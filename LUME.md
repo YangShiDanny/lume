@@ -12,6 +12,10 @@
 > 本轮（性能优化）：数组参数 `restrict`、纯函数 `__attribute__((const))`、
 > `par for` 自动 reduction、循环向量化提示、默认 `-O3` + `--native` + `--lto`、
 > `par for` worker 提到文件顶层（clang/MSVC 可编译）。
+>
+> 同时补上两个「codegen 支持但检查器不认」的缺口：方法里可直接写裸字段名
+> （`fn len() { return sqrt(x*x + y*y) }`，等价于 `self.x`），以及 `|>` 管道
+> 在类型检查阶段按 `f(a, ...)` 脱糖（以前 `9 |> sq()` 会被误报参数个数不对）。
 
 ## 一句话介绍
 
