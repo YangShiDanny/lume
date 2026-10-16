@@ -1,0 +1,551 @@
+use super::Codegen;
+use crate::ast::*;
+
+// par for 的 reduction：sum += a[i] 这类"每轮往同一个变量上累加"的写法。
+// 没有 reduction 时多线程写同一个变量是数据竞争，结果随线程数变；
+// 有了 reduction 每个线程各自累加，最后合并，和 OpenMP 的 reduction(+:sum)
+// 语义一致，这才是 par for 求和能用的前提。
+struct Reduction {
+    var: String,
+    ty: String,
+    op: BinOp,
+}
+
+impl Reduction {
+    fn local(&self) -> String {
+        format!("_r_{}", self.var)
+    }
+    fn field(&self) -> String {
+        format!("_red_{}", self.var)
+    }
+    fn init(&self) -> &'static str {
+        match self.op {
+            BinOp::Mul => "1",
+            _ => "0",
+        }
+    }
+    // 线程内累加符号：减法也先按加法收集，最后统一减掉
+    fn acc_op(&self) -> &'static str {
+        match self.op {
+            BinOp::Mul => "*=",
+            _ => "+=",
+        }
+    }
+    fn merge_op(&self) -> &'static str {
+        match self.op {
+            BinOp::Add => "+=",
+            BinOp::Sub => "-=",
+            BinOp::Mul => "*=",
+            _ => "+=",
+        }
+    }
+}
+
+impl Codegen {
+    pub(crate) fn gen_par_for(&mut self, var: &str, iter: &Expr, body: &Block) {
+        match iter {
+            Expr::Range(start, end, inclusive) => {
+                self.gen_par_for_range(var, start, end, *inclusive, body);
+            }
+            _ => self.push_line("/* par for: 暂不支持此迭代器 */"),
+        }
+    }
+
+    fn gen_par_for_range(
+        &mut self,
+        var: &str,
+        start: &Expr,
+        end: &Expr,
+        inclusive: bool,
+        body: &Block,
+    ) {
+        let start_s = self.gen_expr(start);
+        let end_s = self.gen_expr(end);
+
+        let used_arrays = self.collect_used_arrays(body);
+        let reductions = self.detect_reductions(body, var);
+
+        let id = self.par_counter;
+        self.par_counter += 1;
+        let args_struct = format!("_par_args_{}", id);
+
+        // worker 定义在文件顶层，不嵌在函数里。
+        // 嵌套函数是 GCC 扩展，clang / MSVC 都不认；而且提到外面之后
+        // 它就是个普通静态函数，clang 能正常内联和优化。
+        // 它不捕获任何东西，所有数据都通过 _p 传进去。
+        let saved_out = std::mem::take(&mut self.output);
+        let saved_indent = self.indent;
+        self.indent = 0;
+
+        // args 结构体
+        self.push_line("typedef struct {");
+        self.indent += 1;
+        self.push_line("int64_t start;");
+        self.push_line("int64_t end;");
+        for arr in &used_arrays {
+            let elem_ty = self.array_elem_types.get(arr)
+                .cloned().unwrap_or_else(|| "int64_t".to_string());
+            self.push_line(&format!("{}* {};", elem_ty, arr));
+        }
+        for r in &reductions {
+            self.push_line(&format!("{} {};", r.ty, r.field()));
+        }
+        self.indent -= 1;
+        self.push_line(&format!("}} {};", args_struct));
+
+        // worker 函数（跨平台宏）
+        self.push_line(&format!(
+            "static LUME_WORKER_RET _par_worker_{}(void* arg) {{",
+            id
+        ));
+        self.indent += 1;
+        self.push_line(&format!("{}* _p = ({}*)arg;", args_struct, args_struct));
+
+        // 数组指针拷成带 restrict 的局部变量。
+        // Lume 的数组互不别名，这个保证只有编译器知道，
+        // 说出来之后 clang 才敢对循环体做向量化。
+        for arr in &used_arrays {
+            let elem_ty = self.array_elem_types.get(arr)
+                .cloned().unwrap_or_else(|| "int64_t".to_string());
+            self.push_line(&format!(
+                "{}* LUME_RESTRICT {} = _p->{};",
+                elem_ty, arr, arr
+            ));
+        }
+        // 每个线程一份私有累加器，避免竞争
+        for r in &reductions {
+            self.push_line(&format!("{} {} = {};", r.ty, r.local(), r.init()));
+        }
+
+        // 上界统一按排他处理：0..N 和 0..=N 都化成 [start, stop)，
+        // 这样切块不会在边界上重复执行元素
+        self.push_line("#if defined(__clang__)");
+        self.push_line("#pragma clang loop vectorize(enable) interleave(enable)");
+        self.push_line("#endif");
+        self.push_line(&format!(
+            "for (int64_t {} = _p->start; {} < _p->end; {}++) {{",
+            var, var, var
+        ));
+        self.indent += 1;
+
+        for stmt in &body.stmts {
+            self.gen_par_body_stmt(stmt, &used_arrays, &reductions);
+        }
+
+        self.indent -= 1;
+        self.push_line("}");
+
+        for r in &reductions {
+            self.push_line(&format!("_p->{} = {};", r.field(), r.local()));
+        }
+        self.push_line("LUME_WORKER_RETURN;");
+        self.indent -= 1;
+        self.push_line("}");
+        self.output.push('\n');
+
+        // 把 worker 收进顶层缓冲区，恢复原来的输出位置
+        let hoisted = std::mem::replace(&mut self.output, saved_out);
+        self.indent = saved_indent;
+        self.par_workers.push_str(&hoisted);
+
+        // 调用处（跨平台宏）
+        self.push_line("{");
+        self.indent += 1;
+        self.push_line("int _n_threads = lume_cpu_count();");
+        self.push_line("if (_n_threads > 64) _n_threads = 64;");
+        self.push_line("LumeThread _threads[64];");
+        self.push_line(&format!("{} _args[64];", args_struct));
+        self.push_line(&format!("int64_t _total_start = {};", start_s));
+        self.push_line(&format!(
+            "int64_t _total_stop = {}{};",
+            end_s,
+            if inclusive { " + 1" } else { "" }
+        ));
+        self.push_line("int64_t _total = _total_stop - _total_start;");
+        self.push_line("if (_total < 1) _total = 1;");
+        self.push_line("int64_t _chunk = (_total + _n_threads - 1) / _n_threads;");
+        self.push_line("for (int _t = 0; _t < _n_threads; _t++) {");
+        self.indent += 1;
+        self.push_line("_args[_t].start = _total_start + _t * _chunk;");
+        self.push_line("_args[_t].end = _args[_t].start + _chunk;");
+        self.push_line("if (_args[_t].end > _total_stop) _args[_t].end = _total_stop;");
+        for arr in &used_arrays {
+            self.push_line(&format!("_args[_t].{} = {};", arr, arr));
+        }
+        for r in &reductions {
+            self.push_line(&format!(
+                "_args[_t].{} = {};",
+                r.field(),
+                r.init()
+            ));
+        }
+        self.push_line(&format!(
+            "LUME_THREAD_CREATE(_threads[_t], _par_worker_{}, &_args[_t]);",
+            id
+        ));
+        self.indent -= 1;
+        self.push_line("}");
+        self.push_line("for (int _t = 0; _t < _n_threads; _t++) {");
+        self.indent += 1;
+        self.push_line("LUME_THREAD_JOIN(_threads[_t]);");
+        self.indent -= 1;
+        self.push_line("}");
+        // 合并各线程的私有累加器
+        if !reductions.is_empty() {
+            self.push_line("for (int _t = 0; _t < _n_threads; _t++) {");
+            self.indent += 1;
+            for r in &reductions {
+                self.push_line(&format!(
+                    "{} {} _args[_t].{};",
+                    r.var,
+                    r.merge_op(),
+                    r.field()
+                ));
+            }
+            self.indent -= 1;
+            self.push_line("}");
+        }
+        self.indent -= 1;
+        self.push_line("}");
+    }
+
+    // ── reduction 识别 ──
+
+    fn detect_reductions(&self, body: &Block, loop_var: &str) -> Vec<Reduction> {
+        let mut stmts: Vec<&Stmt> = Vec::new();
+        Self::flatten_stmts(body, &mut stmts);
+
+        // 候选变量：v = v OP rhs，且 v 不是循环变量
+        let mut cands: Vec<String> = Vec::new();
+        for s in &stmts {
+            if let Some((v, _)) = Self::as_reduction(s) {
+                if v != loop_var && !cands.contains(v) {
+                    cands.push(v.clone());
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for v in cands {
+            // 循环体里重新声明了同名变量 → 不是外层累加
+            if stmts.iter().any(|s| matches!(s, Stmt::Let { name, .. } if name == &v)) {
+                continue;
+            }
+            // 必须是"只在这个累加式里出现"：
+            // 每处累加贡献 2 次引用（赋值目标 + 右值左侧），多一次就说明
+            // 循环体还读了它，归约后语义会变，宁可不优化
+            let n = stmts.iter()
+                .filter(|s| matches!(Self::as_reduction(s), Some((x, _)) if x == &v))
+                .count();
+            if Self::count_ident_in_block(body, &v) != 2 * n {
+                continue;
+            }
+            let ty = match self.var_types.get(&v) {
+                Some(t) => t.clone(),
+                None => continue,
+            };
+            let op = stmts.iter()
+                .find_map(|s| match Self::as_reduction(s) {
+                    Some((x, o)) if x == &v => Some(o),
+                    _ => None,
+                })
+                .unwrap();
+            out.push(Reduction { var: v, ty, op });
+        }
+        out
+    }
+
+    // 识别 `v = v OP rhs`，OP ∈ {+, -, *}
+    fn as_reduction(s: &Stmt) -> Option<(&String, BinOp)> {
+        let Stmt::Assign { target, value } = s else { return None };
+        let Expr::Ident(v) = target else { return None };
+        let Expr::Binary(lhs, op, _) = value else { return None };
+        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+            return None;
+        }
+        match lhs.as_ref() {
+            Expr::Ident(v2) if v2 == v => Some((v, *op)),
+            _ => None,
+        }
+    }
+
+    fn flatten_stmts<'a>(b: &'a Block, out: &mut Vec<&'a Stmt>) {
+        for s in &b.stmts {
+            out.push(s);
+            match s {
+                Stmt::If { then, els, .. } => {
+                    Self::flatten_stmts(then, out);
+                    if let Some(e) = els {
+                        match e.as_ref() {
+                            Stmt::Expr(Expr::If(_, block, _)) => {
+                                Self::flatten_stmts(block, out)
+                            }
+                            other => out.push(other),
+                        }
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::ParFor { body, .. } => Self::flatten_stmts(body, out),
+                _ => {}
+            }
+        }
+    }
+
+    fn count_ident_in_block(b: &Block, name: &str) -> usize {
+        let mut n = 0;
+        for s in &b.stmts {
+            Self::count_ident_in_stmt(s, name, &mut n);
+        }
+        n
+    }
+
+    fn count_ident_in_stmt(s: &Stmt, name: &str, n: &mut usize) {
+        match s {
+            Stmt::Let { init, .. } => Self::count_ident_in_expr(init, name, n),
+            Stmt::Assign { target, value } => {
+                Self::count_ident_in_expr(target, name, n);
+                Self::count_ident_in_expr(value, name, n);
+            }
+            Stmt::Expr(e) => Self::count_ident_in_expr(e, name, n),
+            Stmt::Return(Some(e)) => Self::count_ident_in_expr(e, name, n),
+            Stmt::If { cond, then, els } => {
+                Self::count_ident_in_expr(cond, name, n);
+                *n += Self::count_ident_in_block(then, name);
+                if let Some(e) = els {
+                    Self::count_ident_in_stmt(e, name, n);
+                }
+            }
+            Stmt::While { cond, body } => {
+                Self::count_ident_in_expr(cond, name, n);
+                *n += Self::count_ident_in_block(body, name);
+            }
+            Stmt::For { iter, body, .. } | Stmt::ParFor { iter, body, .. } => {
+                Self::count_ident_in_expr(iter, name, n);
+                *n += Self::count_ident_in_block(body, name);
+            }
+            _ => {}
+        }
+    }
+
+    fn count_ident_in_expr(e: &Expr, name: &str, n: &mut usize) {
+        match e {
+            Expr::Ident(v) => {
+                if v == name {
+                    *n += 1;
+                }
+            }
+            Expr::Binary(l, _, r) => {
+                Self::count_ident_in_expr(l, name, n);
+                Self::count_ident_in_expr(r, name, n);
+            }
+            Expr::Unary(_, e) => Self::count_ident_in_expr(e, name, n),
+            Expr::Index(o, i) => {
+                Self::count_ident_in_expr(o, name, n);
+                Self::count_ident_in_expr(i, name, n);
+            }
+            Expr::Range(a, b, _) => {
+                Self::count_ident_in_expr(a, name, n);
+                Self::count_ident_in_expr(b, name, n);
+            }
+            Expr::Call(c, args) => {
+                Self::count_ident_in_expr(c, name, n);
+                for a in args {
+                    Self::count_ident_in_expr(a, name, n);
+                }
+            }
+            Expr::Field(o, _) => Self::count_ident_in_expr(o, name, n),
+            Expr::If(cond, then, els) => {
+                Self::count_ident_in_expr(cond, name, n);
+                *n += Self::count_ident_in_block(then, name);
+                if let Some(b) = els {
+                    *n += Self::count_ident_in_block(b, name);
+                }
+            }
+            Expr::List(items) => {
+                for i in items {
+                    Self::count_ident_in_expr(i, name, n);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── 循环体生成 ──
+
+    fn gen_par_body_stmt(
+        &mut self,
+        stmt: &Stmt,
+        arrays: &[String],
+        reds: &[Reduction],
+    ) {
+        match stmt {
+            Stmt::Assign { target, value } => {
+                // reduction：写私有累加器，不碰共享变量
+                if let Expr::Ident(v) = target {
+                    if let Some(r) = reds.iter().find(|r| &r.var == v) {
+                        if let Expr::Binary(_, _, rhs) = value {
+                            let rs = self.gen_par_expr(rhs, arrays);
+                            self.push_line(&format!(
+                                "{} {} {};",
+                                r.local(),
+                                r.acc_op(),
+                                rs
+                            ));
+                            return;
+                        }
+                    }
+                }
+                let t = self.gen_par_expr(target, arrays);
+                let v = self.gen_par_expr(value, arrays);
+                self.push_line(&format!("{} = {};", t, v));
+            }
+            Stmt::Expr(e) => {
+                let s = self.gen_par_expr(e, arrays);
+                self.push_line(&format!("{};", s));
+            }
+            Stmt::Let { name, ty, init } => {
+                let c_ty = match ty {
+                    Some(t) => self.gen_type(t),
+                    None => self.infer_type(init),
+                };
+                let v = self.gen_par_expr(init, arrays);
+                self.push_line(&format!("{} {} = {};", c_ty, name, v));
+            }
+            Stmt::If { cond, then, els } => {
+                let c = self.gen_par_expr(cond, arrays);
+                self.push_line(&format!("if ({}) {{", c));
+                self.indent += 1;
+                for s in &then.stmts {
+                    self.gen_par_body_stmt(s, arrays, reds);
+                }
+                self.indent -= 1;
+                if let Some(e) = els {
+                    self.push_line("} else {");
+                    self.indent += 1;
+                    self.gen_par_body_stmt(e, arrays, reds);
+                    self.indent -= 1;
+                }
+                self.push_line("}");
+            }
+            _ => self.push_line("/* par body: 暂不支持 */"),
+        }
+    }
+
+    fn gen_par_expr(&mut self, expr: &Expr, arrays: &[String]) -> String {
+        match expr {
+            // 数组已经在 worker 顶部拷成 restrict 局部指针，直接用名字
+            Expr::Ident(name) if arrays.contains(name) => name.clone(),
+            Expr::Binary(l, op, r) => {
+                let ls = self.gen_par_expr(l, arrays);
+                let rs = self.gen_par_expr(r, arrays);
+                let op_str = match op {
+                    BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
+                    BinOp::Div => "/", BinOp::Mod => "%",
+                    BinOp::Eq => "==", BinOp::Ne => "!=",
+                    BinOp::Lt => "<", BinOp::Gt => ">",
+                    BinOp::Le => "<=", BinOp::Ge => ">=",
+                    BinOp::And => "&&", BinOp::Or => "||",
+                    BinOp::Pipe => "/* pipe */",
+                };
+                format!("({} {} {})", ls, op_str, rs)
+            }
+            Expr::Index(o, i) => {
+                let os = self.gen_par_expr(o, arrays);
+                let is = self.gen_par_expr(i, arrays);
+                format!("{}[{}]", os, is)
+            }
+            Expr::Unary(op, e) => {
+                let es = self.gen_par_expr(e, arrays);
+                let op_str = match op { UnOp::Neg => "-", UnOp::Not => "!" };
+                format!("({}{})", op_str, es)
+            }
+            Expr::Int(n) => format!("{}LL", n),
+            Expr::Float(f) => {
+                let s = format!("{}", f);
+                if s.contains('.') || s.contains('e') {
+                    s
+                } else {
+                    format!("{}.0", s)
+                }
+            }
+            Expr::Ident(name) => name.clone(),
+            _ => self.gen_expr(expr),
+        }
+    }
+
+    fn collect_used_arrays(&self, block: &Block) -> Vec<String> {
+        let mut result = Vec::new();
+        for stmt in &block.stmts {
+            self.collect_arrays_in_stmt(stmt, &mut result);
+        }
+        result.sort();
+        result.dedup();
+        result
+    }
+
+    fn collect_arrays_in_stmt(&self, stmt: &Stmt, out: &mut Vec<String>) {
+        match stmt {
+            Stmt::Expr(e) => self.collect_arrays_in_expr(e, out),
+            Stmt::Assign { target, value } => {
+                self.collect_arrays_in_expr(target, out);
+                self.collect_arrays_in_expr(value, out);
+            }
+            Stmt::Let { init, .. } => self.collect_arrays_in_expr(init, out),
+            Stmt::If { cond, then, els } => {
+                self.collect_arrays_in_expr(cond, out);
+                for s in &then.stmts {
+                    self.collect_arrays_in_stmt(s, out);
+                }
+                if let Some(e) = els {
+                    self.collect_arrays_in_stmt(e, out);
+                }
+            }
+            Stmt::While { cond, body } => {
+                self.collect_arrays_in_expr(cond, out);
+                for s in &body.stmts {
+                    self.collect_arrays_in_stmt(s, out);
+                }
+            }
+            Stmt::For { iter, body, .. } | Stmt::ParFor { iter, body, .. } => {
+                self.collect_arrays_in_expr(iter, out);
+                for s in &body.stmts {
+                    self.collect_arrays_in_stmt(s, out);
+                }
+            }
+            Stmt::Return(Some(e)) => self.collect_arrays_in_expr(e, out),
+            _ => {}
+        }
+    }
+
+    fn collect_arrays_in_expr(&self, expr: &Expr, out: &mut Vec<String>) {
+        match expr {
+            Expr::Ident(name) => {
+                // 字面量数组（编译期知道长度）和数组参数都算
+                if !out.contains(name)
+                    && (self.array_lens.contains_key(name)
+                        || self.array_params.contains(name))
+                {
+                    out.push(name.clone());
+                }
+            }
+            Expr::Binary(l, _, r) => {
+                self.collect_arrays_in_expr(l, out);
+                self.collect_arrays_in_expr(r, out);
+            }
+            Expr::Unary(_, e) => self.collect_arrays_in_expr(e, out),
+            Expr::Call(c, args) => {
+                self.collect_arrays_in_expr(c, out);
+                for a in args {
+                    self.collect_arrays_in_expr(a, out);
+                }
+            }
+            Expr::Field(o, _) => self.collect_arrays_in_expr(o, out),
+            Expr::Index(o, i) => {
+                self.collect_arrays_in_expr(o, out);
+                self.collect_arrays_in_expr(i, out);
+            }
+            _ => {}
+        }
+    }
+}

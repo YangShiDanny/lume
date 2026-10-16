@@ -1,0 +1,171 @@
+pub const RUNTIME_HEADER: &str = r#"#ifndef LUME_RUNTIME_H
+#define LUME_RUNTIME_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <ctype.h>
+
+#ifdef _WIN32
+  #include <windows.h>
+  typedef HANDLE LumeThread;
+  #define LUME_WORKER_RET     DWORD WINAPI
+  #define LUME_WORKER_RETURN  return 0
+  #define LUME_THREAD_CREATE(thread, fn, arg) \
+      do { (thread) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(fn), (arg), 0, NULL); } while (0)
+  #define LUME_THREAD_JOIN(thread) \
+      do { WaitForSingleObject((thread), INFINITE); CloseHandle((thread)); } while (0)
+  /* 互斥：用 InitOnceExecuteOnce 做一次性初始化，避免静态初始化顺序问题 */
+  #define LUME_MUTEX_T        struct { CRITICAL_SECTION cs; INIT_ONCE once; }
+  #define LUME_MUTEX_INIT     { 0 }
+  static inline BOOL CALLBACK lume_init_cs_(PINIT_ONCE _o, PVOID _p, PVOID* _c) {
+      (void)_o; (void)_c;
+      InitializeCriticalSection((CRITICAL_SECTION*)_p);
+      return TRUE;
+  }
+  #define LUME_MUTEX_LOCK(m)   do { InitOnceExecuteOnce(&(m).once, lume_init_cs_, (PVOID)&(m).cs, NULL); EnterCriticalSection(&(m).cs); } while (0)
+  #define LUME_MUTEX_UNLOCK(m) LeaveCriticalSection(&(m).cs)
+  #define LUME_NEXT_SLOT(p)    ((unsigned long)(InterlockedIncrement((long*)(p)) - 1))
+  static inline int lume_cpu_count(void) {
+      SYSTEM_INFO si;
+      GetSystemInfo(&si);
+      int n = (int)si.dwNumberOfProcessors;
+      return n < 1 ? 1 : n;
+  }
+  static inline int64_t lume_now_ns(void) {
+      LARGE_INTEGER freq, counter;
+      QueryPerformanceFrequency(&freq);
+      QueryPerformanceCounter(&counter);
+      return (int64_t)(counter.QuadPart * 1000000000LL / freq.QuadPart);
+  }
+#else
+  #include <pthread.h>
+  #include <unistd.h>
+  typedef pthread_t LumeThread;
+  #define LUME_WORKER_RET     void*
+  #define LUME_WORKER_RETURN  return NULL
+  #define LUME_THREAD_CREATE(thread, fn, arg) \
+      do { pthread_create(&(thread), NULL, (fn), (arg)); } while (0)
+  #define LUME_THREAD_JOIN(thread) \
+      do { pthread_join((thread), NULL); } while (0)
+  /* 互斥 */
+  #define LUME_MUTEX_T        pthread_mutex_t
+  #define LUME_MUTEX_INIT     PTHREAD_MUTEX_INITIALIZER
+  #define LUME_MUTEX_LOCK(m)  pthread_mutex_lock(&(m))
+  #define LUME_MUTEX_UNLOCK(m) pthread_mutex_unlock(&(m))
+  #define LUME_NEXT_SLOT(p)   ((unsigned long)__sync_fetch_and_add((long*)(p), 1))
+  static inline int lume_cpu_count(void) {
+      long n = sysconf(_SC_NPROCESSORS_ONLN);
+      if (n < 1) n = 1;
+      return (int)n;
+  }
+  static inline int64_t lume_now_ns(void) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+  }
+#endif
+
+/* ── 优化提示 ── */
+
+/* Lume 的数组是值语义，两个数组参数不可能互相别名。
+   给数组参数加 restrict，clang 才敢把循环向量化（这是打平 Fortran 的关键）。 */
+#define LUME_RESTRICT __restrict
+
+/* __attribute__((const))：函数只看参数、只返回值，不读不写全局状态。
+   clang 因此可以消除重复调用、把调用提到循环外。
+   只有编译器证明过纯度的函数才会被标上（见 purity.rs）。 */
+#if defined(__GNUC__) || defined(__clang__)
+#  define LUME_PURE __attribute__((const))
+#else
+#  define LUME_PURE
+#endif
+
+/* ── std.str ── */
+/* 字符串函数返回内部缓冲区。用轮转槽位代替单一 static buf，
+   这样 say("{str_upper(a)} {str_upper(b)}") 不会拿到同一个指针。 */
+
+#define LUME_STR_SLOTS 8
+
+static inline int64_t lume_str_len(const char* s) {
+    return (int64_t)strlen(s);
+}
+
+static inline const char* lume_str_upper(const char* s) {
+    static char bufs[LUME_STR_SLOTS][4096];
+    static long slot = 0;
+    char* buf = bufs[LUME_NEXT_SLOT(&slot) % LUME_STR_SLOTS];
+    size_t n = strlen(s);
+    if (n > 4095) n = 4095;
+    for (size_t i = 0; i < n; i++) buf[i] = (char)toupper((unsigned char)s[i]);
+    buf[n] = 0;
+    return buf;
+}
+
+static inline const char* lume_str_lower(const char* s) {
+    static char bufs[LUME_STR_SLOTS][4096];
+    static long slot = 0;
+    char* buf = bufs[LUME_NEXT_SLOT(&slot) % LUME_STR_SLOTS];
+    size_t n = strlen(s);
+    if (n > 4095) n = 4095;
+    for (size_t i = 0; i < n; i++) buf[i] = (char)tolower((unsigned char)s[i]);
+    buf[n] = 0;
+    return buf;
+}
+
+static inline const char* lume_str_trim(const char* s) {
+    static char bufs[LUME_STR_SLOTS][4096];
+    static long slot = 0;
+    char* buf = bufs[LUME_NEXT_SLOT(&slot) % LUME_STR_SLOTS];
+    size_t n = strlen(s);
+    if (n > 4095) n = 4095;
+    size_t start = 0;
+    while (start < n && isspace((unsigned char)s[start])) start++;
+    size_t end = n;
+    while (end > start && isspace((unsigned char)s[end - 1])) end--;
+    size_t len = end - start;
+    memcpy(buf, s + start, len);
+    buf[len] = 0;
+    return buf;
+}
+
+static inline int64_t lume_str_to_int(const char* s) {
+    return (int64_t)atoll(s);
+}
+
+static inline double lume_str_to_float(const char* s) {
+    return atof(s);
+}
+
+/* ── std.int ── */
+
+static inline int64_t lume_int_abs(int64_t x) {
+    return x < 0 ? -x : x;
+}
+
+static inline int64_t lume_int_min(int64_t a, int64_t b) {
+    return a < b ? a : b;
+}
+
+static inline int64_t lume_int_max(int64_t a, int64_t b) {
+    return a > b ? a : b;
+}
+
+/* ── std.float ── */
+
+static inline double lume_float_sqrt(double x) { return sqrt(x); }
+static inline double lume_float_abs(double x) { return fabs(x); }
+static inline double lume_float_pow(double x, double y) { return pow(x, y); }
+static inline double lume_float_sin(double x) { return sin(x); }
+static inline double lume_float_cos(double x) { return cos(x); }
+static inline double lume_float_tan(double x) { return tan(x); }
+static inline double lume_float_floor(double x) { return floor(x); }
+static inline double lume_float_ceil(double x) { return ceil(x); }
+static inline double lume_float_round(double x) { return round(x); }
+
+#endif
+"#;
