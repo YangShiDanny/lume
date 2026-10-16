@@ -185,7 +185,11 @@ impl Codegen {
 
     pub(crate) fn gen_expr_with_self(&mut self, expr: &Expr, fields: &[String]) -> String {
         match expr {
-            Expr::Ident(name) if name == "self" => "_self".to_string(),
+            // `self` 单独作为值出现时（f(self)、return self），
+            // Lume 的 struct 是值类型，传的应该是结构体本身而不是指针。
+            // _self 是 Point*，解引用成 Point 才和 `fn f(p: Point)` 对得上。
+            // 注意 self.x / 裸字段名走的是别的分支，不受这里影响。
+            Expr::Ident(name) if name == "self" => "(*_self)".to_string(),
             Expr::Ident(name) if fields.contains(name) => {
                 format!("_self->{}", name)
             }

@@ -24,20 +24,19 @@ impl Reduction {
             _ => "0",
         }
     }
-    // 线程内累加符号：减法也先按加法收集，最后统一减掉
+    // 线程内累加：直接用真实运算符。
+    // 以前这里把 Sub 也写成 "+="（想"先按加法收集最后统一减"），
+    // 但右值没有取负，合并时又按 -= 减，等于加了两次 —— 减法归约结果是错的。
     fn acc_op(&self) -> &'static str {
-        match self.op {
-            BinOp::Mul => "*=",
-            _ => "+=",
-        }
-    }
-    fn merge_op(&self) -> &'static str {
         match self.op {
             BinOp::Add => "+=",
             BinOp::Sub => "-=",
             BinOp::Mul => "*=",
             _ => "+=",
         }
+    }
+    fn merge_op(&self) -> &'static str {
+        self.acc_op()
     }
 }
 
@@ -47,7 +46,12 @@ impl Codegen {
             Expr::Range(start, end, inclusive) => {
                 self.gen_par_for_range(var, start, end, *inclusive, body);
             }
-            _ => self.push_line("/* par for: 暂不支持此迭代器 */"),
+            // 不能静默跳过：那会让循环一次都不执行，结果错得悄无声息
+            _ => {
+                self.push_line(
+                    "#error \"Lume: par for 只支持区间迭代器（for i in 0..n）\""
+                );
+            }
         }
     }
 
@@ -118,12 +122,18 @@ impl Codegen {
         }
 
         // 上界统一按排他处理：0..N 和 0..=N 都化成 [start, stop)，
-        // 这样切块不会在边界上重复执行元素
+        // 这样切块不会在边界上重复执行元素。
+        // start/end 必须先拷成 const 局部变量再进循环条件：
+        // _p 是指向堆上 args 的指针，clang 无法证明循环体内没有别的线程
+        // 或代码改写 *_p，于是不敢把 `i < _p->end` 提出去，向量化直接报废。
+        // 拷成 const 局部量之后，这个别名可能性就消失了。
+        self.push_line("const int64_t _par_lo = _p->start;");
+        self.push_line("const int64_t _par_hi = _p->end;");
         self.push_line("#if defined(__clang__)");
         self.push_line("#pragma clang loop vectorize(enable) interleave(enable)");
         self.push_line("#endif");
         self.push_line(&format!(
-            "for (int64_t {} = _p->start; {} < _p->end; {}++) {{",
+            "for (int64_t {} = _par_lo; {} < _par_hi; {}++) {{",
             var, var, var
         ));
         self.indent += 1;
@@ -151,10 +161,6 @@ impl Codegen {
         // 调用处（跨平台宏）
         self.push_line("{");
         self.indent += 1;
-        self.push_line("int _n_threads = lume_cpu_count();");
-        self.push_line("if (_n_threads > 64) _n_threads = 64;");
-        self.push_line("LumeThread _threads[64];");
-        self.push_line(&format!("{} _args[64];", args_struct));
         self.push_line(&format!("int64_t _total_start = {};", start_s));
         self.push_line(&format!(
             "int64_t _total_stop = {}{};",
@@ -163,6 +169,41 @@ impl Codegen {
         ));
         self.push_line("int64_t _total = _total_stop - _total_start;");
         self.push_line("if (_total < 1) _total = 1;");
+
+        // 小循环直接串行跑。
+        // pthread_create / CreateThread 一次就要几十 µs，而 10 个元素的加法
+        // 是纳秒级 —— 不设阈值的话 par for 在小数据上是净亏几千倍。
+        // 这里不复制一份循环体，而是直接调用 hoisted worker，代码量不涨。
+        self.push_line(&format!(
+            "if (_total < LUME_PAR_SERIAL_THRESHOLD) {{"
+        ));
+        self.indent += 1;
+        self.push_line(&format!("{} _a;", args_struct));
+        self.push_line("_a.start = _total_start;");
+        self.push_line("_a.end = _total_stop;");
+        for arr in &used_arrays {
+            self.push_line(&format!("_a.{} = {};", arr, arr));
+        }
+        for r in &reductions {
+            self.push_line(&format!("_a.{} = {};", r.field(), r.init()));
+        }
+        self.push_line(&format!("_par_worker_{}(&_a);", id));
+        for r in &reductions {
+            self.push_line(&format!(
+                "{} {} _a.{};",
+                r.var,
+                r.merge_op(),
+                r.field()
+            ));
+        }
+        self.indent -= 1;
+        self.push_line("} else {");
+        self.indent += 1;
+
+        self.push_line("int _n_threads = lume_cpu_count();");
+        self.push_line("if (_n_threads > 64) _n_threads = 64;");
+        self.push_line("LumeThread _threads[64];");
+        self.push_line(&format!("{} _args[64];", args_struct));
         self.push_line("int64_t _chunk = (_total + _n_threads - 1) / _n_threads;");
         self.push_line("for (int _t = 0; _t < _n_threads; _t++) {");
         self.indent += 1;
@@ -207,6 +248,8 @@ impl Codegen {
         }
         self.indent -= 1;
         self.push_line("}");
+        self.indent -= 1;
+        self.push_line("}");
     }
 
     // ── reduction 识别 ──
@@ -244,13 +287,17 @@ impl Codegen {
                 Some(t) => t.clone(),
                 None => continue,
             };
-            let op = stmts.iter()
-                .find_map(|s| match Self::as_reduction(s) {
-                    Some((x, o)) if x == &v => Some(o),
-                    _ => None,
-                })
-                .unwrap();
-            out.push(Reduction { var: v, ty, op });
+            // 同一个变量上混用 + / - / * 时，合并顺序会影响浮点结果，
+            // 而且私有累加器的初值该取 0 还是 1 说不清。直接放弃。
+            let mut ops = stmts.iter().filter_map(|s| match Self::as_reduction(s) {
+                Some((x, o)) if x == &v => Some(o),
+                _ => None,
+            });
+            let first = ops.next().unwrap();
+            if ops.any(|o| o != first) {
+                continue;
+            }
+            out.push(Reduction { var: v, ty, op: first });
         }
         out
     }
@@ -285,8 +332,10 @@ impl Codegen {
                     }
                 }
                 Stmt::While { body, .. }
-                | Stmt::For { body, .. }
-                | Stmt::ParFor { body, .. } => Self::flatten_stmts(body, out),
+                | Stmt::For { body, .. } => Self::flatten_stmts(body, out),
+                // 嵌套 par for 是另一个作用域（而且本来就要报错），
+                // 不能把它内部的累加算成外层循环的归约候选
+                Stmt::ParFor { .. } => {}
                 _ => {}
             }
         }
@@ -427,6 +476,14 @@ impl Codegen {
                     self.indent -= 1;
                 }
                 self.push_line("}");
+            }
+            // 嵌套 par for：worker 里再开线程，线程数会变成核数的平方。
+            // 而且 worker 是被提升到文件顶层的，提升逻辑还没处理嵌套，
+            // 静默跳过会让循环一次都不执行、结果错得悄无声息 —— 直接报错。
+            Stmt::ParFor { .. } => {
+                self.push_line(
+                    "#error \"Lume: par for 暂不支持嵌套（worker 里不能再 par for）\""
+                );
             }
             _ => self.push_line("/* par body: 暂不支持 */"),
         }

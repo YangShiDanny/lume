@@ -24,3 +24,6 @@ test_opt.lume
 Cargo.lock
 main.lume
 _b2.txt
+_g.txt
+_gen_test.py
+_b3.txt

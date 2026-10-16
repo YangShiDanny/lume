@@ -371,7 +371,7 @@ impl Codegen {
         self.push_line(&format!("int64_t _newcap = {} == 0 ? 64 : {} * 2;", cap, cap));
         self.push_line("int64_t* _nk = (int64_t*)malloc((size_t)_newcap * sizeof(int64_t));");
         self.push_line(&format!(
-            "{}* _nv = ({})malloc((size_t)_newcap * sizeof({}));",
+            "{}* _nv = ({}*)malloc((size_t)_newcap * sizeof({}));",
             ret_type, ret_type, ret_type
         ));
         self.push_line("unsigned char* _nu = (unsigned char*)calloc((size_t)_newcap, 1);");

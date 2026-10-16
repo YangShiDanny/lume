@@ -30,11 +30,15 @@ pub const RUNTIME_HEADER: &str = r#"#ifndef LUME_RUNTIME_H
   #define LUME_MUTEX_LOCK(m)   do { InitOnceExecuteOnce(&(m).once, lume_init_cs_, (PVOID)&(m).cs, NULL); EnterCriticalSection(&(m).cs); } while (0)
   #define LUME_MUTEX_UNLOCK(m) LeaveCriticalSection(&(m).cs)
   #define LUME_NEXT_SLOT(p)    ((unsigned long)(InterlockedIncrement((long*)(p)) - 1))
+  /* 结果缓存下来：par for 每次都要问一遍核数 */
   static inline int lume_cpu_count(void) {
+      static int cached = 0;
+      if (cached > 0) return cached;
       SYSTEM_INFO si;
       GetSystemInfo(&si);
       int n = (int)si.dwNumberOfProcessors;
-      return n < 1 ? 1 : n;
+      cached = n < 1 ? 1 : n;
+      return cached;
   }
   static inline int64_t lume_now_ns(void) {
       LARGE_INTEGER freq, counter;
@@ -58,10 +62,14 @@ pub const RUNTIME_HEADER: &str = r#"#ifndef LUME_RUNTIME_H
   #define LUME_MUTEX_LOCK(m)  pthread_mutex_lock(&(m))
   #define LUME_MUTEX_UNLOCK(m) pthread_mutex_unlock(&(m))
   #define LUME_NEXT_SLOT(p)   ((unsigned long)__sync_fetch_and_add((long*)(p), 1))
+  /* 结果缓存下来：par for 每次都要问一遍核数，sysconf 是次系统调用 */
   static inline int lume_cpu_count(void) {
+      static int cached = 0;
+      if (cached > 0) return cached;
       long n = sysconf(_SC_NPROCESSORS_ONLN);
       if (n < 1) n = 1;
-      return (int)n;
+      cached = (int)n;
+      return cached;
   }
   static inline int64_t lume_now_ns(void) {
       struct timespec ts;
@@ -71,6 +79,12 @@ pub const RUNTIME_HEADER: &str = r#"#ifndef LUME_RUNTIME_H
 #endif
 
 /* ── 优化提示 ── */
+
+/* 少于这个元素数，par for 直接串行跑、不开线程。
+   一次 pthread_create / CreateThread 就要几十 µs，而几千个元素的循环
+   是微秒级——不设阈值的话小数据上开线程纯属净亏。
+   阈值改这一个地方就行。 */
+#define LUME_PAR_SERIAL_THRESHOLD 1024
 
 /* Lume 的数组是值语义，两个数组参数不可能互相别名。
    给数组参数加 restrict，clang 才敢把循环向量化（这是打平 Fortran 的关键）。 */

@@ -75,6 +75,8 @@ impl Codegen {
 
             Stmt::While { cond, body } => {
                 let c = self.gen_expr(cond);
+                // while 循环同样吃向量化提示（clang 会自动判断能不能向量化）
+                self.push_vectorize_hint();
                 self.push_line(&format!("while ({}) {{", c));
                 self.indent += 1;
                 for s in &body.stmts {
@@ -172,6 +174,7 @@ impl Codegen {
 
             Stmt::While { cond, body } => {
                 let c = self.gen_expr_with_self(cond, fields);
+                self.push_vectorize_hint();
                 self.push_line(&format!("while ({}) {{", c));
                 self.indent += 1;
                 for s in &body.stmts {
