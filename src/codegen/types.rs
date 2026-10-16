@@ -126,6 +126,14 @@ impl Codegen {
                     }
                 }
 
+                // 普通函数：查返回类型表（generate 步骤 2.4 收集的）。
+                // 查不到才退回 int64_t —— 内置函数（sqrt 之类）没有签名。
+                if let Expr::Ident(fname) = callee.as_ref() {
+                    if let Some(ret) = self.fn_ret_types.get(fname) {
+                        return ret.clone();
+                    }
+                }
+
                 // 方法调用
                 if let Expr::Field(obj, method_name) = callee.as_ref() {
                     if let Expr::Ident(obj_name) = obj.as_ref() {

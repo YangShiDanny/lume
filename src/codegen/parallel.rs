@@ -24,19 +24,23 @@ impl Reduction {
             _ => "0",
         }
     }
-    // 线程内累加：直接用真实运算符。
-    // 以前这里把 Sub 也写成 "+="（想"先按加法收集最后统一减"），
-    // 但右值没有取负，合并时又按 -= 减，等于加了两次 —— 减法归约结果是错的。
+    // 线程内累加：减法也先按加法收集。
+    // 私有累加器里存的是"这一块贡献的量和"，符号在合并时统一处理 ——
+    // 如果累加时就用 -=，合并时又 -=，负号会被减两次，结果变正。
+    // （用隔离探针验证过：累加 -= + 合并 -= 得到 +55，正确值是 -55。）
     fn acc_op(&self) -> &'static str {
+        match self.op {
+            BinOp::Mul => "*=",
+            _ => "+=",
+        }
+    }
+    fn merge_op(&self) -> &'static str {
         match self.op {
             BinOp::Add => "+=",
             BinOp::Sub => "-=",
             BinOp::Mul => "*=",
             _ => "+=",
         }
-    }
-    fn merge_op(&self) -> &'static str {
-        self.acc_op()
     }
 }
 
@@ -69,6 +73,45 @@ impl Codegen {
         let used_arrays = self.collect_used_arrays(body);
         let reductions = self.detect_reductions(body, var);
 
+        // worker 被提升到文件顶层，看不见函数的局部变量。
+        // 循环体里引用的外层标量只有两条路：
+        //   只读  → 塞进 args 结构体按值传进去（下面处理）
+        //   被写  → 多线程写同一个变量是数据竞争，直接报错
+        // 以前这里什么都不做，生成的 C 引用未声明符号，编译期才炸，
+        // 而且报错信息指向 worker 而不是用户的 Lume 代码。
+        let mut scalars: Vec<(String, String)> = Vec::new();
+        let mut written: Vec<String> = Vec::new();
+        {
+            let mut ids: Vec<String> = Vec::new();
+            Self::collect_idents_in_block(body, &mut ids);
+            ids.sort();
+            ids.dedup();
+            for n in &ids {
+                if n == var { continue; }
+                if used_arrays.iter().any(|a| a == n) { continue; }
+                if reductions.iter().any(|r| &r.var == n) { continue; }
+                // 不在 var_types 里说明是函数名/内建，不是外层局部变量
+                if !self.var_types.contains_key(n) { continue; }
+                if Self::is_written_in_block(body, n) {
+                    written.push(n.clone());
+                } else {
+                    let ty = self.var_types.get(n).cloned().unwrap();
+                    scalars.push((n.clone(), ty));
+                }
+            }
+        }
+        if !written.is_empty() {
+            self.push_line(&format!(
+                "#error \"Lume: par for 循环体写了外层变量 {}（只有归约变量能跨线程累加）\"",
+                written.join(", ")
+            ));
+            return;
+        }
+        let saved_scalars = std::mem::replace(
+            &mut self.par_scalars,
+            scalars.iter().map(|(n, _)| n.clone()).collect(),
+        );
+
         let id = self.par_counter;
         self.par_counter += 1;
         let args_struct = format!("_par_args_{}", id);
@@ -93,6 +136,9 @@ impl Codegen {
         }
         for r in &reductions {
             self.push_line(&format!("{} {};", r.ty, r.field()));
+        }
+        for (name, ty) in &scalars {
+            self.push_line(&format!("{} {};", ty, name));
         }
         self.indent -= 1;
         self.push_line(&format!("}} {};", args_struct));
@@ -157,6 +203,7 @@ impl Codegen {
         let hoisted = std::mem::replace(&mut self.output, saved_out);
         self.indent = saved_indent;
         self.par_workers.push_str(&hoisted);
+        self.par_scalars = saved_scalars;
 
         // 调用处（跨平台宏）
         self.push_line("{");
@@ -186,6 +233,9 @@ impl Codegen {
         }
         for r in &reductions {
             self.push_line(&format!("_a.{} = {};", r.field(), r.init()));
+        }
+        for (name, _) in &scalars {
+            self.push_line(&format!("_a.{} = {};", name, name));
         }
         self.push_line(&format!("_par_worker_{}(&_a);", id));
         for r in &reductions {
@@ -219,6 +269,9 @@ impl Codegen {
                 r.field(),
                 r.init()
             ));
+        }
+        for (name, _) in &scalars {
+            self.push_line(&format!("_args[_t].{} = {};", name, name));
         }
         self.push_line(&format!(
             "LUME_THREAD_CREATE(_threads[_t], _par_worker_{}, &_args[_t]);",
@@ -493,6 +546,10 @@ impl Codegen {
         match expr {
             // 数组已经在 worker 顶部拷成 restrict 局部指针，直接用名字
             Expr::Ident(name) if arrays.contains(name) => name.clone(),
+            // 只读外层标量走 args 结构体（worker 是顶层函数，看不见它们）
+            Expr::Ident(name) if self.par_scalars.contains(name) => {
+                format!("_p->{}", name)
+            }
             Expr::Binary(l, op, r) => {
                 let ls = self.gen_par_expr(l, arrays);
                 let rs = self.gen_par_expr(r, arrays);
@@ -603,6 +660,104 @@ impl Codegen {
                 self.collect_arrays_in_expr(i, out);
             }
             _ => {}
+        }
+    }
+
+    // ── 外层标量收集 / 写入检测 ──
+    // worker 提到文件顶层后就看不见函数局部变量了，这两组 walker
+    // 用来决定哪些标量要按值传进去、哪些必须报错。
+
+    fn collect_idents_in_block(b: &Block, out: &mut Vec<String>) {
+        for s in &b.stmts {
+            Self::collect_idents_in_stmt(s, out);
+        }
+    }
+
+    fn collect_idents_in_stmt(s: &Stmt, out: &mut Vec<String>) {
+        match s {
+            Stmt::Let { init, .. } => Self::collect_idents_in_expr(init, out),
+            Stmt::Assign { target, value } => {
+                Self::collect_idents_in_expr(target, out);
+                Self::collect_idents_in_expr(value, out);
+            }
+            Stmt::Expr(e) => Self::collect_idents_in_expr(e, out),
+            Stmt::Return(Some(e)) => Self::collect_idents_in_expr(e, out),
+            Stmt::If { cond, then, els } => {
+                Self::collect_idents_in_expr(cond, out);
+                Self::collect_idents_in_block(then, out);
+                if let Some(e) = els {
+                    Self::collect_idents_in_stmt(e, out);
+                }
+            }
+            Stmt::While { cond, body } => {
+                Self::collect_idents_in_expr(cond, out);
+                Self::collect_idents_in_block(body, out);
+            }
+            Stmt::For { iter, body, .. } | Stmt::ParFor { iter, body, .. } => {
+                Self::collect_idents_in_expr(iter, out);
+                Self::collect_idents_in_block(body, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_idents_in_expr(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Ident(n) => out.push(n.clone()),
+            Expr::Binary(l, _, r) => {
+                Self::collect_idents_in_expr(l, out);
+                Self::collect_idents_in_expr(r, out);
+            }
+            Expr::Unary(_, e) => Self::collect_idents_in_expr(e, out),
+            Expr::Index(o, i) => {
+                Self::collect_idents_in_expr(o, out);
+                Self::collect_idents_in_expr(i, out);
+            }
+            Expr::Range(a, b, _) => {
+                Self::collect_idents_in_expr(a, out);
+                Self::collect_idents_in_expr(b, out);
+            }
+            Expr::Call(c, args) => {
+                Self::collect_idents_in_expr(c, out);
+                for a in args {
+                    Self::collect_idents_in_expr(a, out);
+                }
+            }
+            Expr::Field(o, _) => Self::collect_idents_in_expr(o, out),
+            Expr::If(cond, then, els) => {
+                Self::collect_idents_in_expr(cond, out);
+                Self::collect_idents_in_block(then, out);
+                if let Some(b) = els {
+                    Self::collect_idents_in_block(b, out);
+                }
+            }
+            Expr::List(items) => {
+                for i in items {
+                    Self::collect_idents_in_expr(i, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 变量在循环体里是否被赋值（`x = ...`）。
+    // 注意 Stmt::Let 同名算遮蔽，不算写外层变量。
+    fn is_written_in_block(b: &Block, name: &str) -> bool {
+        b.stmts.iter().any(|s| Self::is_written_in_stmt(s, name))
+    }
+
+    fn is_written_in_stmt(s: &Stmt, name: &str) -> bool {
+        match s {
+            Stmt::Assign { target, .. } => matches!(target, Expr::Ident(n) if n == name),
+            Stmt::If { then, els, .. } => {
+                Self::is_written_in_block(then, name)
+                    || els.as_ref().map(|e| Self::is_written_in_stmt(e, name)).unwrap_or(false)
+            }
+            Stmt::While { body, .. } => Self::is_written_in_block(body, name),
+            Stmt::For { body, .. } | Stmt::ParFor { body, .. } => {
+                Self::is_written_in_block(body, name)
+            }
+            _ => false,
         }
     }
 }

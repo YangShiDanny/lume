@@ -2,3 +2,10 @@
 name = "lume"
 version = "0.1.0"
 edition = "2021"
+
+[profile.release]
+opt-level = "z"        # 优化大小（不是速度）
+lto = true             # 链接时优化，跨模块内联 + 去重
+codegen-units = 1      # 单编译单元，更慢但更小
+strip = true           # 去掉符号表
+panic = "abort"        # 去掉 panic 展开代码

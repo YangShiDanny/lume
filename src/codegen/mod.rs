@@ -25,11 +25,15 @@ pub struct Codegen {
     pub(crate) const_fns: HashSet<String>,
     pub(crate) precomputed: HashMap<String, Vec<i64>>,
     pub(crate) generic_fns: HashMap<String, FnDecl>,
+    // 普通函数的返回类型（供插值/类型推断用，见 generate 步骤 2.4）
+    pub(crate) fn_ret_types: HashMap<String, String>,
     pub(crate) monomorphized: HashMap<String, String>,
     pub(crate) pending_monos: Vec<(FnDecl, String, HashMap<String, String>)>,
     pub(crate) par_counter: usize,
     // par for 的 worker 函数（提到文件顶层，不能嵌在函数里）
     pub(crate) par_workers: String,
+    // 当前 par worker 里通过 _p-> 访问的只读外层标量（见 parallel.rs）
+    pub(crate) par_scalars: Vec<String>,
 }
 
 impl Codegen {
@@ -46,10 +50,12 @@ impl Codegen {
             const_fns: HashSet::new(),
             precomputed: HashMap::new(),
             generic_fns: HashMap::new(),
+            fn_ret_types: HashMap::new(),
             monomorphized: HashMap::new(),
             pending_monos: Vec::new(),
             par_counter: 0,
             par_workers: String::new(),
+            par_scalars: Vec::new(),
         }
     }
 
@@ -85,6 +91,19 @@ impl Codegen {
                 if !f.generics.is_empty() {
                     self.generic_fns.insert(f.name.clone(), f.clone());
                 }
+            }
+        }
+
+        // 2.4 收集普通函数的返回类型。
+        //     没有这张表，say("{f(x)}") 里 f 返回 float 也会被推断成
+        //     int64_t，插值就用 %lld 打印，小数全丢。
+        for item in &program.items {
+            if let Item::Fn(f) = item {
+                let ret = match &f.ret {
+                    None => "void".to_string(),
+                    Some(t) => self.gen_type(t),
+                };
+                self.fn_ret_types.insert(f.name.clone(), ret);
             }
         }
 
