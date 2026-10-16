@@ -1,0 +1,25 @@
+target/
+.lume_cache/
+main.c
+main
+main.exe
+output.c
+output
+output.exe
+_precompute_*
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+.workbuddy/
+Lume vs Fortran.md
+_c.txt
+_tcc_test.c
+_tcc_test.exe
+_v.txt
+test_opt.c
+test_opt.lume
+未来优化方向.md
+Cargo.lock
+main.lume
