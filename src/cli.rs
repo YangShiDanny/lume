@@ -126,7 +126,7 @@ pub fn compile_to_c(program: &crate::ast::Program, opts: &Opts) -> String {
         }
     }
 
-    let mut codegen = Codegen::new(opts.fastmath);
+    let mut codegen = Codegen::new();
     for (name, table) in precomputed {
         codegen.set_precomputed(name, table);
     }
@@ -200,7 +200,7 @@ fn compute_precompute_table_cached(
     opts: &Opts,
 ) -> Result<(Vec<i64>, bool), String> {
     // 先把预计算程序生成出来，再用它的源码做缓存键
-    let mut cg = Codegen::new(opts.fastmath);
+    let mut cg = Codegen::new();
     let c_code = cg.generate_precompute_program(f, start, end);
     let hash = hash_source(&c_code);
     let cache_dir = ".lume_cache";

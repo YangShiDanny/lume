@@ -30,11 +30,10 @@ pub struct Codegen {
     pub(crate) par_counter: usize,
     // par for 的 worker 函数（提到文件顶层，不能嵌在函数里）
     pub(crate) par_workers: String,
-    pub(crate) fastmath: bool,
 }
 
 impl Codegen {
-    pub fn new(fastmath: bool) -> Self {
+    pub fn new() -> Self {
         Self {
             output: String::new(),
             indent: 0,
@@ -51,7 +50,6 @@ impl Codegen {
             pending_monos: Vec::new(),
             par_counter: 0,
             par_workers: String::new(),
-            fastmath,
         }
     }
 
