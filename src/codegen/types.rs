@@ -3,6 +3,8 @@ use super::Codegen;
 use crate::ast::*;
 use std::collections::HashMap;
 
+use super::expr::single_expr;
+
 impl Codegen {
     pub(crate) fn gen_type(&self, t: &Type) -> String {
         match t {
@@ -100,6 +102,11 @@ impl Codegen {
                 self.var_types.get(name).cloned()
                     .unwrap_or_else(|| "int64_t".to_string())
             }
+            // if 表达式的类型就是 then 分支的类型（两个分支必须一致）
+            Expr::If(_, then, _) => match single_expr(then) {
+                Some(e) => self.infer_type(e),
+                None => "int64_t".to_string(),
+            },
             Expr::StructLit(name, _) => name.clone(),
             Expr::Call(callee, args) => {
                 // 泛型调用：按返回类型推断

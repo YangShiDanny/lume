@@ -258,7 +258,27 @@ impl Checker {
                 if let Some(e) = els {
                     self.check_block(e);
                 }
-                Ty::Unknown
+                // 作为表达式时类型取 then 分支最后一条
+                match then.stmts.last() {
+                    Some(Stmt::Expr(e)) => {
+                        let t = self.check_expr(e);
+                        // 有 else 就要求两边同类型
+                        if let Some(eb) = els {
+                            if let Some(Stmt::Expr(ee)) = eb.stmts.last() {
+                                let et = self.check_expr(ee);
+                                if !t.is_unknown() && !et.is_unknown() && t != et {
+                                    self.error(format!(
+                                        "if 表达式两个分支类型不同：{} 和 {}",
+                                        t.name(),
+                                        et.name()
+                                    ));
+                                }
+                            }
+                        }
+                        t
+                    }
+                    _ => Ty::Unknown,
+                }
             }
 
             Expr::Match(_, _) => Ty::Unknown,

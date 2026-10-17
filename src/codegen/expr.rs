@@ -183,6 +183,8 @@ impl Codegen {
                 format!("{}[{}]", o, i)
             }
 
+            Expr::If(cond, then, els) => self.gen_if_expr(cond, then, els, None),
+
             Expr::StructLit(name, fields) => {
                 let field_strs: Vec<String> = fields.iter()
                     .map(|(fname, fval)| {
@@ -211,6 +213,44 @@ impl Codegen {
             Expr::List(items) => Some(format!("{}LL", items.len())),
             _ => None,
         }
+    }
+
+    /// `if c { a } else { b }` 作为表达式 → C 三元运算符。
+    /// 两个分支都必须恰好一条表达式语句，否则三元装不下，
+    /// 也不退化成 GNU 语句表达式（MSVC 不认）。
+    pub(crate) fn gen_if_expr(
+        &mut self,
+        cond: &Expr,
+        then: &Block,
+        els: &Option<Block>,
+        fields: Option<&[String]>,
+    ) -> String {
+        let te = match single_expr(then) {
+            Some(e) => e,
+            None => {
+                return "/* if 表达式：then 分支只支持单条表达式 */".to_string()
+            }
+        };
+        let ee = match els.as_ref().and_then(single_expr) {
+            Some(e) => e,
+            None => {
+                return "/* if 表达式：需要 else 分支，且只支持单条表达式 */"
+                    .to_string()
+            }
+        };
+        let c = match fields {
+            Some(f) => self.gen_expr_with_self(cond, f),
+            None => self.gen_expr(cond),
+        };
+        let ts = match fields {
+            Some(f) => self.gen_expr_with_self(te, f),
+            None => self.gen_expr(te),
+        };
+        let es = match fields {
+            Some(f) => self.gen_expr_with_self(ee, f),
+            None => self.gen_expr(ee),
+        };
+        format!("({}) ? ({}) : ({})", c, ts, es)
     }
 
     /// 实参专用生成器。数组字面量在实参位置必须写成 C99 复合字面量
@@ -559,6 +599,8 @@ impl Codegen {
                 format!("{}[{}]", o, i)
             }
 
+            Expr::If(cond, then, els) => self.gen_if_expr(cond, then, els, Some(fields)),
+
             Expr::StructLit(name, fields_list) => {
                 let field_strs: Vec<String> = fields_list.iter()
                     .map(|(fname, fval)| {
@@ -572,6 +614,17 @@ impl Codegen {
             _ => self.gen_expr(expr),
         }
     }
+}
+
+/// 块里恰好一条表达式语句时返回它，否则 None。
+/// if 表达式的两个分支都要过这个检查 —— 三元运算符只包得住单个表达式。
+pub(crate) fn single_expr(b: &Block) -> Option<&Expr> {
+    if b.stmts.len() == 1 {
+        if let Stmt::Expr(e) = &b.stmts[0] {
+            return Some(e);
+        }
+    }
+    None
 }
 
 /// 下标位置的字面量整数不需要 `LL` 后缀：`a[0]` 比 `a[0LL]` 干净，
