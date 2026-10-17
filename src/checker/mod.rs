@@ -148,6 +148,8 @@ pub(crate) fn is_builtin(name: &str) -> bool {
     matches!(name,
         "str_len" | "str_upper" | "str_lower" | "str_trim"
         | "str_to_int" | "str_to_float"
+        | "str_contains" | "str_starts_with" | "str_ends_with"
+        | "str_replace" | "str_split"
         | "int_abs" | "int_min" | "int_max"
         | "float_sqrt" | "sqrt" | "float_abs"
         | "float_pow" | "pow"

@@ -7,6 +7,9 @@ impl Codegen {
     pub(crate) fn gen_struct_decl(&mut self, s: &StructDecl) {
         self.push_line(&format!("typedef struct {} {{", s.name));
         self.indent += 1;
+        // 类型标签：C 没有 RTTI，match 结构体解构靠它判断是哪个 struct。
+        // 由编译器在构造时填，用户不写也看不见。
+        self.push_line("int64_t _tag;");
         for f in &s.fields {
             let c_ty = self.gen_type(&f.ty);
             self.push_line(&format!("{} {};", c_ty, f.name));

@@ -176,6 +176,41 @@ fn mag(p: Point) -> float {
     return sqrt(p.x * p.x + p.y * p.y)
 }
 
+// ── if 表达式：编译成 C 三元运算符，clang 会优化成 cmov ──
+fn abs_if(x: int) -> int {
+    return if x < 0 { -x } else { x }
+}
+
+fn clamp(v: int, lo: int, hi: int) -> int {
+    return if v < lo { lo } else if v > hi { hi } else { v }
+}
+
+// ── match 结构体解构：靠 _tag 判断类型，不是恒真 ──
+struct Circle {
+    r: float
+
+    fn area() -> float {
+        return 3.14159265358979 * r * r
+    }
+}
+
+struct Rect {
+    w: float
+    h: float
+
+    fn area() -> float {
+        return w * h
+    }
+}
+
+// ── 字符串操作 ──
+fn str_demo(s: str) -> int {
+    if str_contains(s, "ell") {
+        return 1
+    }
+    return 0
+}
+
 // ── 结构体 + 方法（含 self.x）──
 struct Point {
     x: float
@@ -327,6 +362,52 @@ fn main() {
     // 18. 入参数组直接传出（不拷贝），长度也带回来
     p := passthru(xs)
     say("[18] passthru(xs).len={p.len}  total={total(p)}        期望 10 / 55")
+
+    // 19. if 表达式：编译成 C 三元，clang 会优化成 cmov
+    a1 := abs_if(-7)
+    a2 := abs_if(7)
+    c1 := clamp(15, 0, 10)
+    c2 := clamp(-3, 0, 10)
+    c3 := clamp(5, 0, 10)
+    say("[19] abs_if(-7)={a1} abs_if(7)={a2} clamp(15)={c1} clamp(-3)={c2} clamp(5)={c3}")
+    say("                                   期望 7 / 7 / 10 / 0 / 5")
+
+    // 20. match 结构体解构：_tag 判断类型 + 按位置绑定字段
+    ci := Circle(r: 2.0)
+    re := Rect(w: 3.0, h: 4.0)
+    say("[20] Circle 面积={ci.area()}  Rect 面积={re.area()}    期望 12.566370 / 12.000000")
+    match ci {
+        Circle(r) => say("[20] 解构 Circle(r)：r={r} 面积={3.14159265358979 * r * r}"),
+        _ => say("[20] 没匹配上 —— 不对"),
+    }
+    match re {
+        Rect(w, h) => say("[20] 解构 Rect(w,h)：w={w} h={h} 面积={w * h}"),
+        _ => say("[20] 没匹配上 —— 不对"),
+    }
+    // tag 判断要真的有效：Circle 不该匹配 Rect 的臂
+    match ci {
+        Rect(w, h) => say("[20] Circle 匹配上了 Rect —— tag 判断失效！"),
+        _ => say("[20] Circle 不匹配 Rect 臂（tag 判断生效）"),
+    }
+
+    // 21. 字符串操作
+    sv := "hello world"
+    say("[21] contains(\"ell\")={str_contains(sv, "ell")} contains(\"xyz\")={str_contains(sv, "xyz")}   期望 1 / 0")
+    say("[21] starts_with(\"hel\")={str_starts_with(sv, "hel")} ends_with(\"rld\")={str_ends_with(sv, "rld")}  期望 1 / 1")
+    say("[21] replace(\"world\",\"lume\")={str_replace(sv, "world", "lume")}  期望 hello lume")
+
+    // 21b. str_split：返回字符串数组，长度自动跟上
+    parts := str_split("a,bb,ccc", ",")
+    say("[21b] split(\"a,bb,ccc\",\",\") 段数={parts.len} 内容={parts[0]}|{parts[1]}|{parts[2]}  期望 3 / a|bb|ccc")
+
+    // 21c. 字符串比较必须是内容比较，不能是指针比较
+    e1 := "hello"
+    e2 := "hello"
+    e3 := "world"
+    say("[21c] \"hello\"==\"hello\": {e1 == e2}   \"hello\"==\"world\": {e1 == e3}  期望 1 / 0")
+
+    // 21d. 大小比较：strcmp 字典序
+    say("[21d] \"abc\" < \"abd\": {\"abc\" < \"abd\"}   \"b\" > \"a\": {\"b\" > \"a\"}  期望 1 / 1")
 
     say("===== 完成 =====")
 }

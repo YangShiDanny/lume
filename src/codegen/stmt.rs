@@ -296,10 +296,15 @@ impl Codegen {
         arms: &[MatchArm],
     ) {
         let val_str = self.gen_expr(value);
+        // _match_val 的类型按被 match 的值推断。
+        // 以前一律写成 int64_t，导致只能 match 整数/布尔，
+        // 结构体和浮点全被截断。
+        let val_ty = self.infer_type(value);
+        let val_ty = if val_ty == "void*" { "int64_t".to_string() } else { val_ty };
 
         self.push_line("{");
         self.indent += 1;
-        self.push_line(&format!("int64_t _match_val = {};", val_str));
+        self.push_line(&format!("{} _match_val = {};", val_ty, val_str));
 
         let mut has_wildcard = false;
 
@@ -354,7 +359,13 @@ impl Codegen {
             }
             Pattern::Ident(_) => "1".to_string(),  // 变量绑定总是匹配
             Pattern::Tuple(_) => "1".to_string(),  // 元组总是匹配（第一版）
-            Pattern::Struct(_, _) => "1".to_string(),
+            // 结构体模式：比较类型标签。
+            // tag 在 gen_struct_decl 里加字段、StructLit 里填值，
+            // 三处必须同步，否则解构会静默绑错数据。
+            Pattern::Struct(name, _) => {
+                let tag = self.struct_tags.get(name).copied().unwrap_or(-1);
+                format!("_match_val._tag == {}LL", tag)
+            }
         }
     }
 
@@ -373,6 +384,25 @@ impl Codegen {
                             name, i
                         ));
                         self.var_types.insert(name.clone(), "int64_t".to_string());
+                    }
+                }
+            }
+            // 结构体解构：第 i 个子模式绑定到第 i 个字段。
+            // 所以 `Circle(r)` 会把 .r 绑到 r，`Rect(w, h)` 绑 .w / .h。
+            Pattern::Struct(sname, subs) => {
+                let fields = match self.structs.get(sname).cloned() {
+                    Some(f) => f,
+                    None => return,
+                };
+                for (i, (_, p)) in subs.iter().enumerate() {
+                    if let Pattern::Ident(vname) = p {
+                        if let Some((fname, fty)) = fields.get(i) {
+                            self.push_line(&format!(
+                                "{} {} = _match_val.{};",
+                                fty, vname, fname
+                            ));
+                            self.var_types.insert(vname.clone(), fty.clone());
+                        }
                     }
                 }
             }

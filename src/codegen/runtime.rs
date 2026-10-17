@@ -151,6 +151,94 @@ static inline int64_t lume_str_to_int(const char* s) {
     return (int64_t)atoll(s);
 }
 
+/* contains / starts_with / ends_with：都返回 0/1。
+   不自己写匹配循环，直接交给 strstr / strncmp —— 它们是 libc 里
+   少数几个用 SIMD 优化过的函数，手写循环只会更慢。 */
+
+static inline int64_t lume_str_contains(const char* s, const char* sub) {
+    return strstr(s, sub) != NULL ? 1 : 0;
+}
+
+static inline int64_t lume_str_starts_with(const char* s, const char* pre) {
+    size_t n = strlen(pre);
+    return strncmp(s, pre, n) == 0 ? 1 : 0;
+}
+
+static inline int64_t lume_str_ends_with(const char* s, const char* suf) {
+    size_t ls = strlen(s), lf = strlen(suf);
+    if (lf > ls) return 0;
+    return strcmp(s + (ls - lf), suf) == 0 ? 1 : 0;
+}
+
+/* replace：结果可能比原文长，用轮转缓冲区装。
+   上限 4095，超了截断 —— 和其他 str_* 的行为一致。 */
+static inline const char* lume_str_replace(
+    const char* s, const char* old_s, const char* new_s
+) {
+    static char bufs[LUME_STR_SLOTS][4096];
+    static long slot = 0;
+    char* buf = bufs[LUME_NEXT_SLOT(&slot) % LUME_STR_SLOTS];
+    size_t old_len = strlen(old_s);
+    size_t new_len = strlen(new_s);
+    if (old_len == 0) {
+        /* 空 old 会让匹配位置永不前进 → 死循环，直接返回原文 */
+        strncpy(buf, s, 4095);
+        buf[4095] = 0;
+        return buf;
+    }
+    size_t pos = 0;
+    const char* p = s;
+    while (*p != 0 && pos < 4095) {
+        const char* hit = strstr(p, old_s);
+        size_t seg = hit ? (size_t)(hit - p) : strlen(p);
+        if (pos + seg > 4095) seg = 4095 - pos;
+        memcpy(buf + pos, p, seg);
+        pos += seg;
+        if (hit == 0) break;
+        size_t nl = new_len;
+        if (pos + nl > 4095) nl = 4095 - pos;
+        memcpy(buf + pos, new_s, nl);
+        pos += nl;
+        p = hit + old_len;
+    }
+    buf[pos] = 0;
+    return buf;
+}
+
+/* split：返回字符串数组（段指针）+ 段数出参。
+   段内容顺序放在一个 4096 的缓冲里，指针指进去；
+   整套（指针数组 + 字符缓冲）按槽位轮转，连续调用不互相覆盖。 */
+#define LUME_STR_SPLIT_MAX 64
+
+static inline const char** lume_str_split(
+    const char* s, const char* sep, int64_t* out_len
+) {
+    static char bufs[LUME_STR_SLOTS][4096];
+    static const char* ptrs[LUME_STR_SLOTS][LUME_STR_SPLIT_MAX];
+    static long slot = 0;
+    long idx = LUME_NEXT_SLOT(&slot) % LUME_STR_SLOTS;
+    char* buf = bufs[idx];
+    const char** out = ptrs[idx];
+    size_t sep_len = strlen(sep);
+    if (sep_len == 0) sep_len = 1;  /* 空分隔符：退化成按字符切，避免死循环 */
+    int64_t count = 0;
+    size_t pos = 0;
+    const char* p = s;
+    while (*p != 0 && count < LUME_STR_SPLIT_MAX - 1) {
+        const char* hit = strstr(p, sep);
+        size_t seg = hit ? (size_t)(hit - p) : strlen(p);
+        if (pos + seg + 1 > 4096) seg = 4096 - pos - 1;
+        memcpy(buf + pos, p, seg);
+        buf[pos + seg] = 0;
+        out[count++] = buf + pos;
+        pos += seg + 1;
+        if (hit == 0) break;
+        p = hit + sep_len;
+    }
+    *out_len = count;
+    return out;
+}
+
 static inline double lume_str_to_float(const char* s) {
     return atof(s);
 }

@@ -69,6 +69,26 @@ impl Codegen {
                         return format!("{}({})", callee, pipe_args.join(", "));
                     }
                 };
+                // 字符串是值语义：六个比较运算符都要比内容，不能比指针。
+                // C 里 char* 直接 == 比的是地址，内容相同的两个字符串
+                // 会判成不等，而且是静默错。
+                if matches!(
+                    op,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+                ) && self.is_str_expr(l)
+                    && self.is_str_expr(r)
+                {
+                    let cmp_op = match op {
+                        BinOp::Eq => "==",
+                        BinOp::Ne => "!=",
+                        BinOp::Lt => "<",
+                        BinOp::Gt => ">",
+                        BinOp::Le => "<=",
+                        BinOp::Ge => ">=",
+                        _ => "==",
+                    };
+                    return format!("(strcmp({}, {}) {} 0)", ls, rs, cmp_op);
+                }
                 format!("({} {} {})", ls, op_str, rs)
             }
 
@@ -192,7 +212,8 @@ impl Codegen {
                         format!(".{} = {}", fname, v)
                     })
                     .collect();
-                format!("({}){{ {} }}", name, field_strs.join(", "))
+                let tag = self.struct_tags.get(name).copied().unwrap_or(0);
+                format!("({}){{ ._tag = {}LL, {} }}", name, tag, field_strs.join(", "))
             }
 
             Expr::List(items) => {
@@ -202,6 +223,11 @@ impl Codegen {
 
             _ => "/* TODO */".to_string(),
         }
+    }
+
+    /// 表达式是不是字符串。用来把 `==` 从指针比较改成内容比较。
+    pub(crate) fn is_str_expr(&self, e: &Expr) -> bool {
+        self.infer_type(e) == "const char*"
     }
 
     /// 数组实参的长度表达式。
@@ -364,10 +390,14 @@ impl Codegen {
             .insert(name.to_string(), elem_ty.clone());
         self.var_types
             .insert(name.to_string(), format!("{}*", elem_ty));
+        // builtin（如 str_split）在 C 里叫 lume_str_split
+        let c_name = builtin_map(&fname)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| fname.clone());
         Some(vec![
             format!("{}* {};", elem_ty, name),
             format!("int64_t {}_len;", name),
-            format!("{} = {}({});", name, fname, parts.join(", ")),
+            format!("{} = {}({});", name, c_name, parts.join(", ")),
         ])
     }
 
@@ -563,6 +593,24 @@ impl Codegen {
                         return format!("{}({})", callee, pipe_args.join(", "));
                     }
                 };
+                // 同上：字符串比较走 strcmp
+                if matches!(
+                    op,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+                ) && self.is_str_expr(l)
+                    && self.is_str_expr(r)
+                {
+                    let cmp_op = match op {
+                        BinOp::Eq => "==",
+                        BinOp::Ne => "!=",
+                        BinOp::Lt => "<",
+                        BinOp::Gt => ">",
+                        BinOp::Le => "<=",
+                        BinOp::Ge => ">=",
+                        _ => "==",
+                    };
+                    return format!("(strcmp({}, {}) {} 0)", ls, rs, cmp_op);
+                }
                 format!("({} {} {})", ls, op_str, rs)
             }
 
@@ -608,7 +656,8 @@ impl Codegen {
                         format!(".{} = {}", fname, v)
                     })
                     .collect();
-                format!("({}){{ {} }}", name, field_strs.join(", "))
+                let tag = self.struct_tags.get(name).copied().unwrap_or(0);
+                format!("({}){{ ._tag = {}LL, {} }}", name, tag, field_strs.join(", "))
             }
 
             _ => self.gen_expr(expr),
@@ -645,6 +694,11 @@ fn builtin_map(name: &str) -> Option<&'static str> {
         "str_trim" => "lume_str_trim",
         "str_to_int" => "lume_str_to_int",
         "str_to_float" => "lume_str_to_float",
+        "str_contains" => "lume_str_contains",
+        "str_starts_with" => "lume_str_starts_with",
+        "str_ends_with" => "lume_str_ends_with",
+        "str_replace" => "lume_str_replace",
+        "str_split" => "lume_str_split",
         // int
         "int_abs" => "lume_int_abs",
         "int_min" => "lume_int_min",

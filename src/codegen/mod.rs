@@ -22,6 +22,8 @@ pub struct Codegen {
     pub(crate) indent: usize,
     pub(crate) var_types: HashMap<String, String>,
     pub(crate) structs: HashMap<String, Vec<(String, String)>>,
+    // struct 名 → 类型标签编号。C 没有 RTTI，match 结构体解构靠它判断类型
+    pub(crate) struct_tags: HashMap<String, i64>,
     pub(crate) methods: HashMap<(String, String), String>,
     // 数组名 → 该数组长度的 C 表达式。
     //   局部数组字面量 → "5LL"
@@ -62,6 +64,7 @@ impl Codegen {
             indent: 0,
             var_types: HashMap::new(),
             structs: HashMap::new(),
+            struct_tags: HashMap::new(),
             methods: HashMap::new(),
             array_len_exprs: HashMap::new(),
             array_elem_types: HashMap::new(),
@@ -91,12 +94,16 @@ impl Codegen {
         self.output.push('\n');
 
         // 1. 收集 struct 定义和方法签名
+        let mut tag_counter: i64 = 0;
         for item in &program.items {
             if let Item::Struct(s) = item {
                 let fields: Vec<(String, String)> = s.fields.iter()
                     .map(|f| (f.name.clone(), self.gen_type(&f.ty)))
                     .collect();
                 self.structs.insert(s.name.clone(), fields);
+                // 按出现顺序分配类型标签
+                self.struct_tags.insert(s.name.clone(), tag_counter);
+                tag_counter += 1;
 
                 for m in &s.methods {
                     let ret = match &m.ret {
@@ -141,6 +148,11 @@ impl Codegen {
                 }
             }
         }
+
+        // 2.45 预置内置函数签名。
+        //      infer_type / 数组长度推导都要查这些表，
+        //      不预置的话 say("{str_contains(a,b)}") 会被推断成 int64_t。
+        self.register_builtin_sigs();
 
         // 2.5 纯函数分析：必须在发前向声明之前跑完，
         //     因为 __attribute__((const)) 要写在声明上，调用点才能看到
@@ -270,6 +282,42 @@ impl Codegen {
         self.push_line("}");
 
         std::mem::take(&mut self.output)
+    }
+
+    /// 内置函数签名表。返回 "const char**" 的（只有 str_split）
+    /// 同时登记成数组返回函数，走 `let x = f(...)` 的三行拆开。
+    fn register_builtin_sigs(&mut self) {
+        let sigs: &[(&str, &str)] = &[
+            ("str_len", "int64_t"),
+            ("str_upper", "const char*"),
+            ("str_lower", "const char*"),
+            ("str_trim", "const char*"),
+            ("str_to_int", "int64_t"),
+            ("str_to_float", "double"),
+            ("str_contains", "bool"),
+            ("str_starts_with", "bool"),
+            ("str_ends_with", "bool"),
+            ("str_replace", "const char*"),
+            ("str_split", "const char**"),
+            ("int_abs", "int64_t"),
+            ("int_min", "int64_t"),
+            ("int_max", "int64_t"),
+            ("float_abs", "double"),
+            ("sqrt", "double"),
+            ("pow", "double"),
+            ("sin", "double"),
+            ("cos", "double"),
+            ("tan", "double"),
+            ("floor", "double"),
+            ("ceil", "double"),
+            ("round", "double"),
+        ];
+        for (name, ret) in sigs {
+            self.fn_ret_types.insert(name.to_string(), ret.to_string());
+            if *ret == "const char**" {
+                self.array_ret_fns.insert(name.to_string());
+            }
+        }
     }
 
     // ── 函数局部作用域 ──
