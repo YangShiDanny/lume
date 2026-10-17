@@ -1,7 +1,7 @@
 # Lume TODO
 
 > 最后更新：2026-10-17
-> 状态：核心编译器可用，20 项验证测试全绿，三平台 CI 通过
+> 状态：核心编译器可用，main.lume 30 项验证在 tcc 下全绿（[5] 除外：tcc 的 InterlockedIncrement 已知缺陷，WSL 正常），三平台 CI 通过
 > 已合并原「未来优化方向.md」，合并后原文件可删
 
 ---
@@ -45,9 +45,9 @@
 - [x] 结构体 + 方法（指针传 self）
 - [x] 数组 + `for x in list`
 - [x] 泛型（单态化，多参数）
-- [x] `match`（字面量、通配、变量绑定）
+- [x] `match`（字面量、通配、变量绑定、结构体解构）
 - [x] 管道 `|>`
-- [x] `if` / `else` / `else if`
+- [x] `if` / `else` / `else if` / `if` 表达式（三元）
 - [x] `while` / `for` / `break` / `continue`
 - [x] 前向声明（互相递归、调用后面定义的函数）
 
@@ -66,7 +66,7 @@
 
 ### 工具链
 - [x] GitHub Actions 三平台 CI
-- [x] 20 项验证测试（`main.lume`）
+- [x] 30 项验证测试（`main.lume`，tcc 实测全绿）
 - [x] README.md + LUME.md
 - [x] 标准库内置（`str_*` / `int_*` / `float_*` / `say` / `now`）
 
@@ -87,16 +87,16 @@
 
 ## 🔥 已知 bug（待修）
 
-- [ ] `if` 表达式未实现（`x := if c { 1 } else { 2 }` 生成非法 C）
-- [ ] `malloc` 结果类型在部分 codegen 路径仍可能出错
-- [ ] `match` 结构体解构恒为真
-- [ ] `match` 值被强制转 `int64_t`（只能 match 整数/布尔）
+- [x] `if` 表达式未实现（`x := if c { 1 } else { 2 }` 生成非法 C）—— 已修：单表达式分支走 C99 三元，else if 链嵌套
+- [x] `malloc` 结果类型在部分 codegen 路径仍可能出错 —— 已修：最后一处是数组返回函数脱指针层脱了两层（str_split），改 strip_suffix 只脱一层
+- [x] `match` 结构体解构恒为真 —— 已修：struct 编译期 `_tag` 字段 + C union 类型双关
+- [x] `match` 值被强制转 `int64_t`（只能 match 整数/布尔）—— 已修：`_match_val` 按 infer_type 声明
 - [ ] 默认参数不生效
 - [ ] 命名参数不支持
 - [ ] 整数除零是 UB（需加检查）
 - [ ] `INT64_MIN / -1` 溢出是 UB
-- [ ] 数组不能跨函数传
-- [ ] `nums.len()` 对数组参数返回不存在的 `nums_len`
+- [x] 数组不能跨函数传 —— 已修：隐式伴随长度参数 + 数组返回 malloc 拷贝
+- [x] `nums.len()` 对数组参数返回不存在的 `nums_len` —— 已修：数组参数登记 array_len_exprs
 
 ---
 
@@ -173,19 +173,19 @@
 
 ### 第一批：语言基础
 
-- [ ] **数组跨函数**（设计已完成）
-  - [ ] `mod.rs` 加 `fn_signatures` / `array_params`
-  - [ ] `items.rs` 参数生成拆 `(T* data, int64_t len)`
-  - [ ] `expr.rs` 调用处追加长度
-  - [ ] `stmt.rs` `for` 支持数组参数遍历
-  - [ ] checker 放宽数组参数检查
+- [x] **数组跨函数**（隐式长度伴随参数 + 数组返回 malloc + out-length 出参）
+  - [x] `mod.rs` 加 `fn_signatures` / `array_params`
+  - [x] `items.rs` 参数生成拆 `(T* data, int64_t len)`
+  - [x] `expr.rs` 调用处追加长度
+  - [x] `stmt.rs` `for` 支持数组参数遍历
+  - [x] checker 放宽数组参数检查
 
-- [ ] **`if` 表达式**（优化 #3 的前置）
+- [x] **`if` 表达式**（C99 三元，else if 嵌套）
 
-- [ ] **`match` 结构体解构**（需要类型标签）
+- [x] **`match` 结构体解构**（`_tag` + union，类型不对的臂 tag 兜底）
 
-- [ ] **字符串操作**
-  - [ ] `str_split` / `str_contains` / `str_replace` / `str_starts_with` / `str_ends_with`
+- [x] **字符串操作**（split / contains / replace / starts_with / ends_with）
+  - [x] `str_split` / `str_contains` / `str_replace` / `str_starts_with` / `str_ends_with`
 
 - [ ] **整数除零检查**
   - [ ] 编译期常量 0 报错
@@ -347,7 +347,7 @@
 | 版本 | 目标 | 状态 |
 |---|---|---|
 | v0.1.0 | 核心编译器 + 20 项验证 | ✅ 已完成 |
-| v0.2.0 | 数组跨函数 + `if` 表达式 + `match` 解构 + 字符串操作 | 待做 |
+| v0.2.0 | 数组跨函数 + `if` 表达式 + `match` 解构 + 字符串操作 | ✅ 代码完成（tcc 30 项全绿，WSL 全量验证待 run.bat 确认） |
 | v0.3.0 | `T?` / `T!` + 切片 + 元组 + 泛型 struct | 待做 |
 | v0.4.0 | 模块系统 + 自动扫描 + VS Code 扩展 | 待做 |
 | v0.5.0 | `par f()` + `await` + 线程池 + `lume_say` | 待做 |
