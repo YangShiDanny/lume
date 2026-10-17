@@ -53,15 +53,11 @@ fn main() {
 `par for` worker 在退出时刷新；并行输出按 worker 块写出，线程间顺序不保证。基准测试中
 可显式调用 `flush()`，把实际输出时间计入测量：
 
-```lume
-start := now()
-for i in 1..=100 {
-  say("{i}")
-}
-flush()
-elapsed := now() - start
-say("输出 100 行耗时 {elapsed} ns")
+```bash
+cargo run -- run benchmarks/print_1_100.lume
 ```
+
+这个基准将最后一次 `flush()` 计入耗时，确保测量包含真实 stdout 写出。
 
 ## 构建与运行
 

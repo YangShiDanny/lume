@@ -195,6 +195,11 @@
   - [x] 编译期常量 0 报错（checker `Expr::Binary` 字面量 `Int(0)` 直接 error_hint）
   - [x] 运行时变量 0 检查（`lume_checked_div_i64` / `lume_checked_mod_i64`，fprintf + abort）
 
+- [ ] **`[v; N]` 非零重复初始化**
+  - [ ] 语句位置：生成声明 + 循环填充（跨平台，C 文件小）
+  - [ ] 表达式位置：展开成显式列表（小 N 才值得）
+  - [ ] `N` 很大时考虑 `memset` 优化（`v` 是单字节模式时）
+
 ### 第二批：类型系统
 
 - [ ] **`T?` 可选值** + `?` 错误传播
@@ -226,7 +231,7 @@
 
 - [ ] **`par f(x)` + `await t`**（`Task[T]` 类型 + codegen）
 - [x] **无锁日志与多线程 print**（say/write 只写线程本地缓冲；刷新时短锁，worker 退出刷新，不交错）
-- [ ] **`write` 内置（不换行）**
+- [x] **`write` 内置（不换行）**
 - [ ] **线程池**（替代裸 `pthread_create`）
 - [ ] **`par for` 支持嵌套控制流**（`while` / `for` / `match` 进 worker）
 - [ ] **`par for` 支持 struct 字段数组**
