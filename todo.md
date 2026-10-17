@@ -2,6 +2,7 @@
 
 > 最后更新：2026-10-17
 > 状态：核心编译器可用，20 项验证测试全绿，三平台 CI 通过
+> 已合并原「未来优化方向.md」，合并后原文件可删
 
 ---
 
@@ -50,18 +51,20 @@
 - [x] `while` / `for` / `break` / `continue`
 - [x] 前向声明（互相递归、调用后面定义的函数）
 
-### 性能特性
-- [x] `@cache`（开放寻址哈希表，O(1)）
-- [x] `@precompute`（编译期查表 + OpenMP + 文件缓存）
-- [x] `par for`（自动切块 + reduction + 串行阈值）
+### 性能特性（已有）
+- [x] `@precompute` 编译期查表（+ OpenMP + 文件缓存）
+- [x] `@cache` 运行时缓存（开放寻址哈希表，O(1)）
+- [x] `par for` 自动并行（切分 + reduction + 串行阈值）
+- [x] 泛型单态化（每类型一份代码，零开销）
+- [x] 跨平台 runtime（Windows / Linux / macOS）
+- [x] 默认 `-O3`、`--native`、`--lto`、`-fno-math-errno`
 - [x] `LUME_RESTRICT`（数组无别名）
-- [x] `LUME_PURE`（纯函数 `__attribute__((const))`）
-- [x] `#pragma clang loop vectorize` 提示
-- [x] 默认 `-O3`，`--native` / `--lto` / `--fastmath`
+- [x] `LUME_PURE`（纯函数 `__attribute__((const))` + `purity.rs` 证明）
+- [x] `#pragma clang loop vectorize` 提示（`for` / `par for` / `while`）
+- [x] `par for` worker 提到文件顶层（跨平台可编译）
 - [x] `lume_cpu_count()` 缓存
 
 ### 工具链
-- [x] 跨平台 runtime（Windows / Linux / macOS）
 - [x] GitHub Actions 三平台 CI
 - [x] 20 项验证测试（`main.lume`）
 - [x] README.md + LUME.md
@@ -97,9 +100,78 @@
 
 ---
 
+## 📊 性能优化全景表
+
+### 一、clang 不敢做（Lume 的独有优势）
+
+- [x] **#1 数组参数加 `restrict`** — 无裸指针，值语义保证无别名 → 向量化 2~8 倍
+- [x] **#2 纯函数加 `__attribute__((const))`** — `purity.rs` 保守证明 → 消除重复调用
+- [ ] **#3 函数级 `@fastmath`** — 只对指定函数开 `-ffast-math` 效果 → 浮点重排、FMA、倒数
+- [x] **#4 边界检查消除** — 编译期知道数组长度 → 快 10~30%
+- [x] **#5 无别名下的自动并行** — `par for` 是显式契约 → 多核 5~8 倍
+- [ ] **#6 管道融合成单循环** — `|>` 语义明确 → 内存 3N → N
+- [x] **#7 编译期执行纯函数** — `@precompute` 执行整个函数 → 运行时零开销
+- [x] **#8 自动 reduction** — `par for` 里识别 `sum +=` → 并行求和 5~8 倍
+- [ ] **#9 激进循环不变式外提** — `@fastmath` 下可以 → 减少重复计算
+- [ ] **#10 跨函数常量传播** — 有整个 AST → 消除冗余调用
+- [ ] **#11 浮点代数简化** — `@fastmath` 下 `x+0`/`x*1` 可简化 → 消除冗余
+- [ ] **#12 FMA 融合** — `@fastmath` 下无条件做 → 一条指令，无中间舍入
+- [ ] **#13 多维数组步长已知** — 编译期知道行主序、步长 → 缓存友好重排
+- [ ] **#14 切片无别名** — 编译期知道不重叠 → 子数组向量化
+- [x] **#15 `@cache` 哈希表** — 生成的缓存可优化 → O(n²) → O(n)
+
+**已完成 6 / 15。**
+
+### 二、clang 会做，但 Lume 可以更早/更激进
+
+- [ ] **#16 强度削弱 `x*2^n → x<<n`** — codegen 里无条件做
+- [ ] **#17 取模 `x%2^n → x&(2^n-1)`** — 同上
+- [ ] **#18 魔数除法** — codegen 里主动做，更早 → 除法快 10~40 倍
+- [ ] **#19 循环感应变量削强度** — `a[i*stride]` → 指针递增（中）
+- [ ] **#20 有符号除法修正** — 自己做时要注意舍入（小）
+- [ ] **#21 常量折叠** — 更早，AST 层面（小）
+- [ ] **#22 位运算优化 `x&0 → 0`** — 更早（小）
+- [ ] **#23 浮点除法外提（LICM）** — `@fastmath` 下做
+- [ ] **#24 乘常数移位化 `x*3 → x+(x<<1)`** — 嵌入式目标才值得（小）
+
+### 三、白嫖 clang（不用自己做）
+
+- [x] **#32 自动向量化（SIMD）** — clang 自动用 AVX/SSE
+- [x] **#33 循环展开** — clang 自动
+- [x] **#34 指令调度** — clang 自动
+- [x] **#35 寄存器分配** — clang 自动
+- [x] **#36 常量传播** — clang 自动
+- [x] **#37 死代码消除** — clang 自动
+- [x] **#38 内联** — clang 自动
+- [x] **#39 尾调用优化** — clang 自动
+- [x] **#40 链接时优化（LTO）** — `--lto` 加 `-flto`
+- [x] **#53 循环向量化提示** — `#pragma clang loop vectorize(enable) interleave(enable)`
+- [x] **#54 默认 `-O3` + `--native` + `--lto`** — 白嫖 clang 展开/向量化/AVX2
+- [x] **#55 `-fno-math-errno`** — 让 `sqrt`/`pow` 真正无副作用，`LUME_PURE` 才站得住
+
+### 四、研究级（暂不需要）
+
+- [ ] **#41 矩阵乘法结合律重排** — `(A*B)*C` vs `A*(B*C)`（大）
+- [ ] **#42 超越函数超优化** — Herbie 风格，找更精确的等价形式（极大）
+- [ ] **#43 跨过程强度削减** — 整个调用图看常量除法（大）
+- [ ] **#44 值敏感分析** — CAD 分析循环变量值（极大）
+- [ ] **#45 循环分块 + 软件预取** — cache 友好（大）
+- [ ] **#46 自动微分** — 数值计算（极大）
+- [ ] **#47 Polyhedral 优化** — 循环变换的数学框架（极大）
+
+### 五、未来换后端才需要
+
+- [ ] **#48 自己生成 LLVM IR** — 跳过 C 前端，编译更快
+- [ ] **#49 自己生成汇编** — 完全控制，最大工作量
+- [ ] **#50 寄存器分配** — 如果不用 LLVM
+- [ ] **#51 指令选择** — 如果不用 LLVM
+- [ ] **#52 ABI 管理** — 如果不用 clang
+
+---
+
 ## 📋 待做（按批次）
 
-### 第一批：语言基础（1 周）
+### 第一批：语言基础
 
 - [ ] **数组跨函数**（设计已完成）
   - [ ] `mod.rs` 加 `fn_signatures` / `array_params`
@@ -108,11 +180,9 @@
   - [ ] `stmt.rs` `for` 支持数组参数遍历
   - [ ] checker 放宽数组参数检查
 
-- [ ] **`if` 表达式**
-  - [ ] codegen 生成 C 的三元或 if-else 表达式
+- [ ] **`if` 表达式**（优化 #3 的前置）
 
-- [ ] **`match` 结构体解构**
-  - [ ] 需要类型标签（enum tag）或 C union
+- [ ] **`match` 结构体解构**（需要类型标签）
 
 - [ ] **字符串操作**
   - [ ] `str_split` / `str_contains` / `str_replace` / `str_starts_with` / `str_ends_with`
@@ -121,206 +191,95 @@
   - [ ] 编译期常量 0 报错
   - [ ] 运行时变量 0 检查（`lume_div_zero()`）
 
-### 第二批：类型系统（2 周）
+### 第二批：类型系统
 
-- [ ] **`T?` 可选值**
-  - [ ] AST / checker / codegen 全链路
-  - [ ] `?` 错误传播
-
+- [ ] **`T?` 可选值** + `?` 错误传播
 - [ ] **`T!` 错误值**
-  - [ ] 同上
-
-- [ ] **切片 `a[1..3]`**
-  - [ ] codegen 支持（parser 已支持）
-
+- [ ] **切片 `a[1..3]`**（parser 已支持，补 codegen）
 - [ ] **多返回值 / 元组**
-  - [ ] `fn divmod(a, b) -> (int, int)`
-  - [ ] C 里用 struct 包装
-
 - [ ] **泛型 struct**
-  - [ ] `struct Box[T] { value: T }`
-  - [ ] 单态化扩展到 struct
-
 - [ ] **`i128` / `u128`**
-  - [ ] 类型映射 `__int128`
-  - [ ] 打印函数 `lume_print_i128`
+- [ ] **Debug 模式溢出检查**（`__builtin_add_overflow`）
 
-- [ ] **Debug 模式溢出检查**
-  - [ ] `__builtin_add_overflow` 系列
-  - [ ] `--debug` 开关
+### 第三批：模块系统 + 工具链
 
-### 第三批：模块系统 + 工具链（1 个月）
-
-- [ ] **文件名即模块名**
-  - [ ] 路径 → 模块名映射（`math.lume` → `math`，`gui/window.lume` → `gui.window`）
-
-- [ ] **自动扫描加载**
-  - [ ] 从 `main.lume` 同级+子目录递归扫描
-  - [ ] 排除 `target/` / `.lume_cache/` / `.git/` / `node_modules/` / `_` 前缀
-
+- [ ] **文件名即模块名**（路径 → 模块映射）
+- [ ] **自动扫描加载**（`main.lume` 同级 + 子目录递归）
 - [ ] **短名冲突检测**
-  - [ ] 两个 `math` → 报错，要求完整路径
-
 - [ ] **`pub` 可见性**
-  - [ ] 非 `pub` 私有，跨模块不可见
-
 - [ ] **循环依赖检测**
-  - [ ] 图上找环，编译期报错
-
 - [ ] **`@no_std`**
-  - [ ] 文件级关闭 std
-
 - [ ] **`@manual_load` / `@exclude`**
-  - [ ] 关掉自动扫描 / 排除指定目录
-
 - [ ] **`@thread_safe` / `@not_thread_safe`**
-  - [ ] 函数级标记
-  - [ ] 自动推断（纯函数 → thread_safe）
-  - [ ] `par for` 里只能调 `@thread_safe`
-
 - [ ] **CLI 统一命名为 `lumen`**
-  - [ ] `Cargo.toml` 改 name
-  - [ ] 文档 / 用法提示全部同步
-
-- [ ] **VS Code 扩展**
-  - [ ] 语法高亮（TextMate）
-  - [ ] `language-configuration.json`
-  - [ ] 代码片段
-  - [ ] LSP（补全 / 跳转 / 诊断）
-
+- [ ] **VS Code 扩展**（语法高亮 + LSP）
 - [ ] **`lumen fmt`**
-  - [ ] 格式化工具
-
 - [ ] **`lumen test`**
-  - [ ] 测试框架
-
 - [ ] **`lumen doc`**
-  - [ ] 从注释生成文档
 
-### 第四批：并发（1 周）
+### 第四批：并发
 
-- [ ] **`par f(x)` + `await t`**
-  - [ ] `Task[T]` 类型
-  - [ ] parser 支持 `par` 前缀
-  - [ ] codegen 生成 `_task_int64` / `_task_double` / struct
-  - [ ] `await` 展开成 `join` + 读结果
-
-- [ ] **`lume_say` 全局锁**
-  - [ ] `par for` 里 `say` 不交错
-  - [ ] `say.rs` 的 `printf` 改成 `lume_say`
-
+- [ ] **`par f(x)` + `await t`**（`Task[T]` 类型 + codegen）
+- [ ] **`lume_say` 全局锁**（多线程 print 不交错）
 - [ ] **`write` 内置（不换行）**
-  - [ ] 用于 BigInt 连续输出
-
-- [ ] **线程池**
-  - [ ] 替代裸 `pthread_create`
-  - [ ] 参考 `pthreadpool`
-
-- [ ] **`par for` 支持嵌套控制流**
-  - [ ] `while` / `for` / `match` 进 worker
-
+- [ ] **线程池**（替代裸 `pthread_create`）
+- [ ] **`par for` 支持嵌套控制流**（`while` / `for` / `match` 进 worker）
 - [ ] **`par for` 支持 struct 字段数组**
-  - [ ] `collect_used_arrays` 扩展到 struct 字段
-
 - [ ] **`atomic_add` 内置**
-  - [ ] 显式原子操作
 
-### 第五批：性能优化（持续）
+### 第五批：性能优化（对应优化表）
 
-- [ ] **`@fastmath` 装饰器**
-  - [ ] 函数级 `-ffast-math` 效果
+**第二批：**
 
-- [ ] **多维数组**
-  - [ ] `[f32; M; N]` 或 `[f32; M][N]`
-  - [ ] 行主序 + 编译期已知步长
-  - [ ] 缓存友好重排
+- [ ] **#3 函数级 `@fastmath`**
+- [ ] **#6 管道融合**（数据管道核心）
+- [ ] **#11 代数简化**（配合 `@fastmath`）
+- [ ] **#16~18 强度削弱 / 魔数除法**（clang 已做，优先级低）
 
-- [ ] **管道融合**
-  - [ ] `data |> filter |> map |> sum` 合成单循环
+**第三批：**
 
-- [ ] **无锁日志**
-  - [ ] 参考 L3 / fastlog
-  - [ ] 线程本地缓冲 + 后台写入
-  - [ ] 目标：`say` 1~10 ns
+- [ ] **#13 多维数组**（矩阵运算）
+- [ ] **#14 切片无别名**（子数组向量化）
+- [ ] **#10 跨函数常量传播**（消除冗余）
+- [ ] **#12 FMA 融合**（浮点内核）
+- [ ] **#9 激进 LICM**（循环不变式）
 
-- [ ] **魔数除法**
-  - [ ] 自己的 codegen 实现（不依赖 clang）
-  - [ ] 为换 LLVM 后端铺路
+**换后端时：**
 
-- [ ] **强度削弱**
-  - [ ] `x * 2^n → x << n`
-  - [ ] `x % 2^n → x & (2^n-1)`
+- [ ] **#16~24 强度削弱、魔数除法等**（自己控制，不依赖 clang）
+- [ ] **#48~52 LLVM IR / 汇编后端**
 
-- [ ] **循环感应变量削强度**
-  - [ ] `a[i * stride]` → 指针递增
+**其他性能：**
 
-- [ ] **FMA 融合**
-  - [ ] `a * b + c` → `fma(a, b, c)`
-
+- [ ] **无锁日志**（参考 L3 / fastlog，`say` 1~10 ns）
 - [ ] **`@precompute` 支持 float 表**
-  - [ ] 打印用 `%f`，解析用 `parse::<f64>`
 
 ### 第六批：生态（持续）
 
-- [ ] **标准库扩展**
-  - [ ] `std.io`（文件读写）
-  - [ ] `std.collections`（动态数组、哈希表）
-  - [ ] `std.math`（更多数学函数）
-
-- [ ] **动态数组 `Vec`**
-  - [ ] `{ data, len, cap }` 结构
-  - [ ] `push` / `pop` / `reserve`
-
-- [ ] **示例项目**
-  - [ ] 排序（快排、归并）
-  - [ ] 矩阵乘法（对标 Fortran）
-  - [ ] HTTP 服务器
-  - [ ] BigInt
-
-- [ ] **包管理**
-  - [ ] `lumen.toml`
-  - [ ] 依赖下载
-  - [ ] 版本解析
-
+- [ ] **标准库扩展**（`std.io` / `std.collections` / `std.math`）
+- [ ] **动态数组 `Vec`**（`{ data, len, cap }` + `push` / `pop`）
+- [ ] **示例项目**（排序 / 矩阵乘法 / HTTP / BigInt）
+- [ ] **包管理**（`lumen.toml` + 依赖下载）
 - [ ] **官网 / 文档站**
-  - [ ] 用户上手教程
-  - [ ] API 参考
-
 - [ ] **包仓库**
-  - [ ] 类似 crates.io / npm
-
-- [ ] **C 库绑定**
-  - [ ] `extern` 真正实现
-  - [ ] raylib / SDL2 绑定（GUI）
-
-- [ ] **自举（用 Lume 写 Lume）**
-  - [ ] 需要动态数组、字符串、文件 I/O 全部就绪
-  - [ ] 长期目标
+- [ ] **C 库绑定**（`extern` 真正实现 + raylib / SDL2）
+- [ ] **自举（用 Lume 写 Lume）**（长期目标）
 
 ---
 
 ## 🎯 BigInt（第一个用 Lume 写的程序）
 
-### 前置补丁（约 1 小时）
+### 前置补丁
 
-- [ ] **struct 支持定长数组字段**
-  - [ ] `gen_struct_decl` 生成 `T name[N]`，不是 `T* name`
-
-- [ ] **`[0; N]` 重复初始化**
-  - [ ] AST 加 `Expr::Repeat`
-  - [ ] parser 解析 `[value; count]`
-  - [ ] codegen 生成 `{0}`
-
+- [ ] **struct 支持定长数组字段**（`gen_struct_decl` 生成 `T name[N]`）
+- [ ] **`[0; N]` 重复初始化**（AST 加 `Expr::Repeat`）
 - [ ] **`write` 内置（不换行）**
-  - [ ] runtime 加 `lume_write`
-  - [ ] checker 加 `write` 到内置表
 
 ### 单线程版本
 
 - [ ] `big_from_int` / `big_zero`
 - [ ] `big_cmp_abs` / `big_cmp`
-- [ ] `big_add_abs` / `big_sub_abs`
-- [ ] `big_add` / `big_sub`
+- [ ] `big_add_abs` / `big_sub_abs` / `big_add` / `big_sub`
 - [ ] `big_mul`
 - [ ] `big_print`
 - [ ] 测试：`2^100` 正确输出 `1267650600228229401496703205376`
@@ -394,6 +353,39 @@
 | v0.5.0 | `par f()` + `await` + 线程池 + `lume_say` | 待做 |
 | v1.0.0 | 包管理 + 文档站 + 示例项目 + 动态数组 | 待做 |
 | v2.0.0 | 自举 | 长期 |
+
+---
+
+## 📎 附：两个核心优化的实现细节
+
+### 纯函数证明（`src/codegen/purity.rs`）
+
+`__attribute__((const))` 标错了会导致错误的 CSE（静默改结果），
+比不优化严重得多，所以判据非常保守 —— **任何一点不确定就放弃**：
+
+- 必须有返回值
+- 只写自己的局部变量；写数组 / 写字段 / 写全局 → 放弃
+- 只引用参数和函数内 `let` 出来的变量；碰全局 `const` → 放弃
+- 只调用数学库白名单函数（`sqrt` `pow` `sin` `abs` `min` `max` …）
+  或已经证明为纯的函数（不动点迭代）
+- `say` / `par for` / 方法调用 / 结构体字段访问 → 放弃
+- `@cache` / `@precompute` 的包装函数读写全局缓存表 → 放弃
+
+配合 `-fno-math-errno`，`sqrt`/`pow` 不再写 errno，白名单才成立。
+
+### `par for` reduction（`src/codegen/parallel.rs`）
+
+识别 `v = v OP rhs`（OP ∈ `+` `-` `*`），并且要求：
+
+- `v` 不是循环变量、循环体里没有被 `let` 重新声明
+- `v` 在整个循环体里的出现次数**恰好**等于 `2 × 累加语句条数`
+  —— 多一次就说明循环体还读了它，归约后语义会变，宁可不优化
+
+满足后：每个线程一份私有累加器（加法/减法按 `+=` 收集、乘法按 `*=`），
+结束后用 `+=` / `-=` / `*=` 合并回原变量。等价于 OpenMP 的 `reduction(+:v)`。
+
+不满足时行为和以前一样（不加锁，多线程写同一变量会竞争）——
+所以要写 `par for` 求和，就用 `sum += ...` 这种形式。
 
 ---
 
