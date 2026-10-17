@@ -1,5 +1,5 @@
 // src/codegen/items.rs
-use super::Codegen;
+use super::{Codegen, is_array_ty};
 use crate::ast::*;
 use std::collections::HashMap;
 
@@ -21,13 +21,17 @@ impl Codegen {
     // 数组/列表参数统一加 LUME_RESTRICT。
     // Lume 里数组是值语义、没有裸指针，两个数组参数不可能重叠，
     // 这个信息只有编译器知道 —— 加上之后 clang 才能放心把循环向量化。
+    //
+    // 数组参数还会额外带一个 `int64_t {name}_len` 伴随参数（见 gen_params）。
+    // 这是「数组跨函数」的关键：长度跟着数组一起走，调用点由编译器自动补，
+    // 用户不用再手写一个 n，也不用担心它和数组对不上。
 
     pub(crate) fn gen_param(&self, p: &Param) -> String {
         let ty = match &p.ty {
             Some(t) => self.gen_type(t),
             None => "int64_t".to_string(),
         };
-        if matches!(&p.ty, Some(Type::Array(_, _)) | Some(Type::List(_))) {
+        if is_array_ty(&p.ty) {
             format!("{} LUME_RESTRICT {}", ty, p.name)
         } else {
             format!("{} {}", ty, p.name)
@@ -43,21 +47,52 @@ impl Codegen {
             Some(t) => self.gen_type_subst(t, type_map),
             None => "int64_t".to_string(),
         };
-        if matches!(&p.ty, Some(Type::Array(_, _)) | Some(Type::List(_))) {
+        if is_array_ty(&p.ty) {
             format!("{} LUME_RESTRICT {}", ty, p.name)
         } else {
             format!("{} {}", ty, p.name)
         }
     }
 
-    // 数组参数登记：长度编译期未知，只登记"这是个数组"，
-    // 不能塞进 array_lens（否则 for x in arr 会拿 usize::MAX 当长度）
+    /// 完整参数列表：每个数组参数展开成「指针 + 伴随长度」两项，
+    /// 伴随参数紧跟在指针后面。声明和调用点必须走同一条规则，
+    /// 否则 C 原型和实参对不上。
+    pub(crate) fn gen_params(&self, params: &[Param]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for p in params {
+            out.push(self.gen_param(p));
+            if is_array_ty(&p.ty) {
+                out.push(format!("int64_t {}_len", p.name));
+            }
+        }
+        out
+    }
+
+    pub(crate) fn gen_params_subst(
+        &self,
+        params: &[Param],
+        type_map: &HashMap<String, String>,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for p in params {
+            out.push(self.gen_param_subst(p, type_map));
+            if is_array_ty(&p.ty) {
+                out.push(format!("int64_t {}_len", p.name));
+            }
+        }
+        out
+    }
+
+    // 数组参数登记：长度登记成伴随参数名 {name}_len，
+    // 这样函数体里 a.len / for v in a 都能用
     pub(crate) fn register_array_params(&mut self, params: &[Param]) {
         for p in params {
             if let Some(Type::Array(inner, _)) | Some(Type::List(inner)) = &p.ty {
                 self.array_params.insert(p.name.clone());
                 self.array_elem_types
                     .insert(p.name.clone(), self.gen_type(inner));
+                self.array_len_exprs
+                    .insert(p.name.clone(), format!("{}_len", p.name));
             }
         }
     }
@@ -81,8 +116,9 @@ impl Codegen {
             Some(t) => self.gen_type(t),
         };
         let mut params = vec![format!("{}* _self", struct_name)];
-        for p in &m.params {
-            params.push(self.gen_param(p));
+        params.extend(self.gen_params(&m.params));
+        if is_array_ty(&m.ret) {
+            params.push("int64_t* _ret_len".to_string());
         }
         self.push_line(&format!(
             "static {} {}({});",
@@ -96,9 +132,10 @@ impl Codegen {
             None => if is_main { "int".to_string() } else { "void".to_string() },
             Some(t) => self.gen_type(t),
         };
-        let params: Vec<String> = f.params.iter()
-            .map(|p| self.gen_param(p))
-            .collect();
+        let mut params = self.gen_params(&f.params);
+        if is_array_ty(&f.ret) {
+            params.push("int64_t* _ret_len".to_string());
+        }
         let params_str = if params.is_empty() {
             "void".to_string()
         } else {
@@ -124,12 +161,14 @@ impl Codegen {
         };
 
         let mut params = vec![format!("{}* _self", struct_name)];
-        for p in &m.params {
-            params.push(self.gen_param(p));
+        params.extend(self.gen_params(&m.params));
+        if is_array_ty(&m.ret) {
+            params.push("int64_t* _ret_len".to_string());
         }
 
         self.push_line(&format!("static {} {}({}) {{", ret_type, c_name, params.join(", ")));
         self.indent += 1;
+        self.cur_ret_is_array = is_array_ty(&m.ret);
 
         for p in &m.params {
             let ty = match &p.ty {
@@ -179,9 +218,10 @@ impl Codegen {
             Some(t) => self.gen_type(t),
         };
 
-        let params: Vec<String> = f.params.iter()
-            .map(|p| self.gen_param(p))
-            .collect();
+        let mut params = self.gen_params(&f.params);
+        if is_array_ty(&f.ret) {
+            params.push("int64_t* _ret_len".to_string());
+        }
 
         let params_str = if params.is_empty() {
             "void".to_string()
@@ -199,6 +239,7 @@ impl Codegen {
             params_str
         ));
         self.indent += 1;
+        self.cur_ret_is_array = is_array_ty(&f.ret);
 
         for p in &f.params {
             let ty = match &p.ty {
@@ -235,15 +276,10 @@ impl Codegen {
             Some(t) => self.gen_type_subst(t, type_map),
         };
 
-        let params: Vec<String> = f.params.iter()
-            .map(|p| {
-                let ty = match &p.ty {
-                    Some(t) => self.gen_type_subst(t, type_map),
-                    None => "int64_t".to_string(),
-                };
-                format!("{} {}", ty, p.name)
-            })
-            .collect();
+        let mut params = self.gen_params_subst(&f.params, type_map);
+        if is_array_ty(&f.ret) {
+            params.push("int64_t* _ret_len".to_string());
+        }
 
         self.push_line(&format!(
             "{} {}({});",
@@ -263,9 +299,10 @@ impl Codegen {
             Some(t) => self.gen_type_subst(t, type_map),
         };
 
-        let params: Vec<String> = f.params.iter()
-            .map(|p| self.gen_param_subst(p, type_map))
-            .collect();
+        let mut params = self.gen_params_subst(&f.params, type_map);
+        if is_array_ty(&f.ret) {
+            params.push("int64_t* _ret_len".to_string());
+        }
 
         self.push_line(&format!(
             "{}{} {}({}) {{",
@@ -333,9 +370,25 @@ impl Codegen {
             ));
         }
 
-        let args_str: Vec<String> = args.iter()
-            .map(|a| self.gen_expr(a))
-            .collect();
+        // 数组实参后面补长度，和 gen_params_subst 展开出来的伴随参数对齐
+        let mut args_str: Vec<String> = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            args_str.push(self.gen_expr(a));
+            let is_arr = generic_fn
+                .params
+                .get(i)
+                .map(|p| is_array_ty(&p.ty))
+                .unwrap_or(false);
+            if is_arr {
+                match self.array_len_of(a) {
+                    Some(len) => args_str.push(len),
+                    None => args_str.push(format!(
+                        "/* 无法确定第 {} 个实参的数组长度 */0LL",
+                        i + 1
+                    )),
+                }
+            }
+        }
         format!("{}({})", mono_name, args_str.join(", "))
     }
 
@@ -436,11 +489,13 @@ impl Codegen {
     // ── @cache（单线程，无锁）──
 
     fn gen_cached_fn(&mut self, f: &FnDecl) {
-        if f.params.len() != 1 {
+        if f.params.len() != 1 || is_array_ty(&f.params[0].ty) {
             self.push_line(&format!(
-                "/* @cache 暂只支持单参数: {} */",
+                "/* @cache 需要单个标量参数，退化成普通函数: {} */",
                 f.name
             ));
+            self.gen_fn_decl(f);
+            self.gen_fn_body_impl(f, &f.name);
             return;
         }
 
@@ -512,11 +567,13 @@ impl Codegen {
     // ── 线程安全版（用于 @precompute 与预计算程序）──
 
     pub(crate) fn gen_thread_safe_cached_fn(&mut self, f: &FnDecl) {
-        if f.params.len() != 1 {
+        if f.params.len() != 1 || is_array_ty(&f.params[0].ty) {
             self.push_line(&format!(
-                "/* 预计算暂只支持单参数: {} */",
+                "/* 预计算需要单个标量参数，退化成普通函数: {} */",
                 f.name
             ));
+            self.gen_fn_decl(f);
+            self.gen_fn_body_impl(f, &f.name);
             return;
         }
 
@@ -607,11 +664,13 @@ impl Codegen {
     // ── @precompute ──
 
     fn gen_precompute_fn(&mut self, f: &FnDecl) {
-        if f.params.len() != 1 {
+        if f.params.len() != 1 || is_array_ty(&f.params[0].ty) {
             self.push_line(&format!(
-                "/* @precompute 暂只支持单参数: {} */",
+                "/* @precompute 需要单个标量参数，退化成普通函数: {} */",
                 f.name
             ));
+            self.gen_fn_decl(f);
+            self.gen_fn_body_impl(f, &f.name);
             return;
         }
 
@@ -767,9 +826,10 @@ impl Codegen {
             Some(t) => self.gen_type(t),
         };
 
-        let params: Vec<String> = f.params.iter()
-            .map(|p| self.gen_param(p))
-            .collect();
+        let mut params = self.gen_params(&f.params);
+        if is_array_ty(&f.ret) {
+            params.push("int64_t* _ret_len".to_string());
+        }
 
         let params_str = if params.is_empty() {
             "void".to_string()
@@ -779,6 +839,7 @@ impl Codegen {
 
         self.push_line(&format!("static {} {}({}) {{", ret_type, impl_name, params_str));
         self.indent += 1;
+        self.cur_ret_is_array = is_array_ty(&f.ret);
 
         for p in &f.params {
             let ty = match &p.ty {

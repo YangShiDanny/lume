@@ -11,15 +11,26 @@ mod types;
 use crate::ast::*;
 use std::collections::{HashMap, HashSet};
 
+/// 数组类型判定：`[T]` 解析成 List，`[T; N]` 解析成 Array。
+/// 两者在 codegen 里一视同仁：指针 + 一个隐式长度伴随参数。
+pub(crate) fn is_array_ty(t: &Option<Type>) -> bool {
+    matches!(t, Some(Type::Array(_, _)) | Some(Type::List(_)))
+}
+
 pub struct Codegen {
     pub(crate) output: String,
     pub(crate) indent: usize,
     pub(crate) var_types: HashMap<String, String>,
     pub(crate) structs: HashMap<String, Vec<(String, String)>>,
     pub(crate) methods: HashMap<(String, String), String>,
-    pub(crate) array_lens: HashMap<String, usize>,
+    // 数组名 → 该数组长度的 C 表达式。
+    //   局部数组字面量 → "5LL"
+    //   数组参数       → "a_len"（伴随参数）
+    //   函数返回的数组 → "_r_len"
+    // 这是「数组跨函数」的核心：长度跟着数组一起走，调用点自动补。
+    pub(crate) array_len_exprs: HashMap<String, String>,
     pub(crate) array_elem_types: HashMap<String, String>,
-    // 数组/列表参数名（长度编译期未知，不能当成已知长度用）
+    // 数组/列表参数名（长度编译期未知）
     pub(crate) array_params: HashSet<String>,
     // 已证明为纯函数、可以打 __attribute__((const)) 的函数名
     pub(crate) const_fns: HashSet<String>,
@@ -27,6 +38,12 @@ pub struct Codegen {
     pub(crate) generic_fns: HashMap<String, FnDecl>,
     // 普通函数的返回类型（供插值/类型推断用，见 generate 步骤 2.4）
     pub(crate) fn_ret_types: HashMap<String, String>,
+    // 函数名 → 每个参数是不是数组（调用点据此补长度实参）
+    pub(crate) fn_array_params: HashMap<String, Vec<bool>>,
+    // (结构体名, 方法名) → 同上
+    pub(crate) method_array_params: HashMap<(String, String), Vec<bool>>,
+    // 返回数组的函数：C 签名多一个 int64_t* _ret_len 出参
+    pub(crate) array_ret_fns: HashSet<String>,
     pub(crate) monomorphized: HashMap<String, String>,
     pub(crate) pending_monos: Vec<(FnDecl, String, HashMap<String, String>)>,
     pub(crate) par_counter: usize,
@@ -34,6 +51,8 @@ pub struct Codegen {
     pub(crate) par_workers: String,
     // 当前 par worker 里通过 _p-> 访问的只读外层标量（见 parallel.rs）
     pub(crate) par_scalars: Vec<String>,
+    // 当前函数是否返回数组（决定 return 要不要 malloc 拷贝）
+    pub(crate) cur_ret_is_array: bool,
 }
 
 impl Codegen {
@@ -44,18 +63,22 @@ impl Codegen {
             var_types: HashMap::new(),
             structs: HashMap::new(),
             methods: HashMap::new(),
-            array_lens: HashMap::new(),
+            array_len_exprs: HashMap::new(),
             array_elem_types: HashMap::new(),
             array_params: HashSet::new(),
             const_fns: HashSet::new(),
             precomputed: HashMap::new(),
             generic_fns: HashMap::new(),
             fn_ret_types: HashMap::new(),
+            fn_array_params: HashMap::new(),
+            method_array_params: HashMap::new(),
+            array_ret_fns: HashSet::new(),
             monomorphized: HashMap::new(),
             pending_monos: Vec::new(),
             par_counter: 0,
             par_workers: String::new(),
             par_scalars: Vec::new(),
+            cur_ret_is_array: false,
         }
     }
 
@@ -81,6 +104,10 @@ impl Codegen {
                         Some(t) => self.gen_type(t),
                     };
                     self.methods.insert((s.name.clone(), m.name.clone()), ret);
+                    self.method_array_params.insert(
+                        (s.name.clone(), m.name.clone()),
+                        m.params.iter().map(|p| is_array_ty(&p.ty)).collect(),
+                    );
                 }
             }
         }
@@ -94,9 +121,10 @@ impl Codegen {
             }
         }
 
-        // 2.4 收集普通函数的返回类型。
-        //     没有这张表，say("{f(x)}") 里 f 返回 float 也会被推断成
+        // 2.4 收集普通函数的返回类型 + 数组参数标记。
+        //     没有返回类型表，say("{f(x)}") 里 f 返回 float 也会被推断成
         //     int64_t，插值就用 %lld 打印，小数全丢。
+        //     数组参数标记则是调用点自动补长度的依据。
         for item in &program.items {
             if let Item::Fn(f) = item {
                 let ret = match &f.ret {
@@ -104,6 +132,13 @@ impl Codegen {
                     Some(t) => self.gen_type(t),
                 };
                 self.fn_ret_types.insert(f.name.clone(), ret);
+                self.fn_array_params.insert(
+                    f.name.clone(),
+                    f.params.iter().map(|p| is_array_ty(&p.ty)).collect(),
+                );
+                if is_array_ty(&f.ret) {
+                    self.array_ret_fns.insert(f.name.clone());
+                }
             }
         }
 
@@ -225,7 +260,7 @@ impl Codegen {
         self.push_line("}");
         self.push_line("for (int64_t i = 0; i < _N; i++) {");
         self.indent += 1;
-        self.push_line("printf(\"%lld\\n\", (long long)_results[i]);");
+        self.push_line(&format!("printf(\"%lld\\n\", (long long)_results[i]);"));
         self.indent -= 1;
         self.push_line("}");
         self.push_line("free(_results);");

@@ -133,6 +133,8 @@ impl Codegen {
             let elem_ty = self.array_elem_types.get(arr)
                 .cloned().unwrap_or_else(|| "int64_t".to_string());
             self.push_line(&format!("{}* {};", elem_ty, arr));
+            // 数组长度一起传进 worker，循环体里 a.len 才用得了
+            self.push_line(&format!("int64_t {}_len;", arr));
         }
         for r in &reductions {
             self.push_line(&format!("{} {};", r.ty, r.field()));
@@ -230,6 +232,9 @@ impl Codegen {
         self.push_line("_a.end = _total_stop;");
         for arr in &used_arrays {
             self.push_line(&format!("_a.{} = {};", arr, arr));
+            let len_expr = self.array_len_exprs.get(arr).cloned()
+                .unwrap_or_else(|| "0LL".to_string());
+            self.push_line(&format!("_a.{}_len = {};", arr, len_expr));
         }
         for r in &reductions {
             self.push_line(&format!("_a.{} = {};", r.field(), r.init()));
@@ -262,6 +267,9 @@ impl Codegen {
         self.push_line("if (_args[_t].end > _total_stop) _args[_t].end = _total_stop;");
         for arr in &used_arrays {
             self.push_line(&format!("_args[_t].{} = {};", arr, arr));
+            let len_expr = self.array_len_exprs.get(arr).cloned()
+                .unwrap_or_else(|| "0LL".to_string());
+            self.push_line(&format!("_args[_t].{}_len = {};", arr, len_expr));
         }
         for r in &reductions {
             self.push_line(&format!(
@@ -583,6 +591,15 @@ impl Codegen {
                     format!("{}.0", s)
                 }
             }
+            // a.len → _p->a_len（长度在 args 结构体里）
+            Expr::Field(o, name) if name == "len" => {
+                if let Expr::Ident(arr) = o.as_ref() {
+                    if arrays.contains(arr) {
+                        return format!("_p->{}_len", arr);
+                    }
+                }
+                self.gen_expr(expr)
+            }
             Expr::Ident(name) => name.clone(),
             _ => self.gen_expr(expr),
         }
@@ -637,7 +654,7 @@ impl Codegen {
             Expr::Ident(name) => {
                 // 字面量数组（编译期知道长度）和数组参数都算
                 if !out.contains(name)
-                    && (self.array_lens.contains_key(name)
+                    && (self.array_len_exprs.contains_key(name)
                         || self.array_params.contains(name))
                 {
                     out.push(name.clone());

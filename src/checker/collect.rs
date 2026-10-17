@@ -87,7 +87,9 @@ impl Checker {
                 Type::Str => Ty::Str,
                 Type::Rune => Ty::Rune,
                 Type::Named(s) => Ty::Struct(s.clone()),
-                Type::List(_) => Ty::Unknown,
+                Type::List(inner) | Type::Array(inner, _) => {
+                    Ty::Array(Box::new(self.ty_from_ast(Some(inner))))
+                }
                 _ => Ty::Unknown,
             },
         }

@@ -98,21 +98,12 @@ impl Codegen {
                     }
                 }
 
-                // 数组 .len()
+                // a.len() —— 数组长度。
+                // 局部字面量是常量，数组参数是伴随参数 {name}_len
                 if let Expr::Field(obj, method) = callee.as_ref() {
                     if method == "len" && args.is_empty() {
-                        if let Expr::Ident(arr_name) = obj.as_ref() {
-                            if let Some(&len) = self.array_lens.get(arr_name) {
-                                if len != usize::MAX {
-                                    return format!("{}LL", len);
-                                }
-                            }
-                            // 数组参数：用 {name}_len
-                            if self.var_types.get(arr_name)
-                                .map(|t| t.ends_with('*')).unwrap_or(false)
-                            {
-                                return format!("{}_len", arr_name);
-                            }
+                        if let Some(len) = self.array_len_of(obj) {
+                            return len;
                         }
                     }
                 }
@@ -128,14 +119,26 @@ impl Codegen {
                 if let Expr::Field(obj, method_name) = callee.as_ref() {
                     if let Expr::Ident(obj_name) = obj.as_ref() {
                         if let Some(struct_name) = self.var_types.get(obj_name).cloned() {
-                            if self.methods.contains_key(
-                                &(struct_name.clone(), method_name.clone())
-                            ) {
-                                let args_str: Vec<String> = args.iter()
-                                    .map(|a| self.gen_expr(a))
-                                    .collect();
+                            let key = (struct_name.clone(), method_name.clone());
+                            if self.methods.contains_key(&key) {
+                                let arr_flags = self
+                                    .method_array_params
+                                    .get(&key)
+                                    .cloned()
+                                    .unwrap_or_default();
                                 let mut all_args = vec![format!("&{}", obj_name)];
-                                all_args.extend(args_str);
+                                for (i, a) in args.iter().enumerate() {
+                                    all_args.push(self.gen_expr(a));
+                                    if arr_flags.get(i).copied().unwrap_or(false) {
+                                        match self.array_len_of(a) {
+                                            Some(len) => all_args.push(len),
+                                            None => all_args.push(format!(
+                                                "/* 无法确定第 {} 个实参的数组长度 */0LL",
+                                                i + 1
+                                            )),
+                                        }
+                                    }
+                                }
                                 return format!(
                                     "{}_{}({})",
                                     struct_name, method_name, all_args.join(", ")
@@ -145,15 +148,28 @@ impl Codegen {
                     }
                 }
 
-                // 普通调用
+                // 普通调用。数组实参后面自动补一个长度实参，
+                // 和被调用函数的伴随参数一一对应（见 gen_params）
                 let callee_str = self.gen_expr(callee);
-                let args_str: Vec<String> = args.iter()
-                    .map(|a| self.gen_expr(a))
-                    .collect();
-                format!("{}({})", callee_str, args_str.join(", "))
+                if let Expr::Ident(fname) = callee.as_ref() {
+                    if self.array_ret_fns.contains(fname) {
+                        return format!(
+                            "/* {}() 返回数组，请写成 `let r = {}(...)` 才能拿到长度 */",
+                            fname, fname
+                        );
+                    }
+                }
+                let arg_strs = self.gen_call_args(callee, args, None);
+                format!("{}({})", callee_str, arg_strs.join(", "))
             }
 
             Expr::Field(obj, name) => {
+                // a.len —— 数组长度（局部字面量和数组参数都支持）
+                if name == "len" {
+                    if let Some(len) = self.array_len_of(obj) {
+                        return len;
+                    }
+                }
                 let o = self.gen_expr(obj);
                 format!("{}.{}", o, name)
             }
@@ -180,6 +196,161 @@ impl Codegen {
             }
 
             _ => "/* TODO */".to_string(),
+        }
+    }
+
+    /// 数组实参的长度表达式。
+    /// 数组变量查 array_len_exprs；数组字面量直接用元素个数
+    /// （C99 复合字面量的生命周期覆盖整次调用，作为实参是安全的）。
+    pub(crate) fn array_len_of(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Ident(n) => self.array_len_exprs.get(n).cloned(),
+            Expr::List(items) => Some(format!("{}LL", items.len())),
+            _ => None,
+        }
+    }
+
+    /// 生成一次普通函数调用的实参列表，数组实参后面自动补长度。
+    /// 声明处用 gen_params 展开伴随参数，两边规则必须一致。
+    /// fields 非空表示在结构体方法里，表达式要走 with_self 版本。
+    pub(crate) fn gen_call_args(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        fields: Option<&[String]>,
+    ) -> Vec<String> {
+        let arr_flags: Option<Vec<bool>> = match callee {
+            Expr::Ident(fname) => self.fn_array_params.get(fname).cloned(),
+            _ => None,
+        };
+        let mut out: Vec<String> = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let s = match fields {
+                Some(f) => self.gen_expr_with_self(a, f),
+                None => self.gen_expr(a),
+            };
+            out.push(s);
+            let need_len = arr_flags
+                .as_ref()
+                .and_then(|fl| fl.get(i))
+                .copied()
+                .unwrap_or(false);
+            if need_len {
+                match self.array_len_of(a) {
+                    Some(len) => out.push(len),
+                    None => out.push(format!(
+                        "/* 无法确定第 {} 个实参的数组长度 */0LL",
+                        i + 1
+                    )),
+                }
+            }
+        }
+        out
+    }
+
+    /// `let r = f(...)` 且 f 返回数组：C 函数多一个长度出参，
+    /// 必须拆成「声明指针 + 声明长度 + 赋值」三行，长度才有地方落。
+    /// 返回 None 表示不是这种情况，走普通 let。
+    pub(crate) fn gen_array_let(
+        &mut self,
+        name: &str,
+        init: &Expr,
+        fields: Option<&[String]>,
+    ) -> Option<Vec<String>> {
+        let (callee, args) = match init {
+            Expr::Call(c, a) => (c.as_ref(), a),
+            _ => return None,
+        };
+        let fname = match callee {
+            Expr::Ident(f) => f.clone(),
+            _ => return None,
+        };
+        if !self.array_ret_fns.contains(&fname) {
+            return None;
+        }
+        let elem_ty = self
+            .fn_ret_types
+            .get(&fname)
+            .cloned()
+            .unwrap_or_else(|| "int64_t*".to_string())
+            .trim_end_matches('*')
+            .to_string();
+        let mut parts = self.gen_call_args(callee, args, fields);
+        parts.push(format!("&{}_len", name));
+        // 登记成长度和普通数组一样，后面 r.len / for v in r 都能用
+        self.array_len_exprs
+            .insert(name.to_string(), format!("{}_len", name));
+        self.array_elem_types
+            .insert(name.to_string(), elem_ty.clone());
+        self.var_types
+            .insert(name.to_string(), format!("{}*", elem_ty));
+        Some(vec![
+            format!("{}* {};", elem_ty, name),
+            format!("int64_t {}_len;", name),
+            format!("{} = {}({});", name, fname, parts.join(", ")),
+        ])
+    }
+
+    /// 返回数组的两种合法形式：
+    ///   return [1,2,3]  → malloc 拷贝（栈上的复合字面量离开函数就悬空）
+    ///   return a        → 把入参数组直接传出去，长度一起带出去
+    /// 其他形式返回 None，走普通 return
+    pub(crate) fn gen_array_return(
+        &mut self,
+        e: &Expr,
+        fields: Option<&[String]>,
+    ) -> Option<Vec<String>> {
+        match e {
+            Expr::List(items) => {
+                let elem_ty = if let Some(first) = items.first() {
+                    self.infer_type(first)
+                } else {
+                    "int64_t".to_string()
+                };
+                let n = items.len();
+                let mut out = vec![format!(
+                    "{}* _r = ({}*)malloc((size_t){} * sizeof({}));",
+                    elem_ty, elem_ty, n, elem_ty
+                )];
+                for (i, it) in items.iter().enumerate() {
+                    let v = match fields {
+                        Some(f) => self.gen_expr_with_self(it, f),
+                        None => self.gen_expr(it),
+                    };
+                    out.push(format!("_r[{}] = {};", i, v));
+                }
+                out.push(format!("*_ret_len = {}LL;", n));
+                out.push("return _r;".to_string());
+                Some(out)
+            }
+            Expr::Ident(src) => {
+                let len = self.array_len_exprs.get(src).cloned()?;
+                if self.array_params.contains(src) {
+                    // 入参数组指向调用方的内存，活得过函数返回，直接传出去
+                    Some(vec![
+                        format!("*_ret_len = {};", len),
+                        format!("return {};", src),
+                    ])
+                } else {
+                    // 局部数组在 C 里是栈上的 `T x[N]`，返回它就是悬空指针。
+                    // 必须 malloc 拷一份。
+                    let elem_ty = self.array_elem_types.get(src).cloned()
+                        .unwrap_or_else(|| "int64_t".to_string());
+                    Some(vec![
+                        format!(
+                            "{}* _r = ({}*)malloc((size_t)({}) * sizeof({}));",
+                            elem_ty, elem_ty, len, elem_ty
+                        ),
+                        format!(
+                            "for (int64_t _i = 0; _i < ({}); _i++) {{ _r[_i] = {}[_i]; }}",
+                            len, src
+                        ),
+                        format!("*_ret_len = {};", len),
+                        "return _r;".to_string(),
+                    ])
+                }
+            }
+            _ => None,
         }
     }
 
@@ -225,20 +396,12 @@ impl Codegen {
                     }
                 }
 
-                // 数组 .len()
+                // a.len() —— 数组长度。
+                // 局部字面量是常量，数组参数是伴随参数 {name}_len
                 if let Expr::Field(obj, method) = callee.as_ref() {
                     if method == "len" && args.is_empty() {
-                        if let Expr::Ident(arr_name) = obj.as_ref() {
-                            if let Some(&len) = self.array_lens.get(arr_name) {
-                                if len != usize::MAX {
-                                    return format!("{}LL", len);
-                                }
-                            }
-                            if self.var_types.get(arr_name)
-                                .map(|t| t.ends_with('*')).unwrap_or(false)
-                            {
-                                return format!("{}_len", arr_name);
-                            }
+                        if let Some(len) = self.array_len_of(obj) {
+                            return len;
                         }
                     }
                 }
@@ -254,14 +417,26 @@ impl Codegen {
                 if let Expr::Field(obj, method_name) = callee.as_ref() {
                     if let Expr::Ident(obj_name) = obj.as_ref() {
                         if let Some(struct_name) = self.var_types.get(obj_name).cloned() {
-                            if self.methods.contains_key(
-                                &(struct_name.clone(), method_name.clone())
-                            ) {
-                                let args_str: Vec<String> = args.iter()
-                                    .map(|a| self.gen_expr_with_self(a, fields))
-                                    .collect();
+                            let key = (struct_name.clone(), method_name.clone());
+                            if self.methods.contains_key(&key) {
+                                let arr_flags = self
+                                    .method_array_params
+                                    .get(&key)
+                                    .cloned()
+                                    .unwrap_or_default();
                                 let mut all_args = vec![format!("&{}", obj_name)];
-                                all_args.extend(args_str);
+                                for (i, a) in args.iter().enumerate() {
+                                    all_args.push(self.gen_expr_with_self(a, fields));
+                                    if arr_flags.get(i).copied().unwrap_or(false) {
+                                        match self.array_len_of(a) {
+                                            Some(len) => all_args.push(len),
+                                            None => all_args.push(format!(
+                                                "/* 无法确定第 {} 个实参的数组长度 */0LL",
+                                                i + 1
+                                            )),
+                                        }
+                                    }
+                                }
                                 return format!(
                                     "{}_{}({})",
                                     struct_name, method_name, all_args.join(", ")
@@ -272,10 +447,16 @@ impl Codegen {
                 }
 
                 let callee_str = self.gen_expr_with_self(callee, fields);
-                let args_str: Vec<String> = args.iter()
-                    .map(|a| self.gen_expr_with_self(a, fields))
-                    .collect();
-                format!("{}({})", callee_str, args_str.join(", "))
+                if let Expr::Ident(fname) = callee.as_ref() {
+                    if self.array_ret_fns.contains(fname) {
+                        return format!(
+                            "/* {}() 返回数组，请写成 `let r = {}(...)` 才能拿到长度 */",
+                            fname, fname
+                        );
+                    }
+                }
+                let arg_strs = self.gen_call_args(callee, args, Some(fields));
+                format!("{}({})", callee_str, arg_strs.join(", "))
             }
 
             Expr::Binary(l, op, r) => {
@@ -315,6 +496,11 @@ impl Codegen {
 
             // self.x → _self->x（裸字段名由上面的 Ident 分支处理）
             Expr::Field(obj, name) => {
+                if name == "len" {
+                    if let Some(len) = self.array_len_of(obj) {
+                        return len;
+                    }
+                }
                 if let Expr::Ident(id) = obj.as_ref() {
                     if id == "self" && fields.contains(name) {
                         return format!("_self->{}", name);

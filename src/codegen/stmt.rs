@@ -5,6 +5,14 @@ impl Codegen {
     pub(crate) fn gen_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let { name, ty, init } => {
+                // 数组返回值的调用：拆成三行，把长度落进 {name}_len
+                if let Some(lines) = self.gen_array_let(name, init, None) {
+                    for l in lines {
+                        self.push_line(&l);
+                    }
+                    return;
+                }
+
                 if let Expr::List(items) = init {
                     let len = items.len();
                     let elem_ty = if let Some(first) = items.first() {
@@ -19,7 +27,8 @@ impl Codegen {
                         "{} {}[] = {{{}}};",
                         elem_ty, name, elem_strs.join(", ")
                     ));
-                    self.array_lens.insert(name.clone(), len);
+                    self.array_len_exprs
+                        .insert(name.clone(), format!("{}LL", len));
                     self.array_elem_types.insert(name.clone(), elem_ty.clone());
                     self.var_types.insert(name.clone(), format!("{}*", elem_ty));
                     return;
@@ -91,6 +100,15 @@ impl Codegen {
 
             Stmt::Return(v) => match v {
                 Some(e) => {
+                    // 返回数组：栈上的字面量不能直接返回（悬空指针），必须 malloc
+                    if self.cur_ret_is_array {
+                        if let Some(lines) = self.gen_array_return(e, None) {
+                            for l in lines {
+                                self.push_line(&l);
+                            }
+                            return;
+                        }
+                    }
                     let s = self.gen_expr(e);
                     self.push_line(&format!("return {};", s));
                 }
@@ -106,6 +124,13 @@ impl Codegen {
     pub(crate) fn gen_stmt_with_self(&mut self, stmt: &Stmt, fields: &[String]) {
         match stmt {
             Stmt::Let { name, ty, init } => {
+                if let Some(lines) = self.gen_array_let(name, init, Some(fields)) {
+                    for l in lines {
+                        self.push_line(&l);
+                    }
+                    return;
+                }
+
                 if let Expr::List(items) = init {
                     let len = items.len();
                     let elem_ty = if let Some(first) = items.first() {
@@ -120,7 +145,8 @@ impl Codegen {
                         "{} {}[] = {{{}}};",
                         elem_ty, name, elem_strs.join(", ")
                     ));
-                    self.array_lens.insert(name.clone(), len);
+                    self.array_len_exprs
+                        .insert(name.clone(), format!("{}LL", len));
                     self.array_elem_types.insert(name.clone(), elem_ty.clone());
                     self.var_types.insert(name.clone(), format!("{}*", elem_ty));
                     return;
@@ -189,6 +215,14 @@ impl Codegen {
 
             Stmt::Return(v) => match v {
                 Some(e) => {
+                    if self.cur_ret_is_array {
+                        if let Some(lines) = self.gen_array_return(e, Some(fields)) {
+                            for l in lines {
+                                self.push_line(&l);
+                            }
+                            return;
+                        }
+                    }
                     let s = self.gen_expr_with_self(e, fields);
                     self.push_line(&format!("return {};", s));
                 }
@@ -223,28 +257,28 @@ impl Codegen {
                 self.var_types.insert(var.to_string(), "int64_t".to_string());
             }
             Expr::Ident(arr_name) => {
-                if let Some(&len) = self.array_lens.get(arr_name) {
+                // 局部数组字面量和数组参数都在 array_len_exprs 里：
+                // 前者长度是常量，后者是伴随参数 {name}_len。
+                // 有了隐式长度参数，for v in a 对两者都能用。
+                if let Some(len_expr) = self.array_len_exprs.get(arr_name).cloned() {
                     let elem_ty = self.array_elem_types.get(arr_name)
                         .cloned().unwrap_or_else(|| "int64_t".to_string());
                     let idx = format!("_i_{}", arr_name);
                     self.push_vectorize_hint();
                     self.push_line(&format!(
                         "for (int64_t {} = 0; {} < {}; {}++) {{",
-                        idx, idx, len, idx
+                        idx, idx, len_expr, idx
                     ));
                     self.push_line(&format!(
                         "{} {} = {}[{}];",
                         elem_ty, var, arr_name, idx
                     ));
                     self.var_types.insert(var.to_string(), elem_ty);
-                } else if self.array_params.contains(arr_name) {
-                    // 数组参数：编译期不知道长度，不能拿 usize::MAX 当上界
+                } else {
                     self.push_line(&format!(
-                        "/* for: {} 是数组参数，长度未知，请写 for i in 0..n */",
+                        "/* for: 无法确定 {} 的长度（只有数组字面量和数组参数可以）*/",
                         arr_name
                     ));
-                } else {
-                    self.push_line("/* for: 未知数组 */");
                 }
             }
             _ => self.push_line("/* for: 暂不支持 */"),

@@ -15,6 +15,9 @@ pub enum Ty {
     Void,
     Unknown,
     Struct(String),
+    /// 数组。长度在运行期才知道（局部字面量除外），所以这里只记元素类型，
+    /// 长度由 codegen 的隐式伴随参数负责传递。
+    Array(Box<Ty>),
 }
 
 impl Ty {
@@ -28,6 +31,7 @@ impl Ty {
             Ty::Void => "void".to_string(),
             Ty::Unknown => "?".to_string(),
             Ty::Struct(s) => s.clone(),
+            Ty::Array(inner) => format!("[{}]", inner.name()),
         }
     }
 

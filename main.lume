@@ -66,6 +66,42 @@ fn axpy(a: [float], b: [float], out: [float], n: int) {
     }
 }
 
+// ── 数组跨函数：隐式长度伴随参数 ──
+// 声明处不用写 n。编译成 C 时数组参数自动多一个 int64_t a_len，
+// 调用点由编译器自动补长度 —— 长度永远跟着数组走，不可能对不上。
+
+// 只收数组：a.len 和 for v in a 都能用
+fn total(a: [int]) -> int {
+    s: int = 0
+    for v in a {
+        s += v
+    }
+    return s
+}
+
+// 混个标量参数，确认伴随参数的插入位置没打乱后面的参数
+fn first_n(a: [int], k: int) -> int {
+    s: int = 0
+    for i in 0..k {
+        s += a[i]
+    }
+    return s
+}
+
+// 函数返回数组：C 层 malloc + 长度出参，Lume 层 let r = f(...) 一并拿到
+fn scaled(a: [int], k: int) -> [int] {
+    out := [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for i in 0..a.len {
+        out[i] = a[i] * k
+    }
+    return out
+}
+
+// 入参数组直接传出：指向调用方的内存，不用拷贝
+fn passthru(a: [int]) -> [int] {
+    return a
+}
+
 // ── @cache：运行时记忆化，哈希表 O(1) ──
 @cache
 fn csteps(n: int) -> int {
@@ -266,6 +302,27 @@ fn main() {
     t4 := now()
     say("[13] csteps(100000)={c1}   首次 {t3 - t2} ns")
     say("[13] 再次调用={c2}         命中 {t4 - t3} ns          期望值相同，耗时接近 0")
+
+    // 14. 隐式长度参数：不传 n。total(xs) 和 total(1500个1) 都只给数组
+    t1 := total(xs)
+    t2 := total(big)
+    say("[14] total(xs)={t1}  total(1500个1)={t2}              期望 55 / 1500")
+
+    // 15. 数组字面量直接作实参（长度编译器自己数）
+    t3 := total([10, 20, 30])
+    say("[15] total([10,20,30])={t3}                           期望 60")
+
+    // 16. 函数返回数组：r.len 可用，说明长度真的跟着数组回来了
+    r := scaled(xs, 3)
+    say("[16] scaled(xs,3) 长度={r.len} 前三项={r[0]} {r[1]} {r[2]}     期望 10 / 3 6 9")
+
+    // 17. 返回的数组继续传给别的函数，长度照样自动补
+    t4 := total(r)
+    say("[17] total(scaled(xs,3))={t4}                         期望 165")
+
+    // 18. 入参数组直接传出（不拷贝），长度也带回来
+    p := passthru(xs)
+    say("[18] passthru(xs).len={p.len}  total={total(p)}        期望 10 / 55")
 
     say("===== 完成 =====")
 }

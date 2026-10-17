@@ -10,7 +10,7 @@
 // 判据是保守的：任何一点不确定就放弃，宁可少标也绝不标错
 // （标错了会导致错误的 CSE，属于静默改结果，比不优化严重得多）。
 
-use super::Codegen;
+use super::{Codegen, is_array_ty};
 use crate::ast::*;
 use std::collections::HashSet;
 
@@ -28,8 +28,10 @@ impl Codegen {
         let mut cands: Vec<FnDecl> = Vec::new();
         for item in &program.items {
             if let Item::Fn(f) = item {
-                // 必须有返回值；@cache/@precompute 的包装函数读写全局缓存表，不算纯
+                // 必须有返回值；@cache/@precompute 的包装函数读写全局缓存表，不算纯；
+                // 返回数组的函数要 malloc，同样不可能是 const
                 if f.ret.is_some()
+                    && !is_array_ty(&f.ret)
                     && !f.decorators.iter()
                         .any(|d| d.name == "cache" || d.name == "precompute")
                 {

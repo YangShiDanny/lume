@@ -162,7 +162,11 @@ impl Checker {
                 Ty::Int
             }
             Expr::Ident(_) => {
-                let _ = self.check_expr(iter);
+                // for v in a：v 的类型是数组元素类型
+                let t = self.check_expr(iter);
+                if let Ty::Array(inner) = &t {
+                    return inner.as_ref().clone();
+                }
                 Ty::Unknown
             }
             _ => {

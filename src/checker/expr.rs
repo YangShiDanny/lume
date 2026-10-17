@@ -138,6 +138,12 @@ impl Checker {
                     for a in args {
                         let _ = self.check_expr(a);
                     }
+                    // a.len() → int
+                    if method == "len" && args.is_empty() {
+                        if let Ty::Array(_) = &obj_ty {
+                            return Ty::Int;
+                        }
+                    }
                     if let Ty::Struct(sname) = &obj_ty {
                         if let Some(methods) = self.methods.get(sname).cloned() {
                             if let Some(sig) = methods.get(method).cloned() {
@@ -157,6 +163,12 @@ impl Checker {
 
             Expr::Field(obj, name) => {
                 let obj_ty = self.check_expr(obj);
+                // a.len → int
+                if name == "len" {
+                    if let Ty::Array(_) = &obj_ty {
+                        return Ty::Int;
+                    }
+                }
                 if let Ty::Struct(sname) = &obj_ty {
                     if let Some(fields) = self.structs.get(sname) {
                         if let Some(fty) = fields.get(name) {
@@ -168,7 +180,7 @@ impl Checker {
             }
 
             Expr::Index(obj, idx) => {
-                let _ = self.check_expr(obj);
+                let obj_ty = self.check_expr(obj);
                 let idx_ty = self.check_expr(idx);
                 if !idx_ty.is_unknown() && idx_ty != Ty::Int {
                     self.error(format!(
@@ -176,7 +188,11 @@ impl Checker {
                         idx_ty.name()
                     ));
                 }
-                Ty::Int
+                // a[i] 的类型就是数组元素类型；不是数组就还按 int 算
+                match &obj_ty {
+                    Ty::Array(inner) => inner.as_ref().clone(),
+                    _ => Ty::Int,
+                }
             }
 
             Expr::Slice(_, _, _, _) => Ty::Unknown,
@@ -213,7 +229,7 @@ impl Checker {
                         return Ty::Unknown;
                     }
                 }
-                Ty::Unknown
+                Ty::Array(Box::new(elem_ty))
             }
 
             Expr::Map(_) => Ty::Unknown,
