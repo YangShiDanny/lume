@@ -70,12 +70,57 @@ impl Codegen {
             Expr::Color(c) => format!("0x{:06X}", c),
             Expr::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
             Expr::Nothing => "NULL".to_string(),
-            Expr::Ident(name) => name.clone(),
+            Expr::Ident(name) => {
+                if name == "None" {
+                    let tag = self.opt_tag("int64_t");
+                    return format!("({}){{0, 0}}", tag);
+                }
+                name.clone()
+            }
             Expr::It => "_it".to_string(),
 
             Expr::Binary(l, op, r) => {
                 let ls = self.gen_expr(l);
                 let rs = self.gen_expr(r);
+
+                // 除以 2^n → 右移（有符号加修正）
+                if let BinOp::Div = op {
+                    if let Expr::Int(d) = r.as_ref() {
+                        if *d > 1 && (*d as u64).is_power_of_two() {
+                            let shift = (*d as u64).trailing_zeros();
+                            let is_unsigned = match l.as_ref() {
+                                Expr::Ident(name) => self.var_types.get(name)
+                                    .map(|t| t.starts_with("uint"))
+                                    .unwrap_or(false),
+                                _ => false,
+                            };
+                            if is_unsigned {
+                                return format!("({} >> {})", ls, shift);
+                            }
+                            return format!("lume_sdiv_pow2({}, {}LL)", ls, shift);
+                        }
+                    }
+                }
+                // 非负整数取模 2^n → 位与
+                if let BinOp::Mod = op {
+                    if let Expr::Int(b) = r.as_ref() {
+                        if *b > 0 && (*b as u64).is_power_of_two() {
+                            let is_non_neg = match l.as_ref() {
+                                Expr::Ident(name) => {
+                                    self.non_neg_vars.contains(name)
+                                        || self.var_types.get(name)
+                                            .map(|t| t.starts_with("uint"))
+                                            .unwrap_or(false)
+                                }
+                                _ => false,
+                            };
+                            if is_non_neg {
+                                let mask = (*b as u64) - 1;
+                                return format!("({} & {}LL)", ls, mask as i64);
+                            }
+                        }
+                    }
+                }
                 let op_str = match op {
                     BinOp::Add => "+",
                     BinOp::Sub => "-",
@@ -152,7 +197,44 @@ impl Codegen {
                 format!("({}{})", op_str, es)
             }
 
+            // ! 强制解包：has==0 直接运行时报错（崩得明明白白）
+            Expr::Force(e) => {
+                let ec = self.gen_expr(e);
+                format!(
+                    "({{ __typeof__({}) _o = {}; if (!_o.has) {{ fprintf(stderr, \"lume: 对 None 用了 !\\n\"); abort(); }} _o.val; }})",
+                    ec, ec
+                )
+            }
+
+            // ? 传播：has==0 提前返回 None（要求当前函数返回 T?）
+            Expr::Try(e) => {
+                let ec = self.gen_expr(e);
+                let ret = &self.cur_ret_c;
+                format!(
+                    "({{ __typeof__({}) _t = {}; if (!_t.has) {{ return ({}){{0, 0}}; }} _t.val; }})",
+                    ec, ec, ret
+                )
+            }
+
             Expr::Call(callee, args) => {
+                // 内置构造：Some(x) / None
+                if let Expr::Ident(name) = callee.as_ref() {
+                    if name == "Some" {
+                        if let Some(x) = args.first() {
+                            let elem_c = self.infer_type(x);
+                            let tag = self.opt_tag(&elem_c);
+                            let xc = self.gen_expr(x);
+                            return format!("(({}){{1, {}}})", tag, xc);
+                        }
+                        let tag = self.opt_tag("int64_t");
+                        return format!("({}){{0, 0}}", tag);
+                    }
+                    if name == "None" {
+                        let tag = self.opt_tag("int64_t");
+                        return format!("({}){{0, 0}}", tag);
+                    }
+                }
+
                 // 内置函数
                 if let Expr::Ident(name) = callee.as_ref() {
                     if name == "say" {
@@ -722,6 +804,46 @@ impl Codegen {
             Expr::Binary(l, op, r) => {
                 let ls = self.gen_expr_with_self(l, fields);
                 let rs = self.gen_expr_with_self(r, fields);
+
+                // 除以 2^n → 右移（有符号加修正）
+                if let BinOp::Div = op {
+                    if let Expr::Int(d) = r.as_ref() {
+                        if *d > 1 && (*d as u64).is_power_of_two() {
+                            let shift = (*d as u64).trailing_zeros();
+                            let is_unsigned = match l.as_ref() {
+                                Expr::Ident(name) => self.var_types.get(name)
+                                    .map(|t| t.starts_with("uint"))
+                                    .unwrap_or(false),
+                                _ => false,
+                            };
+                            if is_unsigned {
+                                return format!("({} >> {})", ls, shift);
+                            }
+                            return format!("lume_sdiv_pow2({}, {}LL)", ls, shift);
+                        }
+                    }
+                }
+                
+                // 非负整数取模 2^n → 位与
+                if let BinOp::Mod = op {
+                    if let Expr::Int(b) = r.as_ref() {
+                        if *b > 0 && (*b as u64).is_power_of_two() {
+                            let is_non_neg = match l.as_ref() {
+                                Expr::Ident(name) => {
+                                    self.non_neg_vars.contains(name)
+                                        || self.var_types.get(name)
+                                            .map(|t| t.starts_with("uint"))
+                                            .unwrap_or(false)
+                                }
+                                _ => false,
+                            };
+                            if is_non_neg {
+                                let mask = (*b as u64) - 1;
+                                return format!("({} & {}LL)", ls, mask as i64);
+                            }
+                        }
+                    }
+                }
                 let op_str = match op {
                     BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
                     BinOp::Div => "/", BinOp::Mod => "%",

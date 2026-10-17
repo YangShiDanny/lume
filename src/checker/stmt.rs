@@ -78,10 +78,7 @@ impl Checker {
                     None => init_ty.clone(),
                 };
 
-                if !declared_ty.is_unknown()
-                    && !init_ty.is_unknown()
-                    && declared_ty != init_ty
-                {
+                if !self.ty_eq_loose(&declared_ty, &init_ty) {
                     self.error_hint(
                         format!(
                             "类型不匹配：{} 声明为 {}，但初始值是 {}",
@@ -154,10 +151,7 @@ impl Checker {
                     None => Ty::Void,
                 };
                 let expected = self.current_ret.clone();
-                if !expected.is_unknown()
-                    && !actual_ty.is_unknown()
-                    && expected != actual_ty
-                {
+                if !self.ty_eq_loose(&expected, &actual_ty) {
                     self.error_hint(
                         format!(
                             "返回类型不匹配：函数声明返回 {}，但这里是 {}",
@@ -179,6 +173,22 @@ impl Checker {
                     self.pop_scope();
                 }
             }
+        }
+    }
+
+    /// 宽松类型相等：Optional(Unknown)（即 None 的字面量类型）与任何
+    /// Optional 都兼容，这样 `x: int? = None` 不会被误报类型不匹配。
+    fn ty_eq_loose(&self, a: &Ty, b: &Ty) -> bool {
+        if a.is_unknown() || b.is_unknown() {
+            return true;
+        }
+        if a == b {
+            return true;
+        }
+        match (a, b) {
+            (Ty::Optional(inner_a), Ty::Optional(_)) if inner_a.is_unknown() => true,
+            (Ty::Optional(_), Ty::Optional(inner_b)) if inner_b.is_unknown() => true,
+            _ => false,
         }
     }
 

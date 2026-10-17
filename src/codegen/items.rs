@@ -4,6 +4,25 @@ use crate::ast::*;
 use std::collections::HashMap;
 
 impl Codegen {
+    fn has_fastmath(f: &FnDecl) -> bool {
+        f.decorators.iter().any(|d| d.name == "fastmath")
+    }
+
+    fn push_fastmath(&mut self, f: &FnDecl) {
+        if Self::has_fastmath(f) {
+            self.push_line("#pragma clang fp push");
+            self.push_line("#pragma clang fp reassociate(on)");
+            self.push_line("#pragma clang fp contract(fast)");
+            self.push_line("#pragma clang fp reciprocal(on)");
+        }
+    }
+
+    fn pop_fastmath(&mut self, f: &FnDecl) {
+        if Self::has_fastmath(f) {
+            self.push_line("#pragma clang fp pop");
+        }
+    }
+
     pub(crate) fn gen_struct_decl(&mut self, s: &StructDecl) {
         self.push_line(&format!("typedef struct {} {{", s.name));
         self.indent += 1;
@@ -179,7 +198,9 @@ impl Codegen {
 
         self.push_line(&format!("static {} {}({}) {{", ret_type, c_name, params.join(", ")));
         self.indent += 1;
+        self.push_fastmath(m);
         self.cur_ret_is_array = is_array_ty(&m.ret);
+        self.cur_ret_c = ret_type.clone();
 
         for p in &m.params {
             let ty = match &p.ty {
@@ -199,6 +220,7 @@ impl Codegen {
             self.gen_stmt_with_self(stmt, &field_names);
         }
 
+        self.pop_fastmath(m);
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');
@@ -251,7 +273,9 @@ impl Codegen {
             params_str
         ));
         self.indent += 1;
+        self.push_fastmath(f);
         self.cur_ret_is_array = is_array_ty(&f.ret);
+        self.cur_ret_c = ret_type.clone();
 
         for p in &f.params {
             let ty = match &p.ty {
@@ -273,6 +297,7 @@ impl Codegen {
             self.push_line("return 0;");
         }
 
+        self.pop_fastmath(f);
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');
@@ -315,6 +340,7 @@ impl Codegen {
             None => "void".to_string(),
             Some(t) => self.gen_type_subst(t, type_map),
         };
+        self.cur_ret_c = ret_type.clone();
 
         let mut params = self.gen_params_subst(&f.params, type_map);
         if is_array_ty(&f.ret) {
@@ -326,6 +352,7 @@ impl Codegen {
             self.pure_attr(&f.name), ret_type, mono_name, params.join(", ")
         ));
         self.indent += 1;
+        self.push_fastmath(f);
 
         for p in &f.params {
             let ty = match &p.ty {
@@ -340,6 +367,7 @@ impl Codegen {
             self.gen_stmt(stmt);
         }
 
+        self.pop_fastmath(f);
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');
@@ -857,7 +885,9 @@ impl Codegen {
 
         self.push_line(&format!("static {} {}({}) {{", ret_type, impl_name, params_str));
         self.indent += 1;
+        self.push_fastmath(f);
         self.cur_ret_is_array = is_array_ty(&f.ret);
+        self.cur_ret_c = ret_type.clone();
 
         for p in &f.params {
             let ty = match &p.ty {
@@ -872,6 +902,7 @@ impl Codegen {
             self.gen_stmt(stmt);
         }
 
+        self.pop_fastmath(f);
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');

@@ -1,4 +1,4 @@
-use super::{Checker, FuncSig, Ty, is_builtin};
+use super::{Checker, FuncSig, Ty, builtin_return_type, is_builtin};
 use crate::ast::*;
 
 impl Checker {
@@ -22,6 +22,9 @@ impl Checker {
             Expr::It => Ty::Unknown,
 
             Expr::Ident(name) => {
+                if name == "None" {
+                    return Ty::Optional(Box::new(Ty::Unknown));
+                }
                 if let Some(ty) = self.lookup(name) {
                     ty
                 } else if self.functions.contains_key(name) {
@@ -98,13 +101,27 @@ impl Checker {
             }
 
             Expr::Call(callee, args) => {
+                // 内置构造：Some(x) / None
+                if let Expr::Ident(name) = callee.as_ref() {
+                    if name == "Some" {
+                        if let Some(x) = args.first() {
+                            let inner = self.check_expr(x);
+                            return Ty::Optional(Box::new(inner));
+                        }
+                        return Ty::Optional(Box::new(Ty::Unknown));
+                    }
+                    if name == "None" {
+                        return Ty::Optional(Box::new(Ty::Unknown));
+                    }
+                }
+
                 // 内置
                 if let Expr::Ident(name) = callee.as_ref() {
                     if is_builtin(name) {
                         for a in args {
                             let _ = self.check_expr(a);
                         }
-                        return Ty::Unknown;
+                        return builtin_return_type(name);
                     }
                 }
                 if let Expr::Ident(name) = callee.as_ref() {
@@ -186,6 +203,12 @@ impl Checker {
 
             Expr::Field(obj, name) => {
                 let obj_ty = self.check_expr(obj);
+                // 可空值的 .has / .val
+                if name == "has" || name == "val" {
+                    if let Ty::Optional(inner) = &obj_ty {
+                        return if name == "has" { Ty::Bool } else { (**inner).clone() };
+                    }
+                }
                 // a.len → int
                 if name == "len" {
                     if let Ty::Array(_) = &obj_ty {
@@ -323,8 +346,55 @@ impl Checker {
             Expr::Match(_, _) => Ty::Unknown,
             Expr::Await(e) => self.check_expr(e),
             Expr::Spawn(_) => Ty::Void,
-            Expr::Try(e) => self.check_expr(e),
-            Expr::Force(e) => self.check_expr(e),
+            Expr::Try(e) => {
+                let et = self.check_expr(e);
+                match &et {
+                    Ty::Optional(inner) => {
+                        let inner = (**inner).clone();
+                        // 传播：当前函数必须返回 T?（同 elem），否则提前返回的
+                        // None 没法构造，也没法接住。
+                        if !self.current_ret.is_unknown() {
+                            match &self.current_ret {
+                                Ty::Optional(ret_inner) => {
+                                    if !ret_inner.is_unknown()
+                                        && !inner.is_unknown()
+                                        && **ret_inner != inner
+                                    {
+                                        self.error_hint(
+                                            "? 传播要求函数返回 T?，且 T 与解包出的类型一致"
+                                                .to_string(),
+                                            format!("把函数返回类型改成 {}", inner.name()),
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    self.error_hint(
+                                        "? 只能用在返回 T? 的函数里".to_string(),
+                                        format!("把函数返回类型改成 {}", inner.name()),
+                                    );
+                                }
+                            }
+                        }
+                        inner
+                    }
+                    Ty::Unknown => Ty::Unknown,
+                    _ => {
+                        self.error(format!("? 只能用于可选值，但得到 {}", et.name()));
+                        Ty::Unknown
+                    }
+                }
+            }
+            Expr::Force(e) => {
+                let et = self.check_expr(e);
+                match &et {
+                    Ty::Optional(inner) => (**inner).clone(),
+                    Ty::Unknown => Ty::Unknown,
+                    _ => {
+                        self.error(format!("! 只能用于可选值，但得到 {}", et.name()));
+                        Ty::Unknown
+                    }
+                }
+            }
         }
     }
 

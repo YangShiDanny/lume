@@ -392,7 +392,14 @@ static inline int64_t lume_shl(int64_t x, int64_t n) {
 static inline int64_t lume_bitand(int64_t x, int64_t m) {
     return x & m;
 }
-    
+
+/* ── 内部：有符号除以 2^n（向零舍入）── */
+
+static inline int64_t lume_sdiv_pow2(int64_t x, int64_t n) {
+    int64_t mask = (1LL << n) - 1;
+    return (x + ((x >> 63) & mask)) >> n;
+}
+
 /* ── std.float ── */
 
 static inline double lume_float_sqrt(double x) { return sqrt(x); }

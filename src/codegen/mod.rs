@@ -9,6 +9,7 @@ mod stmt;
 mod types;
 
 use crate::ast::*;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 /// 数组类型判定：`[T]` 解析成 List，`[T; N]` 解析成 Array。
@@ -61,9 +62,17 @@ pub struct Codegen {
     pub(crate) par_scalars: Vec<String>,
     // 当前函数是否返回数组（决定 return 要不要 malloc 拷贝）
     pub(crate) cur_ret_is_array: bool,
+    // 当前函数的 C 返回类型（供 ? 传播时构造提前返回的 None 字面量）
+    pub(crate) cur_ret_c: String,
+    // 可空类型 typedef：元素 C 类型 → tag（如 "int64_t" → "lume_opt_0"），反查 elem。
+    // 用 RefCell 是因为 opt_tag 在 &self 的 gen_type / infer_type 里惰性分配。
+    pub(crate) opt_names: RefCell<HashMap<String, String>>,
+    pub(crate) opt_elems: RefCell<HashMap<String, String>>,
     // match 生成 union 时，值的真实类型对应的成员名（如 "Circle"）。
     // None 表示没走 union 路径。字面量/变量绑定臂要通过它访问 _match_val。
     pub(crate) match_val_member: Option<String>,
+
+    pub(crate) non_neg_vars: std::collections::HashSet<String>,
 }
 
 impl Codegen {
@@ -92,7 +101,11 @@ impl Codegen {
             par_counter: 0,
             par_workers: String::new(),
             par_scalars: Vec::new(),
+            non_neg_vars: std::collections::HashSet::new(),
             cur_ret_is_array: false,
+            cur_ret_c: String::new(),
+            opt_names: RefCell::new(HashMap::new()),
+            opt_elems: RefCell::new(HashMap::new()),
             match_val_member: None,
         }
     }
@@ -104,6 +117,11 @@ impl Codegen {
     pub fn generate(&mut self, program: &Program) -> String {
         self.output.push_str(runtime::RUNTIME_HEADER);
         self.output.push('\n');
+
+        // 可空 typedef 的插入点。opt_tag 在后面的 gen_type / infer_type 里
+        // 惰性分配，所以真正要发哪些 typedef 只有跑完才知道 —— 和
+        // par_workers 一样，最后再 insert 回这个位置。
+        let opt_pos = self.output.len();
 
         // 1. 收集 struct 定义和方法签名
         let mut tag_counter: i64 = 0;
@@ -260,7 +278,37 @@ impl Codegen {
         if !self.par_workers.is_empty() {
             out.insert_str(worker_pos, &self.par_workers);
         }
+        // 可空 typedef 必须早于所有使用点（struct 字段/函数原型）
+        out.insert_str(opt_pos, &self.gen_opt_typedefs());
         out
+    }
+
+    /// 发出本次用到的全部 lume_opt_N 定义。
+    fn gen_opt_typedefs(&self) -> String {
+        if self.opt_elems.borrow().is_empty() {
+            return String::new();
+        }
+        let mut s = String::from("/* ---- 可空类型 (T? / T!) ---- */\n");
+        // 按 tag 的编号排序，保证输出稳定（HashMap 迭代序随机）
+        let mut pairs: Vec<(String, String)> = self
+            .opt_elems
+            .borrow()
+            .iter()
+            .map(|(tag, elem)| (tag.clone(), elem.clone()))
+            .collect();
+        pairs.sort_by(|a, b| {
+            let na: usize = a.0.trim_start_matches("lume_opt_").parse().unwrap_or(0);
+            let nb: usize = b.0.trim_start_matches("lume_opt_").parse().unwrap_or(0);
+            na.cmp(&nb)
+        });
+        for (tag, elem) in pairs {
+            s.push_str(&format!(
+                "typedef struct {{ int8_t has; {} val; }} {};\n",
+                elem, tag
+            ));
+        }
+        s.push('\n');
+        s
     }
 
     pub fn generate_precompute_program(

@@ -18,6 +18,9 @@ pub enum Ty {
     /// 数组。长度在运行期才知道（局部字面量除外），所以这里只记元素类型，
     /// 长度由 codegen 的隐式伴随参数负责传递。
     Array(Box<Ty>),
+    /// 可选值 T? / 错误值 T!。用户决定合并成同一种「可空」语义：
+    /// 用 { has, val } 表示，T! 只是 T? 的语法别名。
+    Optional(Box<Ty>),
 }
 
 impl Ty {
@@ -32,6 +35,7 @@ impl Ty {
             Ty::Unknown => "?".to_string(),
             Ty::Struct(s) => s.clone(),
             Ty::Array(inner) => format!("[{}]", inner.name()),
+            Ty::Optional(inner) => format!("{}?", inner.name()),
         }
     }
 
@@ -165,4 +169,18 @@ pub(crate) fn is_builtin(name: &str) -> bool {
         | "float_floor" | "floor" | "float_ceil" | "ceil"
         | "float_round" | "round"
     )
+}
+
+pub(crate) fn builtin_return_type(name: &str) -> Ty {
+    match name {
+        "str_len" | "str_to_int" | "int_abs" | "int_min" | "int_max" => Ty::Int,
+        "str_upper" | "str_lower" | "str_trim" | "str_replace" => Ty::Str,
+        "str_to_float" | "float_abs" | "sqrt" | "float_sqrt" | "pow"
+        | "float_pow" | "sin" | "float_sin" | "cos" | "float_cos" | "tan"
+        | "float_tan" | "floor" | "float_floor" | "ceil" | "float_ceil"
+        | "round" | "float_round" => Ty::Float,
+        "str_contains" | "str_starts_with" | "str_ends_with" => Ty::Bool,
+        "str_split" => Ty::Array(Box::new(Ty::Str)),
+        _ => Ty::Unknown,
+    }
 }

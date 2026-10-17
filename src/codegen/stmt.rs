@@ -2,6 +2,17 @@ use super::Codegen;
 use super::expr::bare_parens;
 use crate::ast::*;
 
+/// None 字面量：裸 `None` 或 `None()` 调用
+fn is_none_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Ident(n) => n == "None",
+        Expr::Call(callee, args) => {
+            matches!(callee.as_ref(), Expr::Ident(n) if n == "None") && args.is_empty()
+        }
+        _ => false,
+    }
+}
+
 impl Codegen {
     pub(crate) fn gen_stmt(&mut self, stmt: &Stmt) {
         match stmt {
@@ -31,7 +42,13 @@ impl Codegen {
                     Some(t) => self.gen_type(t),
                     None => self.infer_type(init),
                 };
-                let value = self.gen_expr(init);
+                let value = if is_none_literal(init)
+                    && matches!(ty, Some(Type::Optional(_)) | Some(Type::Error(_)))
+                {
+                    format!("({}){{0, 0}}", c_ty)
+                } else {
+                    self.gen_expr(init)
+                };
                 self.var_types.insert(name.clone(), c_ty.clone());
                 self.push_line(&format!("{} {} = {};", c_ty, name, value));
             }
@@ -102,7 +119,13 @@ impl Codegen {
                             return;
                         }
                     }
-                    let s = self.gen_expr(e);
+                    let s = if is_none_literal(e)
+                        && self.is_opt_tag(&self.cur_ret_c)
+                    {
+                        format!("({}){{0, 0}}", self.cur_ret_c)
+                    } else {
+                        self.gen_expr(e)
+                    };
                     self.push_line(&format!("return {};", s));
                 }
                 None => self.push_line("return;"),
@@ -141,7 +164,13 @@ impl Codegen {
                     Some(t) => self.gen_type(t),
                     None => self.infer_type(init),
                 };
-                let value = self.gen_expr_with_self(init, fields);
+                let value = if is_none_literal(init)
+                    && matches!(ty, Some(Type::Optional(_)) | Some(Type::Error(_)))
+                {
+                    format!("({}){{0, 0}}", c_ty)
+                } else {
+                    self.gen_expr_with_self(init, fields)
+                };
                 self.var_types.insert(name.clone(), c_ty.clone());
                 self.push_line(&format!("{} {} = {};", c_ty, name, value));
             }
@@ -208,7 +237,13 @@ impl Codegen {
                             return;
                         }
                     }
-                    let s = self.gen_expr_with_self(e, fields);
+                    let s = if is_none_literal(e)
+                        && self.is_opt_tag(&self.cur_ret_c)
+                    {
+                        format!("({}){{0, 0}}", self.cur_ret_c)
+                    } else {
+                        self.gen_expr_with_self(e, fields)
+                    };
                     self.push_line(&format!("return {};", s));
                 }
                 None => self.push_line("return;"),
@@ -234,12 +269,33 @@ impl Codegen {
                 let s = self.gen_expr(start);
                 let e = self.gen_expr(end);
                 let cmp = if *inclusive { "<=" } else { "<" };
+
+                // 循环变量非负推断：for i in 0..n 里 i 一定 >= 0
+                let is_non_neg = matches!(start.as_ref(), Expr::Int(n) if *n >= 0);
+                let was_non_neg = self.non_neg_vars.contains(var);
+                if is_non_neg {
+                    self.non_neg_vars.insert(var.to_string());
+                }
+
                 self.push_vectorize_hint();
                 self.push_line(&format!(
                     "for (int64_t {} = {}; {} {} {}; {}++) {{",
                     var, s, var, cmp, e, var
                 ));
                 self.var_types.insert(var.to_string(), "int64_t".to_string());
+
+                self.indent += 1;
+                for s in &body.stmts {
+                    self.gen_stmt(s);
+                }
+                self.indent -= 1;
+                self.push_line("}");
+
+                // 退出循环，恢复原来的非负状态
+                if is_non_neg && !was_non_neg {
+                    self.non_neg_vars.remove(var);
+                }
+                return;
             }
             Expr::Ident(arr_name) => {
                 // 局部数组字面量和数组参数都在 array_len_exprs 里：

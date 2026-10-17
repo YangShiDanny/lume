@@ -124,6 +124,10 @@ impl Checker {
                 Type::List(inner) | Type::Array(inner, _) => {
                     Ty::Array(Box::new(self.ty_from_ast(Some(inner))))
                 }
+                // T? / T! 合并成同一种可空类型（见 Ty::Optional 注释）
+                Type::Optional(inner) | Type::Error(inner) => {
+                    Ty::Optional(Box::new(self.ty_from_ast(Some(inner))))
+                }
                 _ => Ty::Unknown,
             },
         }

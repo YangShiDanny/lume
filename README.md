@@ -81,6 +81,9 @@ Windows 上目前只能由用户手动跑（见 `run.bat`，走 WSL）。
 VS Code 语法扩展位于 `vscode-extension/`，可在该目录打开后按 `F5` 调试；可选的
 `Lume File Icons` 图标主题可通过 VS Code 的 **Preferences: File Icon Theme** 启用。
 
+用 `@fastmath` 只放宽单个函数的浮点重结合、FMA contract 和倒数运算；未标注函数仍保持
+默认浮点语义。它不等同于全局 `--fastmath`，不会额外假定 NaN、Inf 或有符号零不存在。
+
 ## 编译器自动做的优化
 
 不用加任何开关：

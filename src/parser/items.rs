@@ -160,11 +160,16 @@ impl Parser {
         let mut methods = Vec::new();
 
         while !self.check(&TokenKind::RBrace) && !matches!(self.peek(), TokenKind::Eof) {
+            let decorators = self.parse_decorators()?;
+            self.skip_newlines();
             let item_pub = self.eat(&TokenKind::Pub);
 
             if self.check(&TokenKind::Fn) {
-                methods.push(self.parse_fn(item_pub, vec![])?);
+                methods.push(self.parse_fn(item_pub, decorators)?);
             } else {
+                if !decorators.is_empty() {
+                    return Err(self.error("结构体字段不支持装饰器"));
+                }
                 let fname = match self.advance().clone() {
                     TokenKind::Ident(s) => s,
                     _ => return Err(self.error("期待字段名")),

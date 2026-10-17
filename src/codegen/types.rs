@@ -5,6 +5,44 @@ use std::collections::HashMap;
 
 use super::expr::single_expr;
 
+/// 可空类型的 C 表示：`typedef struct { int8_t has; <elem> val; } lume_opt_N;`
+/// has=1 表示有值（Some），has=0 表示无值（None）。
+///
+/// 为什么不用匿名 struct：前向声明和定义各自写一遍匿名结构时，
+/// tcc 判定为 "incompatible types for redefinition"（不套用 C11 的
+/// 结构兼容规则）。命名 typedef 在任何编译器下都稳。
+impl Codegen {
+    /// 元素 C 类型 → 可空 typedef 名（惰性分配，顺序即首次出现顺序）。
+    pub(crate) fn opt_tag(&self, elem_c: &str) -> String {
+        if let Some(tag) = self.opt_names.borrow().get(elem_c) {
+            return tag.clone();
+        }
+        let tag = {
+            let mut names = self.opt_names.borrow_mut();
+            let tag = format!("lume_opt_{}", names.len());
+            names.insert(elem_c.to_string(), tag.clone());
+            tag
+        };
+        self.opt_elems
+            .borrow_mut()
+            .insert(tag.clone(), elem_c.to_string());
+        tag
+    }
+
+    /// 可空 typedef 名 → 元素 C 类型。非可空类型返回 int64_t（保守默认）。
+    pub(crate) fn opt_elem_of(&self, tag: &str) -> String {
+        self.opt_elems
+            .borrow()
+            .get(tag)
+            .cloned()
+            .unwrap_or_else(|| "int64_t".to_string())
+    }
+
+    pub(crate) fn is_opt_tag(&self, c_ty: &str) -> bool {
+        self.opt_elems.borrow().contains_key(c_ty)
+    }
+}
+
 impl Codegen {
     pub(crate) fn gen_type(&self, t: &Type) -> String {
         match t {
@@ -26,6 +64,11 @@ impl Codegen {
             Type::Named(s) => s.clone(),
             Type::List(inner) => format!("{}*", self.gen_type(inner)),
             Type::Array(inner, _) => format!("{}*", self.gen_type(inner)),
+            // T? / T! 合并成同一种可空类型（见 checker Ty::Optional）
+            Type::Optional(inner) | Type::Error(inner) => {
+                let elem = self.gen_type(inner);
+                self.opt_tag(&elem)
+            }
             _ => "void*".to_string(),
         }
     }
@@ -79,6 +122,16 @@ impl Codegen {
             },
             // 结构体字段访问：按字段声明类型
             Expr::Field(obj, name) => {
+                // 可空值的 .has / .val
+                let oc = self.infer_type(obj);
+                if self.is_opt_tag(&oc) {
+                    if name == "has" {
+                        return "int8_t".to_string();
+                    }
+                    if name == "val" {
+                        return self.opt_elem_of(&oc);
+                    }
+                }
                 if let Expr::Ident(oid) = obj.as_ref() {
                     if let Some(sname) = self.var_types.get(oid) {
                         if let Some(fields) = self.structs.get(sname) {
@@ -102,6 +155,9 @@ impl Codegen {
                 "int64_t".to_string()
             }
             Expr::Ident(name) => {
+                if name == "None" {
+                    return self.opt_tag("int64_t");
+                }
                 self.var_types.get(name).cloned()
                     .unwrap_or_else(|| "int64_t".to_string())
             }
@@ -123,6 +179,20 @@ impl Codegen {
                 name.clone()
             }
             Expr::Call(callee, args) => {
+                // 内置构造：Some(x) / None
+                if let Expr::Ident(name) = callee.as_ref() {
+                    if name == "Some" {
+                        if let Some(x) = args.first() {
+                            let e = self.infer_type(x);
+                            return self.opt_tag(&e);
+                        }
+                        return self.opt_tag("int64_t");
+                    }
+                    if name == "None" {
+                        return self.opt_tag("int64_t");
+                    }
+                }
+
                 // 泛型调用：按返回类型推断
                 if let Expr::Ident(fname) = callee.as_ref() {
                     if let Some(gf) = self.generic_fns.get(fname) {
@@ -172,7 +242,40 @@ impl Codegen {
             }
             // 一元负号/取反：类型跟操作数走（否则 i128 的负值和取反会被当成 int64_t 截断）
             Expr::Unary(_, e) => self.infer_type(e),
+            // ! 强制解包 / ? 传播：类型都是解包出的元素类型
+            Expr::Force(e) => self.infer_opt_elem(e),
+            Expr::Try(e) => self.infer_opt_elem(e),
             _ => "int64_t".to_string(),
+        }
+    }
+
+    /// 一个求值为可空的表达式，解包后元素的 C 类型。
+    /// 供 `!` / `?` 的类型推断用。
+    pub(crate) fn infer_opt_elem(&self, e: &Expr) -> String {
+        match e {
+            Expr::Call(callee, args) => {
+                if let Expr::Ident(fname) = callee.as_ref() {
+                    if fname == "Some" {
+                        if let Some(x) = args.first() {
+                            return self.infer_type(x);
+                        }
+                    }
+                    if let Some(ret) = self.fn_ret_types.get(fname) {
+                        if self.is_opt_tag(ret) {
+                            return self.opt_elem_of(ret);
+                        }
+                        return "int64_t".to_string();
+                    }
+                }
+                self.opt_elem_of(&self.infer_type(e))
+            }
+            Expr::Ident(name) => {
+                if let Some(c) = self.var_types.get(name) {
+                    return self.opt_elem_of(c);
+                }
+                "int64_t".to_string()
+            }
+            _ => self.opt_elem_of(&self.infer_type(e)),
         }
     }
 }

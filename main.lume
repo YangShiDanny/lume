@@ -17,6 +17,15 @@ fn add3(a: int, b: int, c: int = 10) -> int {
     return a + b + c
 }
 
+@fastmath
+fn fast_dot(a: float, b: float, c: float) -> float {
+    return a * b + c
+}
+
+fn strict_dot(a: float, b: float, c: float) -> float {
+    return a * b + c
+}
+
 // ── 互相递归 ──
 fn is_even(n: int) -> int {
     if n == 0 {
@@ -436,6 +445,30 @@ fn main() {
     // 24. 默认参数 + 命名参数：c 省略时用默认值 10；命名参数按名字重排
     say("[24] add3(1,2)={add3(1, 2)} add3(1,2,3)={add3(1, 2, 3)}     期望 13 / 6")
     say("[24] add3(c:5,a:1,b:2)={add3(c: 5, a: 1, b: 2)} add3(b:2,a:1)={add3(b: 2, a: 1)}   期望 8 / 13")
+
+    // 27. 函数级 fastmath 与默认严格函数并存
+    fast_result := fast_dot(1.25, 3.0, 2.0)
+    strict_result := strict_dot(1.25, 3.0, 2.0)
+    say("[27] fast={fast_result} strict={strict_result}   期望都是 5.750000")
+
+    // 25. 日志性能基准：计时包含显式 flush 的真实 stdout 写出
+    log_start := now()
+    say("[25] serial print 1..100:")
+    for i in 1..=100 {
+        say("{i}")
+    }
+    flush()
+    log_elapsed := now() - log_start
+    say("[25] flush elapsed={log_elapsed} ns")
+
+    // 26. 超过串行阈值，确认并行 worker 的日志以完整行刷新；块顺序不保证
+    write("[26] parallel worker logs (unordered): ")
+    par for i in 0..1100 {
+        if i % 128 == 0 {
+            say("worker[{i}]")
+        }
+    }
+    say("[26] worker logging complete")
 
     say("===== 完成 =====")
 }
