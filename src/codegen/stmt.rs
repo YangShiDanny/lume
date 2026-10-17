@@ -302,9 +302,52 @@ impl Codegen {
         let val_ty = self.infer_type(value);
         let val_ty = if val_ty == "void*" { "int64_t".to_string() } else { val_ty };
 
+        // 收集结构体模式涉及的类型。只要有一个结构体臂，
+        // 就把这些 struct 装进一个 union：
+        //   - 按值的真实类型写进去
+        //   - 各臂再按自己的类型读
+        // C 标准明确允许读 union 的任意成员，所以这是合法的类型双关；
+        // 直接 ((Rect*)&circle)->w 才是 UB，-O3 下可能被优化错。
+        // 同时 tag 在运行期兜底，类型不对的臂不会真的执行到读字段那步。
+        let mut pattern_structs: Vec<String> = Vec::new();
+        for arm in arms {
+            if let Pattern::Struct(name, _) = &arm.pattern {
+                if !pattern_structs.contains(name) {
+                    pattern_structs.push(name.clone());
+                }
+            }
+        }
+        let val_is_struct = self.structs.contains_key(&val_ty);
+        let use_union = !pattern_structs.is_empty() && val_is_struct;
+
         self.push_line("{");
         self.indent += 1;
-        self.push_line(&format!("{} _match_val = {};", val_ty, val_str));
+
+        if use_union {
+            let mut members: Vec<String> = vec![val_ty.clone()];
+            for n in &pattern_structs {
+                if !members.contains(n) {
+                    members.push(n.clone());
+                }
+            }
+            self.push_line("union {");
+            self.indent += 1;
+            for m in &members {
+                self.push_line(&format!("{} _m_{};", m, m));
+            }
+            self.indent -= 1;
+            self.push_line("} _match_val;");
+            self.push_line(&format!(
+                "_match_val._m_{} = {};",
+                val_ty, val_str
+            ));
+            // 记住值真实类型对应的 union 成员名，
+            // 字面量/变量绑定臂也要通过它访问 _match_val
+            self.match_val_member = Some(val_ty.clone());
+        } else {
+            self.match_val_member = None;
+            self.push_line(&format!("{} _match_val = {};", val_ty, val_str));
+        }
 
         let mut has_wildcard = false;
 
@@ -351,28 +394,41 @@ impl Codegen {
     }
 
     fn gen_pattern_cond(&mut self, pat: &Pattern) -> String {
+        // union 模式下，字面量/变量绑定臂要通过值的真实类型成员访问 _match_val
+        let mv = match &self.match_val_member {
+            Some(m) => format!("_match_val._m_{}", m),
+            None => "_match_val".to_string(),
+        };
         match pat {
             Pattern::Wildcard => "1".to_string(),
             Pattern::Literal(e) => {
                 let lit = self.gen_expr(e);
-                format!("_match_val == {}", lit)
+                format!("{} == {}", mv, lit)
             }
             Pattern::Ident(_) => "1".to_string(),  // 变量绑定总是匹配
             Pattern::Tuple(_) => "1".to_string(),  // 元组总是匹配（第一版）
             // 结构体模式：比较类型标签。
             // tag 在 gen_struct_decl 里加字段、StructLit 里填值，
             // 三处必须同步，否则解构会静默绑错数据。
+            // 字段访问走 union 成员 _m_<Struct>（见 gen_match）。
             Pattern::Struct(name, _) => {
                 let tag = self.struct_tags.get(name).copied().unwrap_or(-1);
-                format!("_match_val._tag == {}LL", tag)
+                format!("_match_val._m_{}._tag == {}LL", name, tag)
             }
         }
     }
 
     fn gen_pattern_bind(&mut self, pat: &Pattern) {
+        // union 模式下字面量/变量绑定要通过值的真实类型成员访问
+        let mv = |cg: &Codegen| -> String {
+            match &cg.match_val_member {
+                Some(m) => format!("_match_val._m_{}", m),
+                None => "_match_val".to_string(),
+            }
+        };
         match pat {
             Pattern::Ident(name) => {
-                self.push_line(&format!("int64_t {} = _match_val;", name));
+                self.push_line(&format!("int64_t {} = {};", name, mv(self)));
                 self.var_types.insert(name.clone(), "int64_t".to_string());
             }
             Pattern::Tuple(pats) => {
@@ -380,8 +436,8 @@ impl Codegen {
                 for (i, p) in pats.iter().enumerate() {
                     if let Pattern::Ident(name) = p {
                         self.push_line(&format!(
-                            "int64_t {} = _match_val[{}];",
-                            name, i
+                            "int64_t {} = {}[{}];",
+                            name, mv(self), i
                         ));
                         self.var_types.insert(name.clone(), "int64_t".to_string());
                     }
@@ -398,8 +454,8 @@ impl Codegen {
                     if let Pattern::Ident(vname) = p {
                         if let Some((fname, fty)) = fields.get(i) {
                             self.push_line(&format!(
-                                "{} {} = _match_val.{};",
-                                fty, vname, fname
+                                "{} {} = _match_val._m_{}.{};",
+                                fty, vname, sname, fname
                             ));
                             self.var_types.insert(vname.clone(), fty.clone());
                         }

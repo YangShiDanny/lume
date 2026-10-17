@@ -55,6 +55,9 @@ pub struct Codegen {
     pub(crate) par_scalars: Vec<String>,
     // 当前函数是否返回数组（决定 return 要不要 malloc 拷贝）
     pub(crate) cur_ret_is_array: bool,
+    // match 生成 union 时，值的真实类型对应的成员名（如 "Circle"）。
+    // None 表示没走 union 路径。字面量/变量绑定臂要通过它访问 _match_val。
+    pub(crate) match_val_member: Option<String>,
 }
 
 impl Codegen {
@@ -82,6 +85,7 @@ impl Codegen {
             par_workers: String::new(),
             par_scalars: Vec::new(),
             cur_ret_is_array: false,
+            match_val_member: None,
         }
     }
 

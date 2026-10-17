@@ -125,12 +125,54 @@ impl Lexer {
 
     fn read_string(&mut self) -> Result<String, LexError> {
         let mut s = String::new();
+        // 插值括号深度。>0 表示正处在 `{...}` 里面 —— 此时遇到的 `"`
+        // 是嵌套字符串的引号，不是这个字符串的结束符。
+        // 不区分的话 `say("{f("x")}")` 会在内层引号处被截断，
+        // 后半段变成游离 token，报错位置还指向莫名其妙的地方。
+        let mut depth: usize = 0;
         loop {
             match self.peek() {
                 None => return Err(LexError::new(self.line, self.col, "未终止的字符串")),
                 Some('"') => {
+                    if depth == 0 {
+                        self.advance();
+                        return Ok(s);
+                    }
+                    // 嵌套字符串：把原始字符（含引号和转义）原样搬进来。
+                    // parse_str_parts 切出 {...} 之后会重新 lex 这段源码，
+                    // 所以这里必须保持原样，不能提前做转义处理。
+                    s.push('"');
                     self.advance();
-                    return Ok(s);
+                    loop {
+                        match self.peek() {
+                            None => {
+                                return Err(LexError::new(
+                                    self.line, self.col, "未终止的字符串"
+                                ))
+                            }
+                            Some('"') => {
+                                s.push('"');
+                                self.advance();
+                                break;
+                            }
+                            Some('\\') => {
+                                s.push('\\');
+                                self.advance();
+                                match self.advance() {
+                                    Some(c) => s.push(c),
+                                    None => {
+                                        return Err(LexError::new(
+                                            self.line, self.col, "未终止的转义序列"
+                                        ))
+                                    }
+                                }
+                            }
+                            Some(c) => {
+                                s.push(c);
+                                self.advance();
+                            }
+                        }
+                    }
                 }
                 Some('\\') => {
                     self.advance();
@@ -149,6 +191,18 @@ impl Lexer {
                         )),
                         None => return Err(LexError::new(self.line, self.col, "未终止的转义序列")),
                     }
+                }
+                Some('{') => {
+                    depth += 1;
+                    s.push('{');
+                    self.advance();
+                }
+                Some('}') => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                    s.push('}');
+                    self.advance();
                 }
                 Some(c) => {
                     self.advance();

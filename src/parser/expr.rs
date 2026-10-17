@@ -280,11 +280,20 @@ impl Parser {
     /// 内层 if 包成「只有一条表达式语句的块」，这样 els 保持
     /// Option<Block> 不用改类型，single_expr 也能透过它拿到内层 if，
     /// 由 gen_expr 递归展开成嵌套三元。
+    /// if 表达式。支持 `else if` 链：
+    /// 内层 if 包成「只有一条表达式语句的块」，这样 els 保持
+    /// Option<Block> 不用改类型，single_expr 也能透过它拿到内层 if，
+    /// 由 gen_expr 递归展开成嵌套三元。
+    ///
+    /// 注意：本函数假设 `if` 关键字已经被消费掉（parse_primary 的 match
+    /// 会先 advance）。所以 else-if 分支里必须自己 advance 吃掉那个 if，
+    /// 否则内层的 parse_expr 会把 `if` 当成表达式起点，多套一层。
     fn parse_if_expr(&mut self) -> Result<Expr, ParseError> {
         let cond = self.parse_expr()?;
         let then = self.parse_block()?;
         let els = if self.eat(&TokenKind::Else) {
             if self.check(&TokenKind::If) {
+                self.advance();
                 let inner = self.parse_if_expr()?;
                 Some(Block { stmts: vec![Stmt::Expr(inner)] })
             } else {
