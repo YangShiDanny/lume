@@ -103,6 +103,12 @@ pub fn compile_to_program(file: &str) -> crate::ast::Program {
     
     let mut program = program;
     crate::optimize::optimize(&mut program);   // ← 新增
+    let opt_level = match std::env::var("LUME_OPT").as_deref() {
+        Ok("safe") => crate::optimize::Level::Safe,
+        _ => crate::optimize::Level::Aggressive,
+    };
+    crate::optimize::optimize_with(&mut program, opt_level);
+    
     program
 }
 
