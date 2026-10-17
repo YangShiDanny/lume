@@ -1,5 +1,7 @@
 # Lume
 
+本项目采用 [MIT License](LICENSE)。
+
 一门静态类型、编译到 C 的语言。目标是「简单调用又最高效」。
 
 你写直观的递归和循环，编译器负责把它们展开成查表、多线程和带 `restrict` /
@@ -65,6 +67,9 @@ cargo run -- build main.lume        # 只生成 main.c + 可执行文件
 | `-O2` | 把默认的 `-O3` 降回去 |
 
 Windows 上目前只能由用户手动跑（见 `run.bat`，走 WSL）。
+
+VS Code 语法扩展位于 `vscode-extension/`，可在该目录打开后按 `F5` 调试；可选的
+`Lume File Icons` 图标主题可通过 VS Code 的 **Preferences: File Icon Theme** 启用。
 
 ## 编译器自动做的优化
 

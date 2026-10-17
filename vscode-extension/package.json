@@ -5,6 +5,11 @@
   "version": "0.1.0",
   "publisher": "lume-language",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YangShiDanny/lume.git",
+    "directory": "vscode-extension"
+  },
   "icon": "icons/lume.png",
   "engines": {
     "vscode": "^1.85.0"

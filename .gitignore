@@ -10,6 +10,7 @@ _precompute_*
 .vscode/
 !vscode-extension/.vscode/
 !vscode-extension/.vscode/launch.json
+vscode-extension/*.vsix
 .idea/
 *.swp
 .DS_Store
