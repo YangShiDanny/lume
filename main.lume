@@ -17,6 +17,10 @@ fn add3(a: int, b: int, c: int = 10) -> int {
     return a + b + c
 }
 
+fn call_fast_dot(a: float, b: float, c: float) -> float {
+    return fast_dot(a, b, c)
+}
+
 @fastmath
 fn fast_dot(a: float, b: float, c: float) -> float {
     return a * b + c
@@ -447,7 +451,7 @@ fn main() {
     say("[24] add3(c:5,a:1,b:2)={add3(c: 5, a: 1, b: 2)} add3(b:2,a:1)={add3(b: 2, a: 1)}   期望 8 / 13")
 
     // 27. 函数级 fastmath 与默认严格函数并存
-    fast_result := fast_dot(1.25, 3.0, 2.0)
+    fast_result := call_fast_dot(1.25, 3.0, 2.0)
     strict_result := strict_dot(1.25, 3.0, 2.0)
     say("[27] fast={fast_result} strict={strict_result}   期望都是 5.750000")
 

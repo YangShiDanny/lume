@@ -221,8 +221,11 @@ impl Codegen {
         }
         for item in &program.items {
             if let Item::Fn(f) = item {
-                // 泛型函数走单态化；带装饰器的函数自己会发原型
-                if f.generics.is_empty() && f.decorators.is_empty() {
+                // 泛型函数走单态化；cache/precompute 会生成包装器并自行发原型。
+                // 其他装饰器（例如 @fastmath）仍是直接函数定义，必须正常前向声明。
+                let has_wrapper = f.decorators.iter()
+                    .any(|d| d.name == "cache" || d.name == "precompute");
+                if f.generics.is_empty() && !has_wrapper {
                     self.gen_fn_decl(f);
                 }
             }

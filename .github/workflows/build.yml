@@ -17,18 +17,22 @@ jobs:
             artifact: lume-windows
             bin: lume.exe
             target: ""
+            package: zip
           - os: ubuntu-latest
             artifact: lume-linux
             bin: lume
             target: ""
+            package: tar.gz
           - os: macos-latest
             artifact: lume-macos
             bin: lume
             target: ""
+            package: tar.gz
           - os: ubuntu-latest
             artifact: lume-alpine
             bin: lume
             target: x86_64-unknown-linux-musl
+            package: tar.gz
 
     runs-on: ${{ matrix.os }}
 
@@ -72,10 +76,54 @@ jobs:
           file target/${{ matrix.target }}/release/lume
           ldd target/${{ matrix.target }}/release/lume 2>&1 || echo "static"
 
-      - uses: actions/upload-artifact@v4
+      # ── 打包 ──
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "stage/lume-windows"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/lume.exe $stage/
+          Copy-Item scripts/install.ps1 $stage/
+          if (Test-Path README.md) { Copy-Item README.md $stage/ }
+          if (Test-Path LICENSE) { Copy-Item LICENSE $stage/ }
+          Compress-Archive -Path "$stage/*" -DestinationPath "lume-windows.zip" -Force
+          Write-Host "打包完成："
+          Get-ChildItem $stage | Format-Table Name, Length
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bin="${{ matrix.bin }}"
+          if [ -n "${{ matrix.target }}" ]; then
+            bin_path="target/${{ matrix.target }}/release/$bin"
+          else
+            bin_path="target/release/$bin"
+          fi
+          stage="stage/${{ matrix.artifact }}"
+          mkdir -p "$stage"
+          cp "$bin_path" "$stage/"
+          [ -f README.md ] && cp README.md "$stage/"
+          [ -f LICENSE ] && cp LICENSE "$stage/"
+          chmod +x "$stage/$bin"
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C stage "${{ matrix.artifact }}"
+          echo "打包完成："
+          tar -tzf "${{ matrix.artifact }}.tar.gz"
+
+      # ── 上传 ──
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            target/release/${{ matrix.bin }}
-            target/${{ matrix.target }}/release/${{ matrix.bin }}
-          if-no-files-found: ignore
+          path: lume-windows.zip
+
+      - name: Upload artifact (Linux/macOS)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
