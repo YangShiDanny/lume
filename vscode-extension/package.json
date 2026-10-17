@@ -1,0 +1,49 @@
+{
+  "name": "lume-language-support",
+  "displayName": "Lume Language Support",
+  "description": "Syntax highlighting and file icons for the Lume programming language.",
+  "version": "0.1.0",
+  "publisher": "lume-language",
+  "license": "MIT",
+  "icon": "icons/lume.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Themes"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "lume",
+        "aliases": [
+          "Lume",
+          "lume"
+        ],
+        "extensions": [
+          ".lume"
+        ],
+        "icon": {
+          "light": "icons/lume.png",
+          "dark": "icons/lume.png"
+        },
+        "configuration": "language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lume",
+        "scopeName": "source.lume",
+        "path": "syntaxes/lume.tmLanguage.json"
+      }
+    ],
+    "iconThemes": [
+      {
+        "id": "lume-file-icons",
+        "label": "Lume File Icons",
+        "path": "themes/lume-icon-theme.json"
+      }
+    ]
+  }
+}

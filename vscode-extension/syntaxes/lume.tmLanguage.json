@@ -1,0 +1,177 @@
+{
+  "scopeName": "source.lume",
+  "name": "Lume",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#decorators"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#runes"
+    },
+    {
+      "include": "#colors"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#function-declarations"
+    },
+    {
+      "include": "#struct-declarations"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#calls"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.lume",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.lume",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "decorators": {
+      "name": "meta.annotation.lume",
+      "match": "@([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "entity.name.function.lume"
+        }
+      }
+    },
+    "strings": {
+      "name": "string.quoted.double.lume",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.lume",
+          "match": "\\\\(?:[\\\\\"ntr{}]|.)"
+        },
+        {
+          "name": "meta.interpolation.lume",
+          "begin": "\\{",
+          "end": "\\}",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.section.interpolation.begin.lume"
+            }
+          },
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.section.interpolation.end.lume"
+            }
+          },
+          "patterns": [
+            {
+              "include": "$self"
+            }
+          ]
+        }
+      ]
+    },
+    "runes": {
+      "name": "string.quoted.single.lume",
+      "begin": "'",
+      "end": "'",
+      "patterns": [
+        {
+          "name": "constant.character.escape.lume",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "colors": {
+      "name": "constant.other.color.lume",
+      "match": "#[0-9A-Fa-f]{6}\\b"
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.lume",
+          "match": "\\b(?:[0-9]+\\.[0-9]*|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?\\b"
+        },
+        {
+          "name": "constant.numeric.float.lume",
+          "match": "\\b[0-9]+[eE][+-]?[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.lume",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    },
+    "function-declarations": {
+      "match": "\\bfn\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "0": {
+          "name": "keyword.control.lume"
+        },
+        "1": {
+          "name": "entity.name.function.lume"
+        }
+      }
+    },
+    "struct-declarations": {
+      "match": "\\bstruct\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "0": {
+          "name": "keyword.control.lume"
+        },
+        "1": {
+          "name": "entity.name.type.struct.lume"
+        }
+      }
+    },
+    "types": {
+      "name": "storage.type.lume",
+      "match": "\\b(?:int|i8|i16|i32|i64|u1|u2|u4|u8|u16|u32|u64|f32|f64|float|bool|str|rune)\\b"
+    },
+    "constants": {
+      "name": "constant.language.lume",
+      "match": "\\b(?:true|false|nothing)\\b"
+    },
+    "keywords": {
+      "name": "keyword.control.lume",
+      "match": "\\b(?:fn|struct|trait|impl|if|else|while|for|in|return|break|continue|match|import|use|pub|const|extern|as|and|or|not|app|par|async|await|spawn|it)\\b"
+    },
+    "operators": {
+      "name": "keyword.operator.lume",
+      "match": "(?::=|\\+=|-=|\\*=|/=|%=|==|!=|<=|>=|=>|->|\\|>|\\.\\.=|\\.\\.|[=+*/%<>!-])"
+    },
+    "calls": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()",
+      "captures": {
+        "1": {
+          "name": "entity.name.function.call.lume"
+        }
+      }
+    }
+  }
+}

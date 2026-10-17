@@ -1,0 +1,10 @@
+{
+  "iconDefinitions": {
+    "_lume": {
+      "iconPath": "../icons/lume-file.svg"
+    }
+  },
+  "fileExtensions": {
+    "lume": "_lume"
+  }
+}

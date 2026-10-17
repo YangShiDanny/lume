@@ -8,6 +8,8 @@ output
 output.exe
 _precompute_*
 .vscode/
+!vscode-extension/.vscode/
+!vscode-extension/.vscode/launch.json
 .idea/
 *.swp
 .DS_Store
