@@ -128,7 +128,7 @@ impl Codegen {
                                     .unwrap_or_default();
                                 let mut all_args = vec![format!("&{}", obj_name)];
                                 for (i, a) in args.iter().enumerate() {
-                                    all_args.push(self.gen_expr(a));
+                                    all_args.push(self.gen_arg(a));
                                     if arr_flags.get(i).copied().unwrap_or(false) {
                                         match self.array_len_of(a) {
                                             Some(len) => all_args.push(len),
@@ -176,7 +176,7 @@ impl Codegen {
 
             Expr::Index(obj, idx) => {
                 let o = self.gen_expr(obj);
-                let i = self.gen_expr(idx);
+                let i = Self::gen_index(idx);
                 format!("{}[{}]", o, i)
             }
 
@@ -210,6 +210,43 @@ impl Codegen {
         }
     }
 
+    /// 实参专用生成器。数组字面量在实参位置必须写成 C99 复合字面量
+    /// `(int64_t[]){1,2,3}` —— 裸的 `{1,2,3}` 在初始化位置合法，
+    /// 但出现在 `f({1,2,3})` 里根本不是表达式，clang 直接报语法错。
+    /// 复合字面量的生命周期覆盖它所在的整个块，作为实参是安全的。
+    pub(crate) fn gen_arg(&mut self, e: &Expr) -> String {
+        if let Expr::List(items) = e {
+            if !items.is_empty() {
+                let elem_ty = if let Some(first) = items.first() {
+                    self.infer_type(first)
+                } else {
+                    "int64_t".to_string()
+                };
+                let strs: Vec<String> = items.iter().map(|x| self.gen_expr(x)).collect();
+                return format!("({}[]){{{}}}", elem_ty, strs.join(", "));
+            }
+        }
+        self.gen_expr(e)
+    }
+
+    pub(crate) fn gen_arg_with_self(&mut self, e: &Expr, fields: &[String]) -> String {
+        if let Expr::List(items) = e {
+            if !items.is_empty() {
+                let elem_ty = if let Some(first) = items.first() {
+                    self.infer_type(first)
+                } else {
+                    "int64_t".to_string()
+                };
+                let strs: Vec<String> = items
+                    .iter()
+                    .map(|x| self.gen_expr_with_self(x, fields))
+                    .collect();
+                return format!("({}[]){{{}}}", elem_ty, strs.join(", "));
+            }
+        }
+        self.gen_expr_with_self(e, fields)
+    }
+
     /// 生成一次普通函数调用的实参列表，数组实参后面自动补长度。
     /// 声明处用 gen_params 展开伴随参数，两边规则必须一致。
     /// fields 非空表示在结构体方法里，表达式要走 with_self 版本。
@@ -226,8 +263,8 @@ impl Codegen {
         let mut out: Vec<String> = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             let s = match fields {
-                Some(f) => self.gen_expr_with_self(a, f),
-                None => self.gen_expr(a),
+                Some(f) => self.gen_arg_with_self(a, f),
+                None => self.gen_arg(a),
             };
             out.push(s);
             let need_len = arr_flags
@@ -426,7 +463,7 @@ impl Codegen {
                                     .unwrap_or_default();
                                 let mut all_args = vec![format!("&{}", obj_name)];
                                 for (i, a) in args.iter().enumerate() {
-                                    all_args.push(self.gen_expr_with_self(a, fields));
+                                    all_args.push(self.gen_arg_with_self(a, fields));
                                     if arr_flags.get(i).copied().unwrap_or(false) {
                                         match self.array_len_of(a) {
                                             Some(len) => all_args.push(len),
@@ -512,7 +549,7 @@ impl Codegen {
 
             Expr::Index(obj, idx) => {
                 let o = self.gen_expr_with_self(obj, fields);
-                let i = self.gen_expr_with_self(idx, fields);
+                let i = Self::gen_index(idx);
                 format!("{}[{}]", o, i)
             }
 
@@ -532,7 +569,6 @@ impl Codegen {
 }
 
 fn builtin_map(name: &str) -> Option<&'static str> {
-    Some(match name {
         // str
         "str_len" => "lume_str_len",
         "str_upper" => "lume_str_upper",

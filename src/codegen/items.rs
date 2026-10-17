@@ -373,7 +373,7 @@ impl Codegen {
         // 数组实参后面补长度，和 gen_params_subst 展开出来的伴随参数对齐
         let mut args_str: Vec<String> = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
-            args_str.push(self.gen_expr(a));
+            args_str.push(self.gen_arg(a));
             let is_arr = generic_fn
                 .params
                 .get(i)
