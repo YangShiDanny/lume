@@ -374,12 +374,18 @@ impl Codegen {
         if !self.array_ret_fns.contains(&fname) {
             return None;
         }
-        let elem_ty = self
+        // 只脱一层 *：`int64_t*` → `int64_t`，`const char**` → `const char*`
+        // （字符串数组的元素是字符串，指针还要留一层）。
+        // 别用 trim_end_matches('*') —— 它会把两个 * 全脱掉，
+        // str_split 的返回值就变成 const char，声明和插值格式全错。
+        let ret_ty = self
             .fn_ret_types
             .get(&fname)
             .cloned()
-            .unwrap_or_else(|| "int64_t*".to_string())
-            .trim_end_matches('*')
+            .unwrap_or_else(|| "int64_t*".to_string());
+        let elem_ty = ret_ty
+            .strip_suffix('*')
+            .unwrap_or(ret_ty.as_str())
             .to_string();
         let mut parts = self.gen_call_args(callee, args, fields);
         parts.push(format!("&{}_len", name));

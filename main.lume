@@ -366,10 +366,10 @@ fn main() {
     // 19. if 表达式：编译成 C 三元，clang 会优化成 cmov
     a1 := abs_if(-7)
     a2 := abs_if(7)
-    c1 := clamp(15, 0, 10)
-    c2 := clamp(-3, 0, 10)
-    c3 := clamp(5, 0, 10)
-    say("[19] abs_if(-7)={a1} abs_if(7)={a2} clamp(15)={c1} clamp(-3)={c2} clamp(5)={c3}")
+    k1 := clamp(15, 0, 10)
+    k2 := clamp(-3, 0, 10)
+    k3 := clamp(5, 0, 10)
+    say("[19] abs_if(-7)={a1} abs_if(7)={a2} clamp(15)={k1} clamp(-3)={k2} clamp(5)={k3}")
     say("                                   期望 7 / 7 / 10 / 0 / 5")
 
     // 20. match 结构体解构：_tag 判断类型 + 按位置绑定字段
