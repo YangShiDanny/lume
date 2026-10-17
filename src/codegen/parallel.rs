@@ -219,6 +219,7 @@ impl Codegen {
         ));
         self.push_line("int64_t _total = _total_stop - _total_start;");
         self.push_line("if (_total < 1) _total = 1;");
+        self.push_line("lume_log_flush();");
 
         // 小循环直接串行跑。
         // pthread_create / CreateThread 一次就要几十 µs，而 10 个元素的加法

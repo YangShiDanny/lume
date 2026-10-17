@@ -170,6 +170,8 @@ impl Codegen {
 
                 "int64_t".to_string()
             }
+            // 一元负号/取反：类型跟操作数走（否则 i128 的负值和取反会被当成 int64_t 截断）
+            Expr::Unary(_, e) => self.infer_type(e),
             _ => "int64_t".to_string(),
         }
     }

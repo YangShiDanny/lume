@@ -100,7 +100,9 @@ pub fn compile_to_program(file: &str) -> crate::ast::Program {
         eprintln!("// 类型检查失败，共 {} 个错误", errors.len());
         std::process::exit(1);
     }
-
+    
+    let mut program = program;
+    crate::optimize::optimize(&mut program);   // ← 新增
     program
 }
 

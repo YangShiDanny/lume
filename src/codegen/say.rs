@@ -39,17 +39,24 @@ impl Codegen {
     ) -> String {
         let mut format_str = String::new();
         let mut format_args: Vec<String> = Vec::new();
+        let mut literal_text = String::new();
+        let mut literal_only = true;
 
         for arg in args {
             match arg {
                 Expr::Str(s) => {
                     format_str.push_str(&escape_fmt(s));
+                    literal_text.push_str(s);
                 }
                 Expr::FmtStr(parts) => {
                     for part in parts {
                         match part {
-                            StrPart::Text(t) => format_str.push_str(&escape_fmt(t)),
+                            StrPart::Text(t) => {
+                                format_str.push_str(&escape_fmt(t));
+                                literal_text.push_str(t);
+                            }
                             StrPart::Expr(e) => {
+                                literal_only = false;
                                 let fmt = self.format_for_expr(e);
                                 format_str.push_str(fmt);
                                 format_args.push(self.say_arg(e, fmt, fields));
@@ -58,6 +65,7 @@ impl Codegen {
                     }
                 }
                 _ => {
+                    literal_only = false;
                     let fmt = self.format_for_expr(arg);
                     format_str.push_str(fmt);
                     format_args.push(self.say_arg(arg, fmt, fields));
@@ -67,6 +75,15 @@ impl Codegen {
 
         if newline {
             format_str.push_str("\\n");
+            literal_text.push('\n');
+        }
+
+        if literal_only {
+            return format!(
+                "lume_log_write_literal(\"{}\", {}U)",
+                escape_c_string(&literal_text),
+                literal_text.len()
+            );
         }
 
         if format_args.is_empty() {
@@ -151,6 +168,21 @@ fn escape_fmt(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
             '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn escape_c_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
             _ => out.push(c),
         }
     }

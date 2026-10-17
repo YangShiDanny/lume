@@ -225,7 +225,7 @@
 ### 第四批：并发
 
 - [ ] **`par f(x)` + `await t`**（`Task[T]` 类型 + codegen）
-- [x] **无锁日志与多线程 print**（每线程缓冲；worker 退出刷新，不交错；顺序不保证）
+- [x] **无锁日志与多线程 print**（say/write 只写线程本地缓冲；刷新时短锁，worker 退出刷新，不交错）
 - [ ] **`write` 内置（不换行）**
 - [ ] **线程池**（替代裸 `pthread_create`）
 - [ ] **`par for` 支持嵌套控制流**（`while` / `for` / `match` 进 worker）
@@ -256,7 +256,7 @@
 
 **其他性能：**
 
-- [x] **无锁日志**（`say/write` 写线程本地缓冲；`flush()` 显式刷新，worker 退出自动刷新）
+- [x] **无锁日志**（`say/write` 写线程本地缓冲；仅刷新时短锁；`flush()` 显式刷新，worker 退出自动刷新）
 - [ ] **`@precompute` 支持 float 表**
 
 ### 第六批：生态（持续）

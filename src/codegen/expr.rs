@@ -906,6 +906,9 @@ fn builtin_map(name: &str) -> Option<&'static str> {
         "float_floor" | "floor" => "lume_float_floor",
         "float_ceil" | "ceil" => "lume_float_ceil",
         "float_round" | "round" => "lume_float_round",
+        // 内部（optimize 生成，用户写不出来）
+        "__shl" => "lume_shl",
+        "__bitand" => "lume_bitand",
         _ => return None,
     })
 }

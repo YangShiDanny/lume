@@ -82,56 +82,80 @@ static inline void lume_log_flush_thread(void);
 #endif
 
 /* say/write append to thread-local memory; only flush touches stdout. */
-#define LUME_LOG_BUFFER_SIZE (64u * 1024u)
+static LUME_MUTEX_T lume_log_mutex_ = LUME_MUTEX_INIT;
 #ifdef _WIN32
   #define LUME_THREAD_LOCAL __declspec(thread)
 #else
   #define LUME_THREAD_LOCAL _Thread_local
 #endif
-static LUME_THREAD_LOCAL char lume_log_buffer_[LUME_LOG_BUFFER_SIZE];
+static LUME_THREAD_LOCAL char* lume_log_buffer_;
 static LUME_THREAD_LOCAL size_t lume_log_length_;
+static LUME_THREAD_LOCAL size_t lume_log_capacity_;
+
+static inline int lume_log_reserve_(size_t extra) {
+    if (extra <= lume_log_capacity_ - lume_log_length_) return 1;
+    size_t needed = lume_log_length_ + extra;
+    size_t capacity = lume_log_capacity_ ? lume_log_capacity_ : 1024;
+    while (capacity < needed) {
+        if (capacity > SIZE_MAX / 2) {
+            capacity = needed;
+            break;
+        }
+        capacity *= 2;
+    }
+    char* grown = (char*)realloc(lume_log_buffer_, capacity);
+    if (grown == NULL) return 0;
+    lume_log_buffer_ = grown;
+    lume_log_capacity_ = capacity;
+    return 1;
+}
 
 static inline void lume_log_flush_thread(void) {
     size_t length = lume_log_length_;
-    if (length == 0) return;
+    if (length == 0) {
+        free(lume_log_buffer_);
+        lume_log_buffer_ = NULL;
+        lume_log_capacity_ = 0;
+        return;
+    }
+    LUME_MUTEX_LOCK(lume_log_mutex_);
     size_t written = fwrite(lume_log_buffer_, 1, length, stdout);
     if (written < length) {
         memmove(lume_log_buffer_, lume_log_buffer_ + written, length - written);
         lume_log_length_ = length - written;
+        LUME_MUTEX_UNLOCK(lume_log_mutex_);
         return;
     }
     lume_log_length_ = 0;
     fflush(stdout);
+    LUME_MUTEX_UNLOCK(lume_log_mutex_);
+    free(lume_log_buffer_);
+    lume_log_buffer_ = NULL;
+    lume_log_capacity_ = 0;
+}
+
+static inline void lume_log_write_literal(const char* text, size_t length) {
+    if (length == 0) return;
+    if (!lume_log_reserve_(length)) abort();
+    memcpy(lume_log_buffer_ + lume_log_length_, text, length);
+    lume_log_length_ += length;
 }
 
 static inline void lume_log_write_v_(const char* format, va_list args) {
-    va_list measure_args;
-    va_copy(measure_args, args);
-    int needed = vsnprintf(NULL, 0, format, measure_args);
-    va_end(measure_args);
+    char small[256];
+    va_list small_args;
+    va_copy(small_args, args);
+    int needed = vsnprintf(small, sizeof(small), format, small_args);
+    va_end(small_args);
     if (needed < 0) return;
 
     size_t length = (size_t)needed;
-    if (length >= LUME_LOG_BUFFER_SIZE) {
-        lume_log_flush_thread();
-        char* large = (char*)malloc(length + 1);
-        if (large == NULL) abort();
-        vsnprintf(large, length + 1, format, args);
-        fwrite(large, 1, length, stdout);
-        fflush(stdout);
-        free(large);
-        return;
+    if (!lume_log_reserve_(length + 1)) abort();
+    if (length < sizeof(small)) {
+        memcpy(lume_log_buffer_ + lume_log_length_, small, length);
+    } else {
+        vsnprintf(lume_log_buffer_ + lume_log_length_, length + 1, format, args);
     }
-
-    if (lume_log_length_ + length >= LUME_LOG_BUFFER_SIZE) {
-        lume_log_flush_thread();
-    }
-    vsnprintf(
-        lume_log_buffer_ + lume_log_length_,
-        LUME_LOG_BUFFER_SIZE - lume_log_length_,
-        format,
-        args
-    );
     lume_log_length_ += length;
 }
 
@@ -359,6 +383,16 @@ static inline int64_t lume_int_max(int64_t a, int64_t b) {
     return a > b ? a : b;
 }
 
+/* ── 内部：强度削弱辅助 ── */
+
+static inline int64_t lume_shl(int64_t x, int64_t n) {
+    return x << n;
+}
+
+static inline int64_t lume_bitand(int64_t x, int64_t m) {
+    return x & m;
+}
+    
 /* ── std.float ── */
 
 static inline double lume_float_sqrt(double x) { return sqrt(x); }
