@@ -1,4 +1,5 @@
 use super::Codegen;
+use super::expr::bare_parens;
 use crate::ast::*;
 
 // par for 的 reduction：sum += a[i] 这类"每轮往同一个变量上累加"的写法。
@@ -524,7 +525,7 @@ impl Codegen {
             }
             Stmt::If { cond, then, els } => {
                 let c = self.gen_par_expr(cond, arrays);
-                self.push_line(&format!("if ({}) {{", c));
+                self.push_line(&format!("if ({}) {{", bare_parens(&c)));
                 self.indent += 1;
                 for s in &then.stmts {
                     self.gen_par_body_stmt(s, arrays, reds);
@@ -570,6 +571,17 @@ impl Codegen {
                     BinOp::And => "&&", BinOp::Or => "||",
                     BinOp::Pipe => "/* pipe */",
                 };
+                // 整数除零/溢出检查，同 gen_expr 的 Binary 分支
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    let lt = self.infer_type(l);
+                    if lt != "double" && lt != "float" {
+                        let fname = match op {
+                            BinOp::Div => "lume_checked_div_i64",
+                            _ => "lume_checked_mod_i64",
+                        };
+                        return format!("{}({}, {})", fname, ls, rs);
+                    }
+                }
                 format!("({} {} {})", ls, op_str, rs)
             }
             Expr::Index(o, i) => {

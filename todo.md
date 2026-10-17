@@ -82,6 +82,10 @@
 - [x] 嵌套 `par for` → 编译期报错
 - [x] `f(self)` 传值（`(*_self)`）
 - [x] `-=` / `*=` 归约（**已撤回，别顺手改**）
+- [x] 默认参数不生效（`FuncSig.required/defaults` + 调用处展开）
+- [x] 命名参数不支持（`StructLit` fallback + `reorder_named_args`）
+- [x] 整数除零 UB（编译期字面量 0 报错 + 运行期 `lume_checked_div_i64`）
+- [x] `INT64_MIN / -1` 溢出 UB（`lume_checked_div_i64` 内置检查）
 
 ---
 
@@ -91,10 +95,10 @@
 - [x] `malloc` 结果类型在部分 codegen 路径仍可能出错 —— 已修：最后一处是数组返回函数脱指针层脱了两层（str_split），改 strip_suffix 只脱一层
 - [x] `match` 结构体解构恒为真 —— 已修：struct 编译期 `_tag` 字段 + C union 类型双关
 - [x] `match` 值被强制转 `int64_t`（只能 match 整数/布尔）—— 已修：`_match_val` 按 infer_type 声明
-- [ ] 默认参数不生效
-- [ ] 命名参数不支持
-- [ ] 整数除零是 UB（需加检查）
-- [ ] `INT64_MIN / -1` 溢出是 UB
+- [x] 默认参数不生效 —— 已修：`FuncSig` 加 `required`/`defaults` 字段，checker 校验「默认值必须在尾部」+ 默认值类型，codegen 调用处展开默认值表达式（C 语义：只能引用调用处可见名字）
+- [x] 命名参数不支持 —— 已修：`f(a: 1)` 与 `Point(x: 1)` 语法同形，parser 一律解析成 `StructLit`；checker/codegen 按名字区分（在 `structs` 表 → 结构体构造，否则 → 命名参数函数调用），共享 `ast::reorder_named_args` 重排
+- [x] 整数除零是 UB（需加检查）—— 已修：编译期字面量 `0` 直接 checker 报错；运行期变量走 `lume_checked_div_i64`（`fprintf stderr + abort`）
+- [x] `INT64_MIN / -1` 溢出是 UB —— 已修：`lume_checked_div_i64` 内置 `a == INT64_MIN && b == -1` 检查，abort；`lume_checked_mod_i64` 同条件返回 0（C99 下 UB，数学余数 0）
 - [x] 数组不能跨函数传 —— 已修：隐式伴随长度参数 + 数组返回 malloc 拷贝
 - [x] `nums.len()` 对数组参数返回不存在的 `nums_len` —— 已修：数组参数登记 array_len_exprs
 
@@ -187,9 +191,9 @@
 - [x] **字符串操作**（split / contains / replace / starts_with / ends_with）
   - [x] `str_split` / `str_contains` / `str_replace` / `str_starts_with` / `str_ends_with`
 
-- [ ] **整数除零检查**
-  - [ ] 编译期常量 0 报错
-  - [ ] 运行时变量 0 检查（`lume_div_zero()`）
+- [x] **整数除零检查**
+  - [x] 编译期常量 0 报错（checker `Expr::Binary` 字面量 `Int(0)` 直接 error_hint）
+  - [x] 运行时变量 0 检查（`lume_checked_div_i64` / `lume_checked_mod_i64`，fprintf + abort）
 
 ### 第二批：类型系统
 
@@ -271,9 +275,9 @@
 
 ### 前置补丁
 
-- [ ] **struct 支持定长数组字段**（`gen_struct_decl` 生成 `T name[N]`）
-- [ ] **`[0; N]` 重复初始化**（AST 加 `Expr::Repeat`）
-- [ ] **`write` 内置（不换行）**
+- [x] **struct 支持定长数组字段**（`gen_struct_decl` 生成 `T name[N]`）
+- [x] **`[0; N]` 重复初始化**（AST 加 `Expr::Repeat`）
+- [x] **`write` 内置（不换行）**
 
 ### 单线程版本
 
@@ -320,7 +324,7 @@
 2. 改编译器
 3. 跑 `cargo run -- run main.lume`，全绿才算完成
 4. 同步 `LUME.md`
-5. 推送 GitHub（CI 三平台验证）
+5. 推送 GitHub（CI 四平台验证）
 
 ### 每修一个 bug
 
@@ -336,9 +340,9 @@
 ### 提交前检查
 
 - [ ] `cargo build` 零警告
-- [ ] `main.lume` 20 项全绿
+- [ ] `main.lume` 全绿
 - [ ] `LUME.md` 同步
-- [ ] CI 三平台通过
+- [ ] CI 四平台通过
 
 ---
 
@@ -346,8 +350,8 @@
 
 | 版本 | 目标 | 状态 |
 |---|---|---|
-| v0.1.0 | 核心编译器 + 20 项验证 | ✅ 已完成 |
-| v0.2.0 | 数组跨函数 + `if` 表达式 + `match` 解构 + 字符串操作 | ✅ 代码完成（tcc 30 项全绿，WSL 全量验证待 run.bat 确认） |
+| v0.1.0 | 核心编译器 + 20 项验证 | ✅ 已完成 语言暂时没有实际价值所有未发布 |
+| v0.2.0 | 数组跨函数 + `if` 表达式 + `match` 解构 + 字符串操作 | ✅ 已完成 未发布 |
 | v0.3.0 | `T?` / `T!` + 切片 + 元组 + 泛型 struct | 待做 |
 | v0.4.0 | 模块系统 + 自动扫描 + VS Code 扩展 | 待做 |
 | v0.5.0 | `par f()` + `await` + 线程池 + `lume_say` | 待做 |

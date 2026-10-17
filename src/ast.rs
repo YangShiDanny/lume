@@ -10,8 +10,6 @@ pub struct Program {
 // 这里选后者 —— 删掉就等于把语言设计从 AST 里抹掉，以后想接回来得重新推。
 //
 // 待办清单（按「离能用还有多远」排）：
-//   Param::default      默认参数。parser 目前连 `=` 都不吃，要 parser +
-//                       checker + codegen 三处一起改。改动不大，是性价比最高的一项。
 //   FnDecl/StructDecl/
 //   Field::is_pub       可见性。没有模块系统之前 `pub` 是空操作，
 //                       等 import 真正生效才有意义。
@@ -54,8 +52,8 @@ pub struct FnDecl {
 pub struct Param {
     pub name: String,
     pub ty: Option<Type>,
-    /// 待办：默认参数，见文件头说明
-    #[allow(dead_code)]
+    /// 默认值。在调用处展开（C 语义），必须排在参数列表尾部
+    /// （collect.rs 的 check_defaults_trailing 校验）。
     pub default: Option<Expr>,
 }
 
@@ -188,6 +186,7 @@ pub enum Expr {
     #[allow(dead_code)]
     Map(Vec<(Expr, Expr)>),
     StructLit(String, Vec<(String, Expr)>),
+    Repeat(Box<Expr>, usize),
     Range(Box<Expr>, Box<Expr>, bool),
     If(Box<Expr>, Block, Option<Block>),
     /// 待办：match 表达式。语句形式的 `match` 已解析，表达式形式未接 codegen。
@@ -213,4 +212,39 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命名参数重排（checker 和 codegen 共用，逻辑必须一份）
+//
+// `f(b: 1, a: 2)` 在语法上和结构体构造 `Point(x: 1)` 完全同形，
+// parser 一律解析成 StructLit。区分靠语义：名字在 structs 表里 →
+// 结构体构造；否则 → 命名参数函数调用，由两边各自 fallback。
+//
+// 返回按签名顺序排列的槽位，None = 调用处没传（等默认值来填，
+// 没有默认值就是错误，由 checker 报）。槽位而不是紧凑 Vec，
+// 是因为命名参数允许省略中间有默认值的参数。
+pub fn reorder_named_args(
+    fields: &[(String, Expr)],
+    param_names: &[String],
+) -> Result<Vec<Option<Expr>>, String> {
+    let mut slots: Vec<Option<Expr>> = vec![None; param_names.len()];
+    for (name, value) in fields {
+        match param_names.iter().position(|p| p == name) {
+            Some(idx) => {
+                if slots[idx].is_some() {
+                    return Err(format!("参数 '{}' 被传了两次", name));
+                }
+                slots[idx] = Some(value.clone());
+            }
+            None => {
+                return Err(format!(
+                    "没有名为 '{}' 的参数（可用参数：{}）",
+                    name,
+                    param_names.join(", ")
+                ))
+            }
+        }
+    }
+    Ok(slots)
 }

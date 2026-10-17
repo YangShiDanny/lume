@@ -3,6 +3,43 @@ use super::Codegen;
 use crate::ast::*;
 
 impl Codegen {
+    pub(crate) fn gen_local_array_init(
+        &mut self,
+        ty: Option<&Type>,
+        init: &Expr,
+        fields: Option<&[String]>,
+    ) -> Option<(String, usize, String)> {
+        let (elem_ty, len) = match init {
+            Expr::List(items) => {
+                let declared = match ty {
+                    Some(Type::Array(inner, Some(len))) => {
+                        Some((self.gen_type(inner), *len))
+                    }
+                    _ => None,
+                };
+                declared.unwrap_or_else(|| {
+                    let elem_ty = items.first()
+                        .map(|item| self.infer_type(item))
+                        .unwrap_or_else(|| "int64_t".to_string());
+                    (elem_ty, items.len())
+                })
+            }
+            Expr::Repeat(value, len) => {
+                let elem_ty = match ty {
+                    Some(Type::Array(inner, Some(_))) => self.gen_type(inner),
+                    _ => self.infer_type(value),
+                };
+                (elem_ty, *len)
+            }
+            _ => return None,
+        };
+        let initializer = match fields {
+            Some(fields) => self.gen_expr_with_self(init, fields),
+            None => self.gen_expr(init),
+        };
+        Some((elem_ty, len, initializer))
+    }
+
     pub(crate) fn gen_expr(&mut self, expr: &Expr) -> String {
         match expr {
             Expr::Int(n) => format!("{}LL", n),
@@ -56,17 +93,18 @@ impl Codegen {
                     BinOp::Pipe => {
                         // a |> f()   →  f(a)
                         // a |> f(b)  →  f(a, b)
-                        let mut pipe_args = vec![ls];
-                        let callee = match r.as_ref() {
-                            Expr::Call(callee, args) => {
-                                for a in args {
-                                    pipe_args.push(self.gen_expr(a));
-                                }
-                                self.gen_expr(callee)
-                            }
-                            other => self.gen_expr(other),
+                        // 走 gen_call_args：尾部默认值在这里展开，
+                        // 数组实参的长度伴随参数也在这里补
+                        // （以前手拼参数列表，这两样都会漏）。
+                        let (callee, extra): (&Expr, &[Expr]) = match r.as_ref() {
+                            Expr::Call(callee, args) => (callee.as_ref(), args.as_slice()),
+                            other => (other, &[]),
                         };
-                        return format!("{}({})", callee, pipe_args.join(", "));
+                        let mut all = vec![l.as_ref().clone()];
+                        all.extend_from_slice(extra);
+                        let arg_strs = self.gen_call_args(callee, &all, None);
+                        let callee_str = self.gen_expr(callee);
+                        return format!("{}({})", callee_str, arg_strs.join(", "));
                     }
                 };
                 // 字符串是值语义：六个比较运算符都要比内容，不能比指针。
@@ -89,6 +127,19 @@ impl Codegen {
                     };
                     return format!("(strcmp({}, {}) {} 0)", ls, rs, cmp_op);
                 }
+                // 整数除法/取模：除零和 INT64_MIN / -1 在 C 里是 UB。
+                // 包一层运行时检查（double 是 IEEE，inf 有定义，不包）。
+                // -O3 下 static inline 会被内联，常量除数直接消掉分支。
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    let lt = self.infer_type(l);
+                    if lt != "double" && lt != "float" {
+                        let fname = match op {
+                            BinOp::Div => "lume_checked_div_i64",
+                            _ => "lume_checked_mod_i64",
+                        };
+                        return format!("{}({}, {})", fname, ls, rs);
+                    }
+                }
                 format!("({} {} {})", ls, op_str, rs)
             }
 
@@ -106,6 +157,9 @@ impl Codegen {
                 if let Expr::Ident(name) = callee.as_ref() {
                     if name == "say" {
                         return self.gen_say(args);
+                    }
+                    if name == "write" {
+                        return self.gen_write(args);
                     }
                     if name == "now" {
                         return "lume_now_ns()".to_string();
@@ -206,6 +260,10 @@ impl Codegen {
             Expr::If(cond, then, els) => self.gen_if_expr(cond, then, els, None),
 
             Expr::StructLit(name, fields) => {
+                // 名字不是结构体 → 命名参数函数调用 f(a: 1)（checker 已放过）
+                if let Some(call) = self.gen_named_call(name, fields, None) {
+                    return call;
+                }
                 let field_strs: Vec<String> = fields.iter()
                     .map(|(fname, fval)| {
                         let v = self.gen_expr(fval);
@@ -219,6 +277,11 @@ impl Codegen {
             Expr::List(items) => {
                 let s: Vec<String> = items.iter().map(|e| self.gen_expr(e)).collect();
                 format!("{{{}}}", s.join(", "))
+            }
+
+            Expr::Repeat(value, count) => {
+                let item = self.gen_expr(value);
+                format!("{{{}}}", vec![item; *count].join(", "))
             }
 
             _ => "/* TODO */".to_string(),
@@ -276,7 +339,12 @@ impl Codegen {
             Some(f) => self.gen_expr_with_self(ee, f),
             None => self.gen_expr(ee),
         };
-        format!("({}) ? ({}) : ({})", c, ts, es)
+        format!(
+            "({}) ? ({}) : ({})",
+            bare_parens(&c),
+            bare_parens(&ts),
+            bare_parens(&es)
+        )
     }
 
     /// 实参专用生成器。数组字面量在实参位置必须写成 C99 复合字面量
@@ -325,6 +393,27 @@ impl Codegen {
         args: &[Expr],
         fields: Option<&[String]>,
     ) -> Vec<String> {
+        // 默认参数：位置参数从前往后填，缺的尾部参数在调用处展开默认值
+        // （C 语义——默认值表达式在调用处求值，只能引用调用处可见的名字）。
+        // checker 已保证个数在 [required, total]，这里只负责补尾。
+        let defaults: Vec<Option<Expr>> = match callee {
+            Expr::Ident(fname) => self
+                .fn_param_defaults
+                .get(fname)
+                .cloned()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let mut args: Vec<Expr> = args.to_vec();
+        if args.len() < defaults.len() {
+            for d in defaults.iter().skip(args.len()) {
+                match d {
+                    Some(e) => args.push(e.clone()),
+                    // 理论上 checker 已挡住（缺参且无默认值），防御
+                    None => break,
+                }
+            }
+        }
         let arr_flags: Option<Vec<bool>> = match callee {
             Expr::Ident(fname) => self.fn_array_params.get(fname).cloned(),
             _ => None,
@@ -352,6 +441,52 @@ impl Codegen {
             }
         }
         out
+    }
+
+    /// 命名参数函数调用 f(b: 2, a: 1) → C 的位置参数调用。
+    ///
+    /// parser 把 `f(a: 1)` 解析成 StructLit（和 Point(x: 1) 完全同形），
+    /// 这里按语义分流：名字在 structs 表里 → 结构体构造，返回 None 交给
+    /// 调用方按老路生成；否则查 fn_param_names 重排，None 槽位用默认值
+    /// 表达式补，再走 gen_call_args（数组长度伴随参数一起补）。
+    ///
+    /// self_fields 非空表示在结构体方法里，实参要走 with_self 版本。
+    /// 返回 None = 不是命名参数调用（结构体构造，或名字完全未知）。
+    fn gen_named_call(
+        &mut self,
+        name: &str,
+        fields: &[(String, Expr)],
+        self_fields: Option<&[String]>,
+    ) -> Option<String> {
+        if self.structs.contains_key(name) {
+            return None;
+        }
+        // 名字既不是结构体也不是用户函数：保持老行为（生成一个必然
+        // 编译不过的结构体字面量），错误由 checker 报。
+        let param_names = self.fn_param_names.get(name).cloned()?;
+        let slots = match reorder_named_args(fields, &param_names) {
+            Ok(s) => s,
+            // checker 已经报过错了，这里兜个底别 panic
+            Err(msg) => return Some(format!("/* 命名参数错误: {} */", msg)),
+        };
+        let defaults = self
+            .fn_param_defaults
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        let mut args: Vec<Expr> = Vec::with_capacity(slots.len());
+        for (i, slot) in slots.iter().enumerate() {
+            match slot {
+                Some(e) => args.push(e.clone()),
+                None => match defaults.get(i).and_then(|d| d.clone()) {
+                    Some(d) => args.push(d),
+                    // checker 已验证过有默认值，防御性填充
+                    None => args.push(Expr::Int(0)),
+                },
+            }
+        }
+        let arg_strs = self.gen_call_args(&Expr::Ident(name.to_string()), &args, self_fields);
+        Some(format!("{}({})", name, arg_strs.join(", ")))
     }
 
     /// `let r = f(...)` 且 f 返回数组：C 函数多一个长度出参，
@@ -498,6 +633,9 @@ impl Codegen {
                     if name == "say" {
                         return self.gen_say_with(args, Some(fields));
                     }
+                    if name == "write" {
+                        return self.gen_write_with(args, Some(fields));
+                    }
                 }
                 // now
                 if let Expr::Ident(name) = callee.as_ref() {
@@ -586,17 +724,15 @@ impl Codegen {
                     BinOp::Le => "<=", BinOp::Ge => ">=",
                     BinOp::And => "&&", BinOp::Or => "||",
                     BinOp::Pipe => {
-                        let mut pipe_args = vec![ls];
-                        let callee = match r.as_ref() {
-                            Expr::Call(callee, args) => {
-                                for a in args {
-                                    pipe_args.push(self.gen_expr_with_self(a, fields));
-                                }
-                                self.gen_expr_with_self(callee, fields)
-                            }
-                            other => self.gen_expr_with_self(other, fields),
+                        let (callee, extra): (&Expr, &[Expr]) = match r.as_ref() {
+                            Expr::Call(callee, args) => (callee.as_ref(), args.as_slice()),
+                            other => (other, &[]),
                         };
-                        return format!("{}({})", callee, pipe_args.join(", "));
+                        let mut all = vec![l.as_ref().clone()];
+                        all.extend_from_slice(extra);
+                        let arg_strs = self.gen_call_args(callee, &all, Some(fields));
+                        let callee_str = self.gen_expr_with_self(callee, fields);
+                        return format!("{}({})", callee_str, arg_strs.join(", "));
                     }
                 };
                 // 同上：字符串比较走 strcmp
@@ -616,6 +752,19 @@ impl Codegen {
                         _ => "==",
                     };
                     return format!("(strcmp({}, {}) {} 0)", ls, rs, cmp_op);
+                }
+                // 整数除法/取模：除零和 INT64_MIN / -1 在 C 里是 UB。
+                // 包一层运行时检查（double 是 IEEE，inf 有定义，不包）。
+                // -O3 下 static inline 会被内联，常量除数直接消掉分支。
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    let lt = self.infer_type(l);
+                    if lt != "double" && lt != "float" {
+                        let fname = match op {
+                            BinOp::Div => "lume_checked_div_i64",
+                            _ => "lume_checked_mod_i64",
+                        };
+                        return format!("{}({}, {})", fname, ls, rs);
+                    }
                 }
                 format!("({} {} {})", ls, op_str, rs)
             }
@@ -656,6 +805,9 @@ impl Codegen {
             Expr::If(cond, then, els) => self.gen_if_expr(cond, then, els, Some(fields)),
 
             Expr::StructLit(name, fields_list) => {
+                if let Some(call) = self.gen_named_call(name, fields_list, Some(fields)) {
+                    return call;
+                }
                 let field_strs: Vec<String> = fields_list.iter()
                     .map(|(fname, fval)| {
                         let v = self.gen_expr_with_self(fval, fields);
@@ -666,6 +818,11 @@ impl Codegen {
                 format!("({}){{ ._tag = {}LL, {} }}", name, tag, field_strs.join(", "))
             }
 
+            Expr::Repeat(value, count) => {
+                let item = self.gen_expr_with_self(value, fields);
+                format!("{{{}}}", vec![item; *count].join(", "))
+            }
+
             _ => self.gen_expr(expr),
         }
     }
@@ -673,6 +830,30 @@ impl Codegen {
 
 /// 块里恰好一条表达式语句时返回它，否则 None。
 /// if 表达式的两个分支都要过这个检查 —— 三元运算符只包得住单个表达式。
+/// 剥掉一整串最外层的括号（仅当首尾确实是一对匹配括号时）。
+/// if/while 的条件和三元的 cond 都用它：Binary 产出的 `(a == b)`
+/// 再被外层包一层就成了 `((a == b))`，clang -Wparentheses-equality
+/// 会为此报警。剥掉不影响优先级——本来就是最外层。
+pub(crate) fn bare_parens(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'(' && bytes[bytes.len() - 1] == b')' {
+        let mut depth: i32 = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                depth -= 1;
+                if depth == 0 && i < bytes.len() - 1 {
+                    // 提前闭合：说明括号不是全包，别剥
+                    return s.to_string();
+                }
+            }
+        }
+        return s[1..s.len() - 1].to_string();
+    }
+    s.to_string()
+}
+
 pub(crate) fn single_expr(b: &Block) -> Option<&Expr> {
     if b.stmts.len() == 1 {
         if let Stmt::Expr(e) = &b.stmts[0] {

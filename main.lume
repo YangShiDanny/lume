@@ -12,6 +12,11 @@ fn later(x: int) -> int {
     return x * 3
 }
 
+// ── 默认参数 + 命名参数 ──
+fn add3(a: int, b: int, c: int = 10) -> int {
+    return a + b + c
+}
+
 // ── 互相递归 ──
 fn is_even(n: int) -> int {
     if n == 0 {
@@ -28,6 +33,10 @@ fn is_odd(n: int) -> int {
 }
 
 // ── 数组参数（自动带 restrict）──
+
+struct LimbProbe {
+    limbs: [int; 4]
+}
 
 fn ser_sum(a: [int], n: int) -> int {
     total: int = 0
@@ -408,6 +417,25 @@ fn main() {
 
     // 21d. 大小比较：strcmp 字典序
     say("[21d] \"abc\" < \"abd\": {\"abc\" < \"abd\"}   \"b\" > \"a\": {\"b\" > \"a\"}  期望 1 / 1")
+
+    // 22. 除零检查：整数除法走 lume_checked_div_i64 包装，
+    //     正常结果不能变（abort 行为用单独探针测，不能进主套件）
+    q1 := 100 / 4
+    q2 := 100 % 7
+    q3 := 17 / 5
+    say("[22] 100/4={q1} 100%7={q2} 17/5={q3}     期望 25 / 2 / 3")
+
+    // 23. BigInt 前置：定长数组字段、重复初始化和不换行输出
+    zeros := [0; 4]
+    probe := LimbProbe(limbs: [0; 4])
+    probe.limbs[0] = 42
+    write("[23] repeat={zeros[0]} len={zeros.len} struct={probe.limbs[0]}")
+    write(" +continued")
+    say(" 期望 0 / 4 / 42，write 之间不换行")
+
+    // 24. 默认参数 + 命名参数：c 省略时用默认值 10；命名参数按名字重排
+    say("[24] add3(1,2)={add3(1, 2)} add3(1,2,3)={add3(1, 2, 3)}     期望 13 / 6")
+    say("[24] add3(c:5,a:1,b:2)={add3(c: 5, a: 1, b: 2)} add3(b:2,a:1)={add3(b: 2, a: 1)}   期望 8 / 13")
 
     say("===== 完成 =====")
 }

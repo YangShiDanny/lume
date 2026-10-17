@@ -257,13 +257,27 @@ impl Parser {
                 let mut items = Vec::new();
                 self.skip_newlines();
                 if !self.check(&TokenKind::RBracket) {
+                    let first = self.parse_expr()?;
+                    if self.eat(&TokenKind::Semicolon) {
+                        let count = match self.advance().clone() {
+                            TokenKind::Int(n) if n > 0 => usize::try_from(n)
+                                .map_err(|_| self.error("重复初始化长度超出范围"))?,
+                            TokenKind::Int(_) => {
+                                return Err(self.error("重复初始化长度必须大于 0"));
+                            }
+                            _ => return Err(self.error("期待重复初始化长度")),
+                        };
+                        self.expect(&TokenKind::RBracket, "期待 ]")?;
+                        return Ok(Expr::Repeat(Box::new(first), count));
+                    }
+                    items.push(first);
                     loop {
-                        items.push(self.parse_expr()?);
                         self.skip_newlines();
                         if !self.eat(&TokenKind::Comma) {
                             break;
                         }
                         self.skip_newlines();
+                        items.push(self.parse_expr()?);
                     }
                 }
                 self.expect(&TokenKind::RBracket, "期待 ]")?;

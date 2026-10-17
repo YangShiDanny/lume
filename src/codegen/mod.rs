@@ -42,6 +42,12 @@ pub struct Codegen {
     pub(crate) fn_ret_types: HashMap<String, String>,
     // 函数名 → 每个参数是不是数组（调用点据此补长度实参）
     pub(crate) fn_array_params: HashMap<String, Vec<bool>>,
+    // 函数名 → 参数名表。命名参数调用 f(a: 1) 的重排依据
+    // （parser 把这种语法解析成 StructLit，见 gen_named_call）
+    pub(crate) fn_param_names: HashMap<String, Vec<String>>,
+    // 函数名 → 参数默认值表达式（None = 无默认值）。
+    // 默认值在调用处展开（C 语义），与 checker 的 FuncSig::defaults 同源。
+    pub(crate) fn_param_defaults: HashMap<String, Vec<Option<Expr>>>,
     // (结构体名, 方法名) → 同上
     pub(crate) method_array_params: HashMap<(String, String), Vec<bool>>,
     // 返回数组的函数：C 签名多一个 int64_t* _ret_len 出参
@@ -77,6 +83,8 @@ impl Codegen {
             generic_fns: HashMap::new(),
             fn_ret_types: HashMap::new(),
             fn_array_params: HashMap::new(),
+            fn_param_names: HashMap::new(),
+            fn_param_defaults: HashMap::new(),
             method_array_params: HashMap::new(),
             array_ret_fns: HashSet::new(),
             monomorphized: HashMap::new(),
@@ -146,6 +154,17 @@ impl Codegen {
                 self.fn_array_params.insert(
                     f.name.clone(),
                     f.params.iter().map(|p| is_array_ty(&p.ty)).collect(),
+                );
+                // 默认参数 + 命名参数的依据。位置调用省略尾部参数时，
+                // gen_call_args 从这里取默认值在调用处展开；命名参数
+                // 调用则靠 fn_param_names 重排（见 gen_named_call）。
+                self.fn_param_names.insert(
+                    f.name.clone(),
+                    f.params.iter().map(|p| p.name.clone()).collect(),
+                );
+                self.fn_param_defaults.insert(
+                    f.name.clone(),
+                    f.params.iter().map(|p| p.default.clone()).collect(),
                 );
                 if is_array_ty(&f.ret) {
                     self.array_ret_fns.insert(f.name.clone());

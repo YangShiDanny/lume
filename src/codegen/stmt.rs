@@ -1,4 +1,5 @@
 use super::Codegen;
+use super::expr::bare_parens;
 use crate::ast::*;
 
 impl Codegen {
@@ -13,22 +14,14 @@ impl Codegen {
                     return;
                 }
 
-                if let Expr::List(items) = init {
-                    let len = items.len();
-                    let elem_ty = if let Some(first) = items.first() {
-                        self.infer_type(first)
-                    } else {
-                        "int64_t".to_string()
-                    };
-                    let elem_strs: Vec<String> = items.iter()
-                        .map(|e| self.gen_expr(e))
-                        .collect();
+                if let Some((elem_ty, len, initializer)) =
+                    self.gen_local_array_init(ty.as_ref(), init, None)
+                {
                     self.push_line(&format!(
-                        "{} {}[] = {{{}}};",
-                        elem_ty, name, elem_strs.join(", ")
+                        "{} {}[{}] = {};",
+                        elem_ty, name, len, initializer
                     ));
-                    self.array_len_exprs
-                        .insert(name.clone(), format!("{}LL", len));
+                    self.array_len_exprs.insert(name.clone(), format!("{}LL", len));
                     self.array_elem_types.insert(name.clone(), elem_ty.clone());
                     self.var_types.insert(name.clone(), format!("{}*", elem_ty));
                     return;
@@ -56,7 +49,7 @@ impl Codegen {
 
             Stmt::If { cond, then, els } => {
                 let c = self.gen_expr(cond);
-                self.push_line(&format!("if ({}) {{", c));
+                self.push_line(&format!("if ({}) {{", bare_parens(&c)));
                 self.indent += 1;
                 for s in &then.stmts {
                     self.gen_stmt(s);
@@ -86,7 +79,7 @@ impl Codegen {
                 let c = self.gen_expr(cond);
                 // while 循环同样吃向量化提示（clang 会自动判断能不能向量化）
                 self.push_vectorize_hint();
-                self.push_line(&format!("while ({}) {{", c));
+                self.push_line(&format!("while ({}) {{", bare_parens(&c)));
                 self.indent += 1;
                 for s in &body.stmts {
                     self.gen_stmt(s);
@@ -131,22 +124,14 @@ impl Codegen {
                     return;
                 }
 
-                if let Expr::List(items) = init {
-                    let len = items.len();
-                    let elem_ty = if let Some(first) = items.first() {
-                        self.infer_type(first)
-                    } else {
-                        "int64_t".to_string()
-                    };
-                    let elem_strs: Vec<String> = items.iter()
-                        .map(|e| self.gen_expr_with_self(e, fields))
-                        .collect();
+                if let Some((elem_ty, len, initializer)) =
+                    self.gen_local_array_init(ty.as_ref(), init, Some(fields))
+                {
                     self.push_line(&format!(
-                        "{} {}[] = {{{}}};",
-                        elem_ty, name, elem_strs.join(", ")
+                        "{} {}[{}] = {};",
+                        elem_ty, name, len, initializer
                     ));
-                    self.array_len_exprs
-                        .insert(name.clone(), format!("{}LL", len));
+                    self.array_len_exprs.insert(name.clone(), format!("{}LL", len));
                     self.array_elem_types.insert(name.clone(), elem_ty.clone());
                     self.var_types.insert(name.clone(), format!("{}*", elem_ty));
                     return;
@@ -174,7 +159,7 @@ impl Codegen {
 
             Stmt::If { cond, then, els } => {
                 let c = self.gen_expr_with_self(cond, fields);
-                self.push_line(&format!("if ({}) {{", c));
+                self.push_line(&format!("if ({}) {{", bare_parens(&c)));
                 self.indent += 1;
                 for s in &then.stmts {
                     self.gen_stmt_with_self(s, fields);
@@ -201,7 +186,7 @@ impl Codegen {
             Stmt::While { cond, body } => {
                 let c = self.gen_expr_with_self(cond, fields);
                 self.push_vectorize_hint();
-                self.push_line(&format!("while ({}) {{", c));
+                self.push_line(&format!("while ({}) {{", bare_parens(&c)));
                 self.indent += 1;
                 for s in &body.stmts {
                     self.gen_stmt_with_self(s, fields);

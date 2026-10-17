@@ -11,8 +11,15 @@ impl Codegen {
         // 由编译器在构造时填，用户不写也看不见。
         self.push_line("int64_t _tag;");
         for f in &s.fields {
-            let c_ty = self.gen_type(&f.ty);
-            self.push_line(&format!("{} {};", c_ty, f.name));
+            if let Type::Array(inner, Some(len)) = &f.ty {
+                self.push_line(&format!(
+                    "{} {}[{}];",
+                    self.gen_type(inner), f.name, len
+                ));
+            } else {
+                let c_ty = self.gen_type(&f.ty);
+                self.push_line(&format!("{} {};", c_ty, f.name));
+            }
         }
         self.indent -= 1;
         self.push_line(&format!("}} {};", s.name));

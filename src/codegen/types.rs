@@ -57,6 +57,7 @@ impl Codegen {
                     "int64_t".to_string()
                 }
             }
+            Expr::Repeat(value, _) => self.infer_type(value),
             // 比较 / 逻辑 → bool；算术 → 看操作数，不能一律 int64_t
             Expr::Binary(l, op, r) => match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt |
@@ -107,7 +108,18 @@ impl Codegen {
                 Some(e) => self.infer_type(e),
                 None => "int64_t".to_string(),
             },
-            Expr::StructLit(name, _) => name.clone(),
+            // StructLit 有两种语义：结构体构造（名字是结构体）和
+            // 命名参数函数调用 f(a: 1)（parser 同形，见 gen_named_call）。
+            // 后者的类型 = 函数返回类型，不能把函数名当类型返回——
+            // 否则 say("{add3(c: 5)}") 的插值格式选择直接抓瞎。
+            Expr::StructLit(name, _) => {
+                if !self.structs.contains_key(name) {
+                    if let Some(ret) = self.fn_ret_types.get(name) {
+                        return ret.clone();
+                    }
+                }
+                name.clone()
+            }
             Expr::Call(callee, args) => {
                 // 泛型调用：按返回类型推断
                 if let Expr::Ident(fname) = callee.as_ref() {

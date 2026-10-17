@@ -7,7 +7,11 @@ use crate::ast::*;
 
 impl Codegen {
     pub(crate) fn gen_say(&mut self, args: &[Expr]) -> String {
-        self.gen_say_with(args, None)
+        self.gen_output_with(args, None, true)
+    }
+
+    pub(crate) fn gen_write(&mut self, args: &[Expr]) -> String {
+        self.gen_output_with(args, None, false)
     }
 
     // fields = Some(...) 表示当前在 struct 方法里，裸字段要映射成 _self->field
@@ -15,6 +19,23 @@ impl Codegen {
         &mut self,
         args: &[Expr],
         fields: Option<&[String]>,
+    ) -> String {
+        self.gen_output_with(args, fields, true)
+    }
+
+    pub(crate) fn gen_write_with(
+        &mut self,
+        args: &[Expr],
+        fields: Option<&[String]>,
+    ) -> String {
+        self.gen_output_with(args, fields, false)
+    }
+
+    fn gen_output_with(
+        &mut self,
+        args: &[Expr],
+        fields: Option<&[String]>,
+        newline: bool,
     ) -> String {
         let mut format_str = String::new();
         let mut format_args: Vec<String> = Vec::new();
@@ -44,7 +65,9 @@ impl Codegen {
             }
         }
 
-        format_str.push_str("\\n");
+        if newline {
+            format_str.push_str("\\n");
+        }
 
         if format_args.is_empty() {
             format!("printf(\"{}\")", format_str)

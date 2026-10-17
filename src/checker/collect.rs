@@ -38,10 +38,16 @@ impl Checker {
                         }
                     }
 
+                    // 默认参数必须连续排在尾部，见 check_defaults_trailing
+                    self.check_defaults_trailing(f, &f.name);
+
                     let sig = FuncSig {
                         params: f.params.iter()
                             .map(|p| self.ty_from_ast(p.ty.as_ref()))
                             .collect(),
+                        param_names: f.params.iter().map(|p| p.name.clone()).collect(),
+                        required: f.params.iter().take_while(|p| p.default.is_none()).count(),
+                        defaults: f.params.iter().map(|p| p.default.clone()).collect(),
                         ret: self.ty_from_ast(f.ret.as_ref()),
                     };
 
@@ -60,10 +66,15 @@ impl Checker {
 
                     let mut methods = HashMap::new();
                     for m in &s.methods {
+                        let label = format!("{}.{}", s.name, m.name);
+                        self.check_defaults_trailing(m, &label);
                         let sig = FuncSig {
                             params: m.params.iter()
                                 .map(|p| self.ty_from_ast(p.ty.as_ref()))
                                 .collect(),
+                            param_names: m.params.iter().map(|p| p.name.clone()).collect(),
+                            required: m.params.iter().take_while(|p| p.default.is_none()).count(),
+                            defaults: m.params.iter().map(|p| p.default.clone()).collect(),
                             ret: self.ty_from_ast(m.ret.as_ref()),
                         };
                         methods.insert(m.name.clone(), sig);
@@ -71,6 +82,28 @@ impl Checker {
                     self.methods.insert(s.name.clone(), methods);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// 默认参数必须连续排在参数列表尾部。
+    /// C 的默认参数是调用处展开：`f(a, b = 1)` 调 `f(x)` 时补的是
+    /// 最后一个参数。要是中间夹一个没默认值的（`f(a = 1, b)`），
+    /// 调用处根本不知道该把实参往哪个槽位填，这个洞补不上。
+    fn check_defaults_trailing(&mut self, f: &FnDecl, label: &str) {
+        let mut seen_default = false;
+        for p in &f.params {
+            if p.default.is_some() {
+                seen_default = true;
+            } else if seen_default {
+                self.error_hint(
+                    format!(
+                        "'{}' 的参数 '{}' 没有默认值，却排在带默认值的参数后面",
+                        label, p.name
+                    ),
+                    "把有默认值的参数统一挪到参数列表尾部",
+                );
+                return;
             }
         }
     }

@@ -99,6 +99,35 @@ pub const RUNTIME_HEADER: &str = r#"#ifndef LUME_RUNTIME_H
 #  define LUME_PURE
 #endif
 
+/* ── 除零 / 溢出检查 ── */
+/* 整数除零、INT64_MIN / -1 在 C 里都是 UB（后者直接 SIGFPE）。
+   Lume 双保险：编译期常量 0 直接报错，运行期变量兜底 ——
+   错误信息说明白，然后 abort。崩得明明白白好过静默算错。
+   double 除法是 IEEE 语义（inf 有定义），不包这层，零开销。 */
+static inline int64_t lume_checked_div_i64(int64_t a, int64_t b) {
+    if (b == 0) {
+        fprintf(stderr, "lume: runtime error: division by zero\n");
+        abort();
+    }
+    if (a == INT64_MIN && b == -1) {
+        fprintf(stderr, "lume: runtime error: INT64_MIN / -1 overflow\n");
+        abort();
+    }
+    return a / b;
+}
+
+static inline int64_t lume_checked_mod_i64(int64_t a, int64_t b) {
+    if (b == 0) {
+        fprintf(stderr, "lume: runtime error: modulo by zero\n");
+        abort();
+    }
+    if (a == INT64_MIN && b == -1) {
+        /* C99 下 INT64_MIN % -1 是 UB，数学余数是 0 */
+        return 0;
+    }
+    return a % b;
+}
+
 /* ── std.str ── */
 /* 字符串函数返回内部缓冲区。用轮转槽位代替单一 static buf，
    这样 say("{str_upper(a)} {str_upper(b)}") 不会拿到同一个指针。 */

@@ -21,6 +21,19 @@ impl Checker {
 
         for p in &f.params {
             let ty = self.ty_from_ast(p.ty.as_ref());
+            // 默认值在调用处展开，但类型必须和参数一致
+            // （引用其他参数也在这里被抓到——callee 作用域里没有它们）
+            if let Some(d) = &p.default {
+                let dty = self.check_expr(d);
+                if !dty.is_unknown() && !ty.is_unknown() && dty != ty {
+                    self.error(format!(
+                        "参数 '{}' 的默认值类型不匹配：期望 {}，得到 {}",
+                        p.name,
+                        ty.name(),
+                        dty.name()
+                    ));
+                }
+            }
             self.define(p.name.clone(), ty);
         }
 
@@ -45,6 +58,21 @@ impl Checker {
         match stmt {
             Stmt::Let { name, ty, init } => {
                 let init_ty = self.check_expr(init);
+                if let Some(Type::Array(_, Some(expected))) = ty {
+                    let actual = match init {
+                        Expr::List(items) => Some(items.len()),
+                        Expr::Repeat(_, count) => Some(*count),
+                        _ => None,
+                    };
+                    if let Some(actual) = actual {
+                        if actual != *expected {
+                            self.error(format!(
+                                "数组 '{}' 的长度不匹配：声明为 {}，初始化为 {}",
+                                name, expected, actual
+                            ));
+                        }
+                    }
+                }
                 let declared_ty = match ty {
                     Some(t) => self.ty_from_ast(Some(t)),
                     None => init_ty.clone(),

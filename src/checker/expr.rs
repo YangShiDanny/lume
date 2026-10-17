@@ -53,6 +53,23 @@ impl Checker {
             Expr::Binary(l, op, r) => {
                 let lt = self.check_expr(l);
                 let rt = self.check_expr(r);
+                // 编译期除零：整数字面量 0 作除数/模数直接拒编译。
+                // 浮点除零是 IEEE 语义（inf），合法；变量的情况运行时
+                // 兜底（lume_checked_div_i64 / lume_checked_mod_i64）。
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    if let Expr::Int(0) = r.as_ref() {
+                        if lt == Ty::Int || lt.is_unknown() {
+                            let what = match op {
+                                BinOp::Div => "division",
+                                _ => "modulo",
+                            };
+                            self.error_hint(
+                                format!("{} by zero", what),
+                                "整数除零/模零在 C 里是未定义行为，Lume 编译期直接拒绝",
+                            );
+                        }
+                    }
+                }
                 self.check_binop(op, &lt, &rt)
             }
 
@@ -91,7 +108,7 @@ impl Checker {
                     }
                 }
                 if let Expr::Ident(name) = callee.as_ref() {
-                    if name == "say" {
+                    if name == "say" || name == "write" {
                         for a in args {
                             let _ = self.check_expr(a);
                         }
@@ -232,8 +249,24 @@ impl Checker {
                 Ty::Array(Box::new(elem_ty))
             }
 
+            Expr::Repeat(value, _) => Ty::Array(Box::new(self.check_expr(value))),
+
             Expr::Map(_) => Ty::Unknown,
             Expr::StructLit(name, fields) => {
+                // f(a: 1) 与 Point(x: 1) 语法同形，parser 一律解析成 StructLit。
+                // 名字不是结构体 → 命名参数函数调用，按签名重排后检查。
+                if !self.structs.contains_key(name) {
+                    if let Some(sig) = self.functions.get(name).cloned() {
+                        return self.check_named_call(name, &sig, fields);
+                    }
+                    // 既不是结构体也不是函数：只能是用错了。以前这里静默
+                    // 放行、codegen 生成一个必然编译不过的结构体字面量；
+                    // 现在命名参数进来了，把两种正确写法都在提示里说清楚。
+                    self.error_hint(
+                        format!("'{}' 不是结构体，也不能这样调用", name),
+                        "结构体构造写 Point(x: 1)；函数命名参数写 f(a: 1)（内置函数和 say/write/now 只支持位置参数）",
+                    );
+                }
                 for (_, v) in fields {
                     let _ = self.check_expr(v);
                 }
@@ -354,13 +387,28 @@ impl Checker {
     }
 
     pub(crate) fn check_call_args(&mut self, fname: &str, sig: &FuncSig, args: &[Expr]) {
-        if args.len() != sig.params.len() {
+        if sig.required == sig.params.len() {
+            // 无默认参数：个数必须精确
+            if args.len() != sig.params.len() {
+                self.error_hint(
+                    format!(
+                        "函数 '{}' 需要 {} 个参数，但传了 {} 个",
+                        fname, sig.params.len(), args.len()
+                    ),
+                    format!("改成传 {} 个参数", sig.params.len()),
+                );
+            }
+        } else if args.len() < sig.required || args.len() > sig.params.len() {
+            // 有默认参数：尾部参数可省略，个数落在 [required, total] 即可
             self.error_hint(
                 format!(
-                    "函数 '{}' 需要 {} 个参数，但传了 {} 个",
-                    fname, sig.params.len(), args.len()
+                    "函数 '{}' 需要 {} ~ {} 个参数，但传了 {} 个",
+                    fname, sig.required, sig.params.len(), args.len()
                 ),
-                format!("改成传 {} 个参数", sig.params.len()),
+                format!(
+                    "尾部 {} 个参数有默认值，可以省略",
+                    sig.params.len() - sig.required
+                ),
             );
         }
 
@@ -376,6 +424,67 @@ impl Checker {
                         fname, i + 1, expected.name(), arg_ty.name()
                     ));
                 }
+            }
+        }
+    }
+
+    /// 命名参数调用 f(b: 2, a: 1)。parser 把这种语法解析成 StructLit，
+    /// 由 check_expr 的 StructLit 分支按语义分流过来（名字不是结构体）。
+    /// 重排成位置参数后，类型检查与位置调用完全同一套。
+    fn check_named_call(&mut self, fname: &str, sig: &FuncSig, fields: &[(String, Expr)]) -> Ty {
+        if self.generic_fns.contains(fname) {
+            self.error_hint(
+                format!("泛型函数 '{}' 暂不支持命名参数", fname),
+                "改成位置参数调用",
+            );
+            for (_, v) in fields {
+                let _ = self.check_expr(v);
+            }
+            return sig.ret.clone();
+        }
+        match reorder_named_args(fields, &sig.param_names) {
+            Ok(slots) => {
+                // None 槽位 = 调用处没传，必须由默认值补，否则是缺参
+                for (i, slot) in slots.iter().enumerate() {
+                    if slot.is_some() {
+                        continue;
+                    }
+                    let has_default = sig
+                        .defaults
+                        .get(i)
+                        .map(|d| d.is_some())
+                        .unwrap_or(false);
+                    if !has_default {
+                        self.error_hint(
+                            format!("函数 '{}' 缺少参数 '{}'", fname, sig.param_names[i]),
+                            format!("补上 '{}: ...'，或改用位置参数", sig.param_names[i]),
+                        );
+                    }
+                }
+                for (i, slot) in slots.iter().enumerate() {
+                    if let Some(arg) = slot {
+                        let arg_ty = self.check_expr(arg);
+                        if let Some(expected) = sig.params.get(i) {
+                            if !arg_ty.is_unknown()
+                                && !expected.is_unknown()
+                                && &arg_ty != expected
+                            {
+                                self.error(format!(
+                                    "函数 '{}' 参数 '{}' 类型不匹配：期望 {}，得到 {}",
+                                    fname, sig.param_names[i], expected.name(), arg_ty.name()
+                                ));
+                            }
+                        }
+                    }
+                }
+                sig.ret.clone()
+            }
+            Err(msg) => {
+                self.error_hint(msg, "检查参数名，或改用位置参数调用");
+                for (_, v) in fields {
+                    let _ = self.check_expr(v);
+                }
+                sig.ret.clone()
             }
         }
     }

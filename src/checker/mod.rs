@@ -43,6 +43,13 @@ impl Ty {
 #[derive(Debug, Clone)]
 pub struct FuncSig {
     pub params: Vec<Ty>,
+    /// 参数名。命名参数调用 `f(a: 1)` 的重排依据。
+    pub param_names: Vec<String>,
+    /// 无默认值的参数个数（默认参数必须在尾部，这就是最少要传的数）。
+    pub required: usize,
+    /// 每个参数的默认值表达式。在调用处求值（C 的展开语义），
+    /// 所以默认值只能引用调用处可见的名字，不能引用其他参数。
+    pub defaults: Vec<Option<Expr>>,
     pub ret: Ty,
 }
 
