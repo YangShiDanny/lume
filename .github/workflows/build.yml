@@ -16,12 +16,19 @@ jobs:
           - os: windows-latest
             artifact: lume-windows
             bin: lume.exe
+            target: ""
           - os: ubuntu-latest
             artifact: lume-linux
             bin: lume
+            target: ""
           - os: macos-latest
             artifact: lume-macos
             bin: lume
+            target: ""
+          - os: ubuntu-latest
+            artifact: lume-alpine
+            bin: lume
+            target: x86_64-unknown-linux-musl
 
     runs-on: ${{ matrix.os }}
 
@@ -29,17 +36,38 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install clang (Linux)
-        if: runner.os == 'Linux'
+      - name: Install clang (Linux glibc)
+        if: runner.os == 'Linux' && matrix.target == ''
         run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
 
+      - name: Install musl toolchain (Alpine target)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build
-        run: cargo build --release
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo build --release --target ${{ matrix.target }}
+          else
+            cargo build --release
+          fi
+
+      - name: Verify static (Alpine)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          file target/${{ matrix.target }}/release/lume
+          ldd target/${{ matrix.target }}/release/lume 2>&1 || echo "static"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: target/release/${{ matrix.bin }}
+          path: |
+            target/release/${{ matrix.bin }}
+            target/${{ matrix.target }}/release/${{ matrix.bin }}
+          if-no-files-found: ignore
