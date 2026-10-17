@@ -20,8 +20,8 @@ pub enum TokenKind {
     Nothing, App, Par, Async, Await, Spawn, It,
 
     // ── 类型关键字 ──
-    TInt, TI8, TI16, TI32, TI64,
-    TU1, TU2, TU4, TU8, TU16, TU32, TU64,
+    TInt, TI8, TI16, TI32, TI64, TI128,
+    TU1, TU2, TU4, TU8, TU16, TU32, TU64, TU128,
     TF32, TF64, TBool, TStr, TRune,
 
     // ── 运算符 ──
@@ -545,6 +545,7 @@ fn keyword(s: &str) -> Option<TokenKind> {
         "i16" => TokenKind::TI16,
         "i32" => TokenKind::TI32,
         "i64" => TokenKind::TI64,
+        "i128" => TokenKind::TI128,
         "u1" => TokenKind::TU1,
         "u2" => TokenKind::TU2,
         "u4" => TokenKind::TU4,
@@ -552,6 +553,7 @@ fn keyword(s: &str) -> Option<TokenKind> {
         "u16" => TokenKind::TU16,
         "u32" => TokenKind::TU32,
         "u64" => TokenKind::TU64,
+        "u128" => TokenKind::TU128,
         "f32" => TokenKind::TF32,
         "f64" | "float" => TokenKind::TF64,
         "bool" => TokenKind::TBool,

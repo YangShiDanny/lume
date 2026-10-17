@@ -298,5 +298,37 @@ static inline double lume_float_floor(double x) { return floor(x); }
 static inline double lume_float_ceil(double x) { return ceil(x); }
 static inline double lume_float_round(double x) { return round(x); }
 
+/* ── 128 位整数 ──
+   tcc 不支持 __int128，用 __SIZEOF_INT128__ 守卫：tcc 不定义这个宏，
+   预处理阶段直接跳过整段，普通程序（不用 i128）的编译不受影响；
+   只有用到 i128/u128 且编译器支持（gcc/clang 64 位）时才包含。 */
+#if defined(__SIZEOF_INT128__)
+static char _lume_i128_buf[8][48];
+static int _lume_i128_slot = 0;
+static const char* lume_i128_str(__int128 v) {
+    char* b = _lume_i128_buf[_lume_i128_slot];
+    _lume_i128_slot = (_lume_i128_slot + 1) & 7;
+    if (v == 0) { b[0] = '0'; b[1] = 0; return b; }
+    int neg = v < 0;
+    /* 用无符号算术取绝对值，避开 INT128_MIN 的符号溢出 UB */
+    unsigned __int128 u = neg ? ((unsigned __int128)0 - (unsigned __int128)v)
+                              : (unsigned __int128)v;
+    int i = 47;
+    while (u > 0) { b[i--] = (char)('0' + (int)(u % 10ULL)); u /= 10ULL; }
+    if (neg) b[i--] = '-';
+    return b + i + 1;
+}
+static char _lume_u128_buf[8][48];
+static int _lume_u128_slot = 0;
+static const char* lume_u128_str(unsigned __int128 v) {
+    char* b = _lume_u128_buf[_lume_u128_slot];
+    _lume_u128_slot = (_lume_u128_slot + 1) & 7;
+    if (v == 0) { b[0] = '0'; b[1] = 0; return b; }
+    int i = 47;
+    while (v > 0) { b[i--] = (char)('0' + (int)(v % 10ULL)); v /= 10ULL; }
+    return b + i + 1;
+}
+#endif
+
 #endif
 "#;

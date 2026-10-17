@@ -16,6 +16,8 @@ impl Codegen {
             Type::U16 => "uint16_t".to_string(),
             Type::U32 => "uint32_t".to_string(),
             Type::U64 => "uint64_t".to_string(),
+            Type::I128 => "__int128".to_string(),
+            Type::U128 => "unsigned __int128".to_string(),
             Type::F32 => "float".to_string(),
             Type::F64 => "double".to_string(),
             Type::Bool => "bool".to_string(),

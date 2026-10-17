@@ -93,6 +93,8 @@ impl Parser {
                         | TokenKind::TU16
                         | TokenKind::TU32
                         | TokenKind::TU64
+                | TokenKind::TI128
+                | TokenKind::TU128
                         | TokenKind::Ident(_)
                         | TokenKind::LBracket
                 ) {

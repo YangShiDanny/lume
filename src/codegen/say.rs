@@ -82,6 +82,14 @@ impl Codegen {
             Some(f) => self.gen_expr_with_self(e, f),
             None => self.gen_expr(e),
         };
+        // i128/u128 没有 printf 格式符，转成字符串再 %s
+        let cty = self.infer_type(e);
+        if cty == "__int128" {
+            return format!("lume_i128_str({})", code);
+        }
+        if cty == "unsigned __int128" {
+            return format!("lume_u128_str({})", code);
+        }
         if code.starts_with("printf(") || code.contains("/* ") {
             return code;
         }

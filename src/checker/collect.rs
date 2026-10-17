@@ -114,7 +114,8 @@ impl Checker {
             Some(t) => match t {
                 Type::Int | Type::I8 | Type::I16 | Type::I32 | Type::I64
                 | Type::U1 | Type::U2 | Type::U4 | Type::U8
-                | Type::U16 | Type::U32 | Type::U64 => Ty::Int,
+                | Type::U16 | Type::U32 | Type::U64
+                | Type::I128 | Type::U128 => Ty::Int,
                 Type::F32 | Type::F64 => Ty::Float,
                 Type::Bool => Ty::Bool,
                 Type::Str => Ty::Str,
