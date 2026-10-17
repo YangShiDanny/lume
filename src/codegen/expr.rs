@@ -176,7 +176,10 @@ impl Codegen {
 
             Expr::Index(obj, idx) => {
                 let o = self.gen_expr(obj);
-                let i = Self::gen_index(idx);
+                let i = match gen_index(idx) {
+                    Some(s) => s,
+                    None => self.gen_expr(idx),
+                };
                 format!("{}[{}]", o, i)
             }
 
@@ -549,7 +552,10 @@ impl Codegen {
 
             Expr::Index(obj, idx) => {
                 let o = self.gen_expr_with_self(obj, fields);
-                let i = Self::gen_index(idx);
+                let i = match gen_index(idx) {
+                    Some(s) => s,
+                    None => self.gen_expr_with_self(idx, fields),
+                };
                 format!("{}[{}]", o, i)
             }
 
@@ -568,7 +574,17 @@ impl Codegen {
     }
 }
 
+/// 下标位置的字面量整数不需要 `LL` 后缀：`a[0]` 比 `a[0LL]` 干净，
+/// 对 clang 来说两者完全等价。返回 None 表示不是字面量，走常规生成。
+fn gen_index(idx: &Expr) -> Option<String> {
+    match idx {
+        Expr::Int(n) => Some(format!("{}", n)),
+        _ => None,
+    }
+}
+
 fn builtin_map(name: &str) -> Option<&'static str> {
+    Some(match name {
         // str
         "str_len" => "lume_str_len",
         "str_upper" => "lume_str_upper",

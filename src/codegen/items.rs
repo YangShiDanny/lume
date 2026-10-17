@@ -154,6 +154,7 @@ impl Codegen {
     }
 
     pub(crate) fn gen_method(&mut self, struct_name: &str, m: &FnDecl) {
+        self.begin_fn_scope();
         let c_name = format!("{}_{}", struct_name, m.name);
         let ret_type = match &m.ret {
             None => "void".to_string(),
@@ -194,6 +195,7 @@ impl Codegen {
     }
 
     pub(crate) fn gen_fn(&mut self, f: &FnDecl) {
+        self.begin_fn_scope();
         // 登记数组参数（供 par for 收集、restrict 生效）
         self.register_array_params(&f.params);
 
@@ -294,6 +296,7 @@ impl Codegen {
         mono_name: &str,
         type_map: &HashMap<String, String>,
     ) {
+        self.begin_fn_scope();
         let ret_type = match &f.ret {
             None => "void".to_string(),
             Some(t) => self.gen_type_subst(t, type_map),
@@ -821,6 +824,7 @@ impl Codegen {
     }
 
     pub(crate) fn gen_fn_body_impl(&mut self, f: &FnDecl, impl_name: &str) {
+        self.begin_fn_scope();
         let ret_type = match &f.ret {
             None => "void".to_string(),
             Some(t) => self.gen_type(t),

@@ -147,6 +147,14 @@ impl Codegen {
             }
 
             Stmt::For { var, iter, body, .. } => {
+                // `for v in a` 会遍历整个数组，也就是通过指针读内存。
+                // GCC 明确规定："a function that has pointer arguments and
+                // examines the data pointed to must not be declared const"。
+                // 所以只要出现数组遍历，这个函数就不可能是纯函数 ——
+                // 标了 const，clang 会把两次不同数组的调用折叠成一次。
+                if matches!(iter, Expr::Ident(_)) {
+                    return false;
+                }
                 if !self.expr_const(iter, locals, set) {
                     return false;
                 }

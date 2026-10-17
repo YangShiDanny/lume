@@ -272,6 +272,20 @@ impl Codegen {
         std::mem::take(&mut self.output)
     }
 
+    // ── 函数局部作用域 ──
+    //
+    // var_types / array_len_exprs / array_elem_types / array_params
+    // 描述的都是「当前函数内部」的符号。Codegen 是单个实例、跨函数复用的，
+    // 不清空就会串味：`out` 在 dbl() 里是数组参数，在 scaled() 里是局部
+    // 数组，混在一起就分不清它是入参还是栈上变量 —— 而这两者的返回值
+    // 处理完全不同（入参能直接 return，栈数组必须 malloc 拷贝）。
+    pub(crate) fn begin_fn_scope(&mut self) {
+        self.var_types.clear();
+        self.array_len_exprs.clear();
+        self.array_elem_types.clear();
+        self.array_params.clear();
+    }
+
     pub(crate) fn push_line(&mut self, s: &str) {
         self.output.push_str(&"    ".repeat(self.indent));
         self.output.push_str(s);
