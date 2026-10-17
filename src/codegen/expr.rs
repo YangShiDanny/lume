@@ -453,7 +453,7 @@ impl Codegen {
     /// 缺省：起点 `0LL`，终点 = 原数组长度。`..=j` 的终点是 `j + 1`。
     /// 一律带运行期边界检查 —— 切片越界在 C 里是静默的越界读写。
     /// 和除零检查同一个思路：崩得明明白白好过静默算错。
-    fn slice_bounds(
+    pub(crate) fn slice_bounds(
         &mut self,
         obj: &Expr,
         start: &Option<Box<Expr>>,
