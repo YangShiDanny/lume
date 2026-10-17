@@ -49,6 +49,20 @@ fn main() {
 `write(...)` 与 `say(...)` 使用相同的字符串插值格式，但不自动换行；固定数组字段可用
 `[int; 256]` 声明，并通过 `[0; 256]` 零初始化。
 
+`say` / `write` 先写入线程本地缓冲，不争用 Lume 全局输出锁。主线程在程序退出时刷新，
+`par for` worker 在退出时刷新；并行输出按 worker 块写出，线程间顺序不保证。基准测试中
+可显式调用 `flush()`，把实际输出时间计入测量：
+
+```lume
+start := now()
+for i in 1..=100 {
+  say("{i}")
+}
+flush()
+elapsed := now() - start
+say("输出 100 行耗时 {elapsed} ns")
+```
+
 ## 构建与运行
 
 ```bash

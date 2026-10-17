@@ -261,6 +261,10 @@ impl Codegen {
             self.var_types.insert(p.name.clone(), ty);
         }
 
+        if is_main {
+            self.push_line("lume_log_init_main();");
+        }
+
         for stmt in &f.body.stmts {
             self.gen_stmt(stmt);
         }

@@ -70,9 +70,9 @@ impl Codegen {
         }
 
         if format_args.is_empty() {
-            format!("printf(\"{}\")", format_str)
+            format!("lume_logf(\"{}\")", format_str)
         } else {
-            format!("printf(\"{}\", {})", format_str, format_args.join(", "))
+            format!("lume_logf(\"{}\", {})", format_str, format_args.join(", "))
         }
     }
 
@@ -90,7 +90,7 @@ impl Codegen {
         if cty == "unsigned __int128" {
             return format!("lume_u128_str({})", code);
         }
-        if code.starts_with("printf(") || code.contains("/* ") {
+        if code.starts_with("lume_logf(") || code.contains("/* ") {
             return code;
         }
         match fmt {

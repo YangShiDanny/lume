@@ -6,15 +6,18 @@ pub const RUNTIME_HEADER: &str = r#"#ifndef LUME_RUNTIME_H
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdarg.h>
 #include <math.h>
 #include <time.h>
 #include <ctype.h>
+
+static inline void lume_log_flush_thread(void);
 
 #ifdef _WIN32
   #include <windows.h>
   typedef HANDLE LumeThread;
   #define LUME_WORKER_RET     DWORD WINAPI
-  #define LUME_WORKER_RETURN  return 0
+    #define LUME_WORKER_RETURN  do { lume_log_flush_thread(); return 0; } while (0)
   #define LUME_THREAD_CREATE(thread, fn, arg) \
       do { (thread) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(fn), (arg), 0, NULL); } while (0)
   #define LUME_THREAD_JOIN(thread) \
@@ -51,7 +54,7 @@ pub const RUNTIME_HEADER: &str = r#"#ifndef LUME_RUNTIME_H
   #include <unistd.h>
   typedef pthread_t LumeThread;
   #define LUME_WORKER_RET     void*
-  #define LUME_WORKER_RETURN  return NULL
+    #define LUME_WORKER_RETURN  do { lume_log_flush_thread(); return NULL; } while (0)
   #define LUME_THREAD_CREATE(thread, fn, arg) \
       do { pthread_create(&(thread), NULL, (fn), (arg)); } while (0)
   #define LUME_THREAD_JOIN(thread) \
@@ -77,6 +80,76 @@ pub const RUNTIME_HEADER: &str = r#"#ifndef LUME_RUNTIME_H
       return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
   }
 #endif
+
+/* say/write append to thread-local memory; only flush touches stdout. */
+#define LUME_LOG_BUFFER_SIZE (64u * 1024u)
+#ifdef _WIN32
+  #define LUME_THREAD_LOCAL __declspec(thread)
+#else
+  #define LUME_THREAD_LOCAL _Thread_local
+#endif
+static LUME_THREAD_LOCAL char lume_log_buffer_[LUME_LOG_BUFFER_SIZE];
+static LUME_THREAD_LOCAL size_t lume_log_length_;
+
+static inline void lume_log_flush_thread(void) {
+    size_t length = lume_log_length_;
+    if (length == 0) return;
+    size_t written = fwrite(lume_log_buffer_, 1, length, stdout);
+    if (written < length) {
+        memmove(lume_log_buffer_, lume_log_buffer_ + written, length - written);
+        lume_log_length_ = length - written;
+        return;
+    }
+    lume_log_length_ = 0;
+    fflush(stdout);
+}
+
+static inline void lume_log_write_v_(const char* format, va_list args) {
+    va_list measure_args;
+    va_copy(measure_args, args);
+    int needed = vsnprintf(NULL, 0, format, measure_args);
+    va_end(measure_args);
+    if (needed < 0) return;
+
+    size_t length = (size_t)needed;
+    if (length >= LUME_LOG_BUFFER_SIZE) {
+        lume_log_flush_thread();
+        char* large = (char*)malloc(length + 1);
+        if (large == NULL) abort();
+        vsnprintf(large, length + 1, format, args);
+        fwrite(large, 1, length, stdout);
+        fflush(stdout);
+        free(large);
+        return;
+    }
+
+    if (lume_log_length_ + length >= LUME_LOG_BUFFER_SIZE) {
+        lume_log_flush_thread();
+    }
+    vsnprintf(
+        lume_log_buffer_ + lume_log_length_,
+        LUME_LOG_BUFFER_SIZE - lume_log_length_,
+        format,
+        args
+    );
+    lume_log_length_ += length;
+}
+
+static inline void lume_logf(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    lume_log_write_v_(format, args);
+    va_end(args);
+}
+
+static inline void lume_log_init_main(void) {
+    atexit(lume_log_flush_thread);
+}
+
+static inline void lume_log_flush(void) {
+    lume_log_flush_thread();
+    fflush(stdout);
+}
 
 /* ── 优化提示 ── */
 

@@ -114,6 +114,12 @@ impl Checker {
                         }
                         return Ty::Void;
                     }
+                    if name == "flush" {
+                        if !args.is_empty() {
+                            self.error("flush 不接受参数");
+                        }
+                        return Ty::Void;
+                    }
                     if name == "now" {
                         return Ty::Int;
                     }

@@ -161,6 +161,9 @@ impl Codegen {
                     if name == "write" {
                         return self.gen_write(args);
                     }
+                    if name == "flush" {
+                        return "lume_log_flush()".to_string();
+                    }
                     if name == "now" {
                         return "lume_now_ns()".to_string();
                     }
@@ -635,6 +638,9 @@ impl Codegen {
                     }
                     if name == "write" {
                         return self.gen_write_with(args, Some(fields));
+                    }
+                    if name == "flush" {
+                        return "lume_log_flush()".to_string();
                     }
                 }
                 // now
