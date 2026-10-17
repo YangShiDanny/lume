@@ -242,6 +242,8 @@ impl Codegen {
             }
             // 一元负号/取反：类型跟操作数走（否则 i128 的负值和取反会被当成 int64_t 截断）
             Expr::Unary(_, e) => self.infer_type(e),
+            // 切片：元素类型不变，只是长度变了
+            Expr::Slice(obj, _, _, _) => self.infer_type(obj),
             // ! 强制解包 / ? 传播：类型都是解包出的元素类型
             Expr::Force(e) => self.infer_opt_elem(e),
             Expr::Try(e) => self.infer_opt_elem(e),

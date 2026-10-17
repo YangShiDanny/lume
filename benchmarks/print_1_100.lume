@@ -1,0 +1,9 @@
+fn main() {
+    start := now()
+    for x in 1..=100 {
+        say("{x}")
+    }
+    flush()
+    elapsed := now() - start
+    say("elapsed_ns={elapsed}")
+}

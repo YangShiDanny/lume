@@ -472,6 +472,7 @@ fn main() {
             say("worker[{i}]")
         }
     }
+    flush()
     say("[26] worker logging complete")
 
     say("===== 完成 =====")

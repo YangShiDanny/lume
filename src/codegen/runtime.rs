@@ -12,6 +12,7 @@ pub const RUNTIME_HEADER: &str = r#"#ifndef LUME_RUNTIME_H
 #include <ctype.h>
 
 static inline void lume_log_flush_thread(void);
+static inline void lume_log_shutdown(void);
 
 #ifdef _WIN32
   #include <windows.h>
@@ -22,6 +23,11 @@ static inline void lume_log_flush_thread(void);
       do { (thread) = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)(fn), (arg), 0, NULL); } while (0)
   #define LUME_THREAD_JOIN(thread) \
       do { WaitForSingleObject((thread), INFINITE); CloseHandle((thread)); } while (0)
+  typedef CONDITION_VARIABLE LumeCond;
+  #define LUME_COND_INIT CONDITION_VARIABLE_INIT
+  #define LUME_COND_WAIT(cond, mutex) SleepConditionVariableCS(&(cond), &(mutex).cs, INFINITE)
+  #define LUME_COND_SIGNAL(cond) WakeConditionVariable(&(cond))
+  #define LUME_COND_BROADCAST(cond) WakeAllConditionVariable(&(cond))
   /* 互斥：用 InitOnceExecuteOnce 做一次性初始化，避免静态初始化顺序问题 */
   #define LUME_MUTEX_T        struct { CRITICAL_SECTION cs; INIT_ONCE once; }
   #define LUME_MUTEX_INIT     { 0 }
@@ -59,6 +65,11 @@ static inline void lume_log_flush_thread(void);
       do { pthread_create(&(thread), NULL, (fn), (arg)); } while (0)
   #define LUME_THREAD_JOIN(thread) \
       do { pthread_join((thread), NULL); } while (0)
+  typedef pthread_cond_t LumeCond;
+  #define LUME_COND_INIT PTHREAD_COND_INITIALIZER
+  #define LUME_COND_WAIT(cond, mutex) pthread_cond_wait(&(cond), &(mutex))
+  #define LUME_COND_SIGNAL(cond) pthread_cond_signal(&(cond))
+  #define LUME_COND_BROADCAST(cond) pthread_cond_broadcast(&(cond))
   /* 互斥 */
   #define LUME_MUTEX_T        pthread_mutex_t
   #define LUME_MUTEX_INIT     PTHREAD_MUTEX_INITIALIZER
@@ -81,13 +92,31 @@ static inline void lume_log_flush_thread(void);
   }
 #endif
 
-/* say/write append to thread-local memory; only flush touches stdout. */
-static LUME_MUTEX_T lume_log_mutex_ = LUME_MUTEX_INIT;
+/* say/write append to thread-local memory; a single background thread owns stdout. */
+#define LUME_LOG_CHUNK_SIZE (64u * 1024u)
 #ifdef _WIN32
   #define LUME_THREAD_LOCAL __declspec(thread)
 #else
   #define LUME_THREAD_LOCAL _Thread_local
 #endif
+
+typedef struct LumeLogChunk {
+        char* data;
+        size_t length;
+        uint64_t sequence;
+        struct LumeLogChunk* next;
+} LumeLogChunk;
+
+static LUME_MUTEX_T lume_log_mutex_ = LUME_MUTEX_INIT;
+static LumeCond lume_log_cond_ = LUME_COND_INIT;
+static LumeLogChunk* lume_log_head_;
+static LumeLogChunk* lume_log_tail_;
+static uint64_t lume_log_submitted_;
+static uint64_t lume_log_completed_;
+static int lume_log_stopping_;
+static int lume_log_started_;
+static LumeThread lume_log_writer_thread_;
+
 static LUME_THREAD_LOCAL char* lume_log_buffer_;
 static LUME_THREAD_LOCAL size_t lume_log_length_;
 static LUME_THREAD_LOCAL size_t lume_log_capacity_;
@@ -110,28 +139,67 @@ static inline int lume_log_reserve_(size_t extra) {
     return 1;
 }
 
-static inline void lume_log_flush_thread(void) {
-    size_t length = lume_log_length_;
-    if (length == 0) {
-        free(lume_log_buffer_);
-        lume_log_buffer_ = NULL;
-        lume_log_capacity_ = 0;
-        return;
-    }
-    LUME_MUTEX_LOCK(lume_log_mutex_);
-    size_t written = fwrite(lume_log_buffer_, 1, length, stdout);
-    if (written < length) {
-        memmove(lume_log_buffer_, lume_log_buffer_ + written, length - written);
-        lume_log_length_ = length - written;
-        LUME_MUTEX_UNLOCK(lume_log_mutex_);
-        return;
-    }
-    lume_log_length_ = 0;
-    fflush(stdout);
-    LUME_MUTEX_UNLOCK(lume_log_mutex_);
-    free(lume_log_buffer_);
+static inline uint64_t lume_log_submit_thread(void) {
+    if (lume_log_length_ == 0) return 0;
+    LumeLogChunk* chunk = (LumeLogChunk*)malloc(sizeof(LumeLogChunk));
+    if (chunk == NULL) abort();
+
+    chunk->data = lume_log_buffer_;
+    chunk->length = lume_log_length_;
+    chunk->next = NULL;
     lume_log_buffer_ = NULL;
+    lume_log_length_ = 0;
     lume_log_capacity_ = 0;
+
+    LUME_MUTEX_LOCK(lume_log_mutex_);
+    uint64_t sequence = ++lume_log_submitted_;
+    chunk->sequence = sequence;
+    if (lume_log_tail_ == NULL) {
+        lume_log_head_ = chunk;
+    } else {
+        lume_log_tail_->next = chunk;
+    }
+    lume_log_tail_ = chunk;
+    LUME_COND_SIGNAL(lume_log_cond_);
+    LUME_MUTEX_UNLOCK(lume_log_mutex_);
+    return sequence;
+}
+
+static LUME_WORKER_RET lume_log_writer(void* unused) {
+    (void)unused;
+    for (;;) {
+        LUME_MUTEX_LOCK(lume_log_mutex_);
+        while (lume_log_head_ == NULL && !lume_log_stopping_) {
+            LUME_COND_WAIT(lume_log_cond_, lume_log_mutex_);
+        }
+        if (lume_log_head_ == NULL && lume_log_stopping_) {
+            LUME_MUTEX_UNLOCK(lume_log_mutex_);
+            break;
+        }
+        LumeLogChunk* chunk = lume_log_head_;
+        lume_log_head_ = chunk->next;
+        if (lume_log_head_ == NULL) lume_log_tail_ = NULL;
+        LUME_MUTEX_UNLOCK(lume_log_mutex_);
+
+        fwrite(chunk->data, 1, chunk->length, stdout);
+        fflush(stdout);
+        free(chunk->data);
+
+        LUME_MUTEX_LOCK(lume_log_mutex_);
+        lume_log_completed_ = chunk->sequence;
+        free(chunk);
+        LUME_COND_BROADCAST(lume_log_cond_);
+        LUME_MUTEX_UNLOCK(lume_log_mutex_);
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static inline void lume_log_flush_thread(void) {
+    (void)lume_log_submit_thread();
 }
 
 static inline void lume_log_write_literal(const char* text, size_t length) {
@@ -139,6 +207,9 @@ static inline void lume_log_write_literal(const char* text, size_t length) {
     if (!lume_log_reserve_(length)) abort();
     memcpy(lume_log_buffer_ + lume_log_length_, text, length);
     lume_log_length_ += length;
+    if (lume_log_length_ >= LUME_LOG_CHUNK_SIZE) {
+        (void)lume_log_submit_thread();
+    }
 }
 
 static inline void lume_log_write_v_(const char* format, va_list args) {
@@ -157,6 +228,9 @@ static inline void lume_log_write_v_(const char* format, va_list args) {
         vsnprintf(lume_log_buffer_ + lume_log_length_, length + 1, format, args);
     }
     lume_log_length_ += length;
+    if (lume_log_length_ >= LUME_LOG_CHUNK_SIZE) {
+        (void)lume_log_submit_thread();
+    }
 }
 
 static inline void lume_logf(const char* format, ...) {
@@ -167,12 +241,43 @@ static inline void lume_logf(const char* format, ...) {
 }
 
 static inline void lume_log_init_main(void) {
-    atexit(lume_log_flush_thread);
+    if (lume_log_started_) return;
+#ifdef _WIN32
+    lume_log_writer_thread_ = CreateThread(
+        NULL, 0, (LPTHREAD_START_ROUTINE)lume_log_writer, NULL, 0, NULL
+    );
+    if (lume_log_writer_thread_ == NULL) abort();
+#else
+    if (pthread_create(&lume_log_writer_thread_, NULL, lume_log_writer, NULL) != 0) {
+        abort();
+    }
+#endif
+    lume_log_started_ = 1;
+    atexit(lume_log_shutdown);
+}
+
+static inline void lume_log_shutdown(void) {
+    (void)lume_log_submit_thread();
+    LUME_MUTEX_LOCK(lume_log_mutex_);
+    lume_log_stopping_ = 1;
+    LUME_COND_SIGNAL(lume_log_cond_);
+    LUME_MUTEX_UNLOCK(lume_log_mutex_);
+#ifdef _WIN32
+    WaitForSingleObject(lume_log_writer_thread_, INFINITE);
+    CloseHandle(lume_log_writer_thread_);
+#else
+    pthread_join(lume_log_writer_thread_, NULL);
+#endif
 }
 
 static inline void lume_log_flush(void) {
-    lume_log_flush_thread();
-    fflush(stdout);
+    uint64_t target = lume_log_submit_thread();
+    LUME_MUTEX_LOCK(lume_log_mutex_);
+    if (target == 0) target = lume_log_submitted_;
+    while (lume_log_completed_ < target) {
+        LUME_COND_WAIT(lume_log_cond_, lume_log_mutex_);
+    }
+    LUME_MUTEX_UNLOCK(lume_log_mutex_);
 }
 
 /* ── 优化提示 ── */
@@ -223,6 +328,40 @@ static inline int64_t lume_checked_mod_i64(int64_t a, int64_t b) {
         return 0;
     }
     return a % b;
+}
+
+/* ── 切片边界检查 ── */
+/* a[i..j] 生成 (a + off, len) 两个值。越界在 C 里是静默的越界读写，
+   编译期能算出来的（都是字面量）checker 直接报错，这里兜运行期变量。
+   和除零检查同一个思路：崩得明明白白好过静默算错。
+   注意 off 和 len 必须一致，所以两个函数共用同一条校验：
+   0 <= i <= j <= 原长度。 */
+static inline void lume_slice_check(
+    const char* what, int64_t start, int64_t end, int64_t base_len
+) {
+    if (start < 0 || end < start || end > base_len) {
+        fprintf(stderr,
+                "lume: runtime error: slice %s[%lld..%lld] out of range "
+                "(len=%lld)\n",
+                what, (long long)start, (long long)end,
+                (long long)base_len);
+        abort();
+    }
+}
+
+static inline int64_t lume_slice_len(
+    const void* base, int64_t start, int64_t end, int64_t base_len
+) {
+    (void)base;
+    lume_slice_check("slice", start, end, base_len);
+    return end - start;
+}
+
+static inline int64_t lume_slice_off(
+    const void* base, int64_t start, int64_t end, int64_t base_len
+) {
+    lume_slice_check("slice", start, end, base_len);
+    return start;
 }
 
 /* ── std.str ── */

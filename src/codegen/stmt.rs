@@ -25,6 +25,14 @@ impl Codegen {
                     return;
                 }
 
+                // 切片：同样要拆行（指针 + 长度两个值）
+                if let Some(lines) = self.gen_slice_let(name, init, None) {
+                    for l in lines {
+                        self.push_line(&l);
+                    }
+                    return;
+                }
+
                 if let Some((elem_ty, len, initializer)) =
                     self.gen_local_array_init(ty.as_ref(), init, None)
                 {
@@ -141,6 +149,12 @@ impl Codegen {
         match stmt {
             Stmt::Let { name, ty, init } => {
                 if let Some(lines) = self.gen_array_let(name, init, Some(fields)) {
+                    for l in lines {
+                        self.push_line(&l);
+                    }
+                    return;
+                }
+                if let Some(lines) = self.gen_slice_let(name, init, Some(fields)) {
                     for l in lines {
                         self.push_line(&l);
                     }

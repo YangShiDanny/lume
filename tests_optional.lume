@@ -1,0 +1,67 @@
+// T? 可选值 / T! 错误值 · Some/None · .has/.val · ! 强制解包 · ? 错误传播
+//
+// 由 run.bat 自动跑（TESTS 列表里的每一项）。
+// clang 路径验证用：tcc 只用于本地快速回归，GNU statement expression
+// 在 tcc 和 clang 下行为可能有差异，最终以这里的输出为准。
+
+fn get(b: int) -> int? {
+    if b > 0 {
+        return Some(b * 2)
+    }
+    return None
+}
+
+// ? 传播：x 是 None 就把 None 提前返回出去
+fn chain(x: int?) -> int? {
+    v := x?
+    return Some(v + 1)
+}
+
+fn main() {
+    a: int? = Some(42)
+    if a.has {
+        say("[opt] a val={a.val}  期望 42")
+    } else {
+        say("[opt] a 错误")
+    }
+
+    b: int? = None
+    if b.has {
+        say("[opt] b 错误地有值")
+    } else {
+        say("[opt] b 是 None  期望 None")
+    }
+
+    c := get(5)
+    if c.has {
+        say("[opt] c val={c.val}  期望 10")
+    }
+
+    d := get(-1)
+    if d.has {
+        say("[opt] d 错误地有值")
+    } else {
+        say("[opt] d 是 None  期望 None")
+    }
+
+    e := chain(a)
+    if e.has {
+        say("[opt] e val={e.val}  期望 43")
+    }
+
+    f := chain(b)
+    if f.has {
+        say("[opt] f 错误地有值")
+    } else {
+        say("[opt] f 是 None（? 传播生效）  期望 None")
+    }
+
+    g := chain(d)
+    if g.has {
+        say("[opt] g 错误地有值")
+    } else {
+        say("[opt] g 是 None（传播穿透）  期望 None")
+    }
+
+    say("[opt] h bang={a!}  期望 42")
+}

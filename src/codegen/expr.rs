@@ -216,6 +216,11 @@ impl Codegen {
                 )
             }
 
+            // 切片在表达式位置退化成指针值（长度走伴随参数那条路，
+            // 见 gen_call_args / gen_slice_let）。直接内联用会丢长度，
+            // 所以只允许出现在 let 和函数实参里，checker 会拦其他位置。
+            Expr::Slice(..) => self.slice_ptr_expr(expr),
+
             Expr::Call(callee, args) => {
                 // 内置构造：Some(x) / None
                 if let Expr::Ident(name) = callee.as_ref() {
@@ -378,15 +383,125 @@ impl Codegen {
         self.infer_type(e) == "const char*"
     }
 
-    /// 数组实参的长度表达式。
+    /// `let s = a[i..j]`：切片要产出两个值（指针 + 长度），
+    /// 和数组返回函数的 `let r = f()` 一样拆成三行，长度才有地方落。
+    /// 返回 None 表示 init 不是切片，走普通 let。
+    ///
+    /// 切片是**借用**，不拷贝：s 和 a 指向同一块内存，a 改了 s 也跟着改。
+    /// 零开销，和 Rust 的 `&a[i..j]` 同语义。
+    pub(crate) fn gen_slice_let(
+        &mut self,
+        name: &str,
+        init: &Expr,
+        fields: Option<&[String]>,
+    ) -> Option<Vec<String>> {
+        let (obj, start, end, inclusive) = match init {
+            Expr::Slice(o, s, e, inc) => (o.as_ref(), s, e, *inc),
+            _ => return None,
+        };
+        // self 场景（结构体方法内）元素类型仍走 infer_type：
+    // var_types 表在方法里登记过，self 的字段访问也走同一张表。
+    let elem_ty = self.infer_type(obj);
+        let base = match fields {
+            Some(f) => self.gen_expr_with_self(obj, f),
+            None => self.gen_expr(obj),
+        };
+        let (s, e, base_len) = self.slice_bounds(obj, start, end, inclusive);
+        let ptr = format!(
+            "({} + lume_slice_off({}, {}, {}, {}))",
+            base, base, s, e, base_len
+        );
+        let len = format!("lume_slice_len({}, {}, {}, {})", base, s, e, base_len);
+        // 登记成长度和普通数组一样，后面 s.len / for v in s 都能用
+        self.array_len_exprs.insert(name.to_string(), format!("{}_len", name));
+        self.array_elem_types.insert(name.to_string(), elem_ty.clone());
+        self.var_types.insert(name.to_string(), format!("{}*", elem_ty));
+        Some(vec![
+            format!("{}* {};", elem_ty, name),
+            format!("int64_t {}_len;", name),
+            format!("{} = {};", name, ptr),
+            format!("{}_len = {};", name, len),
+        ])
+    }
+
+/// 数组实参的长度表达式。
     /// 数组变量查 array_len_exprs；数组字面量直接用元素个数
     /// （C99 复合字面量的生命周期覆盖整次调用，作为实参是安全的）。
     pub(crate) fn array_len_of(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::Ident(n) => self.array_len_exprs.get(n).cloned(),
             Expr::List(items) => Some(format!("{}LL", items.len())),
+            // 切片的长度带运行期边界检查，要 gen_expr（&mut self），
+            // 只能由 &mut 的调用方（gen_call_args / gen_slice_let）算。
+            // 这里返回 None 表示「不是能直接算出长度的表达式」。
             _ => None,
         }
+    }
+
+    /// 切片的边界三元组（起点 / 终点 / 原长度）的 C 表达式。
+    /// 缺省：起点 `0LL`，终点 = 原数组长度。`..=j` 的终点是 `j + 1`。
+    /// 一律带运行期边界检查 —— 切片越界在 C 里是静默的越界读写。
+    /// 和除零检查同一个思路：崩得明明白白好过静默算错。
+    fn slice_bounds(
+        &mut self,
+        obj: &Expr,
+        start: &Option<Box<Expr>>,
+        end: &Option<Box<Expr>>,
+        inclusive: bool,
+    ) -> (String, String, String) {
+        let base_len = self
+            .array_len_of(obj)
+            .unwrap_or_else(|| "/* 未知原长度 */0LL".to_string());
+        let s = match start {
+            Some(e) => self.gen_expr(e),
+            None => "0LL".to_string(),
+        };
+        let raw_end = match end {
+            Some(e) => self.gen_expr(e),
+            None => base_len.clone(),
+        };
+        let e = if inclusive {
+            format!("({} + 1LL)", raw_end)
+        } else {
+            raw_end
+        };
+        (s, e, base_len)
+    }
+
+    /// 切片在表达式位置的指针值：`a + off`。
+    /// 长度不在这里 —— 长度走伴随参数那条路（gen_slice_let / gen_call_args）。
+    pub(crate) fn slice_ptr_expr(&mut self, e: &Expr) -> String {
+        match e {
+            Expr::Slice(obj, start, end, inclusive) => {
+                let base = self.gen_expr(obj);
+                let (s, ev, len) =
+                    self.slice_bounds(obj, start, end, *inclusive);
+                format!(
+                    "({} + lume_slice_off({}, {}, {}, {}))",
+                    base, base, s, ev, len
+                )
+            }
+            _ => self.gen_expr(e),
+        }
+    }
+
+    /// 切片的长度 C 表达式，供函数实参的伴随长度参数用。
+    pub(crate) fn slice_len_expr(
+        &mut self,
+        obj: &Expr,
+        start: &Option<Box<Expr>>,
+        end: &Option<Box<Expr>>,
+        inclusive: bool,
+    ) -> Option<String> {
+        if self.array_len_of(obj).is_none() {
+            return None;
+        }
+        let base = self.gen_expr(obj);
+        let (s, ev, len) = self.slice_bounds(obj, start, end, inclusive);
+        Some(format!(
+            "lume_slice_len({}, {}, {}, {})",
+            base, s, ev, len
+        ))
     }
 
     /// `if c { a } else { b }` 作为表达式 → C 三元运算符。
@@ -505,9 +620,15 @@ impl Codegen {
         };
         let mut out: Vec<String> = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
-            let s = match fields {
-                Some(f) => self.gen_arg_with_self(a, f),
-                None => self.gen_arg(a),
+            // 切片实参：先取指针，长度由下面的 need_len 分支补。
+            // 不能走 gen_arg —— 它会把 Slice 当普通表达式降级处理。
+            let s = if matches!(a, Expr::Slice(..)) {
+                self.slice_ptr_expr(a)
+            } else {
+                match fields {
+                    Some(f) => self.gen_arg_with_self(a, f),
+                    None => self.gen_arg(a),
+                }
             };
             out.push(s);
             let need_len = arr_flags
@@ -516,12 +637,23 @@ impl Codegen {
                 .copied()
                 .unwrap_or(false);
             if need_len {
-                match self.array_len_of(a) {
-                    Some(len) => out.push(len),
-                    None => out.push(format!(
-                        "/* 无法确定第 {} 个实参的数组长度 */0LL",
-                        i + 1
-                    )),
+                match a {
+                    Expr::Slice(obj, s, e, inc) => {
+                        match self.slice_len_expr(obj, s, e, *inc) {
+                            Some(len) => out.push(len),
+                            None => out.push(format!(
+                                "/* 无法确定第 {} 个实参的切片长度 */0LL",
+                                i + 1
+                            )),
+                        }
+                    }
+                    other => match self.array_len_of(other) {
+                        Some(len) => out.push(len),
+                        None => out.push(format!(
+                            "/* 无法确定第 {} 个实参的数组长度 */0LL",
+                            i + 1
+                        )),
+                    },
                 }
             }
         }

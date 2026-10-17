@@ -14,7 +14,8 @@ REM ==================
 
 echo [1/3] Syncing %WIN_DIR% to WSL:%WSL_DIR%
 
-wsl -d %DISTRO% bash -lc "mkdir -p %WSL_DIR% && rsync -a --delete --exclude target --exclude .git --exclude .lume_cache %WIN_DIR%/ %WSL_DIR%/"
+REM .workbuddy 是本地工作区（memory + scratch 临时文件），不同步
+wsl -d %DISTRO% bash -lc "mkdir -p %WSL_DIR% && rsync -a --delete --exclude target --exclude .git --exclude .lume_cache --exclude .workbuddy %WIN_DIR%/ %WSL_DIR%/"
 
 if errorlevel 1 (
     echo [ERROR] Sync failed

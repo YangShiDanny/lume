@@ -17,22 +17,18 @@ jobs:
             artifact: lume-windows
             bin: lume.exe
             target: ""
-            package: zip
           - os: ubuntu-latest
             artifact: lume-linux
             bin: lume
             target: ""
-            package: tar.gz
           - os: macos-latest
             artifact: lume-macos
             bin: lume
             target: ""
-            package: tar.gz
           - os: ubuntu-latest
             artifact: lume-alpine
             bin: lume
             target: x86_64-unknown-linux-musl
-            package: tar.gz
 
     runs-on: ${{ matrix.os }}
 
@@ -89,7 +85,7 @@ jobs:
           if (Test-Path README.md) { Copy-Item README.md $stage/ }
           if (Test-Path LICENSE) { Copy-Item LICENSE $stage/ }
           Compress-Archive -Path "$stage/*" -DestinationPath "lume-windows.zip" -Force
-          Write-Host "打包完成："
+          Write-Host "Package contents:"
           Get-ChildItem $stage | Format-Table Name, Length
 
       - name: Package (Linux/macOS)
@@ -105,11 +101,13 @@ jobs:
           stage="stage/${{ matrix.artifact }}"
           mkdir -p "$stage"
           cp "$bin_path" "$stage/"
+          [ -f scripts/install.sh ] && cp scripts/install.sh "$stage/"
+          [ -f scripts/install.sh ] && chmod +x "$stage/install.sh"
           [ -f README.md ] && cp README.md "$stage/"
           [ -f LICENSE ] && cp LICENSE "$stage/"
           chmod +x "$stage/$bin"
           tar -czf "${{ matrix.artifact }}.tar.gz" -C stage "${{ matrix.artifact }}"
-          echo "打包完成："
+          echo "Package contents:"
           tar -tzf "${{ matrix.artifact }}.tar.gz"
 
       # ── 上传 ──

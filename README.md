@@ -49,9 +49,10 @@ fn main() {
 `write(...)` 与 `say(...)` 使用相同的字符串插值格式，但不自动换行；固定数组字段可用
 `[int; 256]` 声明，并通过 `[0; 256]` 零初始化。
 
-`say` / `write` 先写入线程本地缓冲，不争用 Lume 全局输出锁。主线程在程序退出时刷新，
-`par for` worker 在退出时刷新；并行输出按 worker 块写出，线程间顺序不保证。基准测试中
-可显式调用 `flush()`，把实际输出时间计入测量：
+`say` / `write` 先写入线程本地缓冲，不争用 stdout 锁；缓冲达到 64 KiB 时异步提交给单个
+后台 writer。`par for` worker 退出时也只提交、不等待写盘，writer 按 FIFO 写出完整日志块；
+不同 worker 的块顺序不保证。`flush()` 会提交当前线程缓冲并等待此前提交的日志写完；程序
+退出时会排空队列并 join writer。基准测试中显式调用 `flush()`，把实际输出时间计入测量：
 
 ```bash
 cargo run -- run benchmarks/print_1_100.lume

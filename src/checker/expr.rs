@@ -241,7 +241,33 @@ impl Checker {
                 }
             }
 
-            Expr::Slice(_, _, _, _) => Ty::Unknown,
+            // 切片 a[i..j] / a[i..=j] / a[..j] / a[..]：
+            // 类型和被切的数组同型（元素类型不变），只是长度可变。
+            // 长度是运行期值，所以这里只保证「切的是数组、边界是 int」。
+            Expr::Slice(obj, start, end, _) => {
+                let obj_ty = self.check_expr(obj);
+                for bound in [start, end].into_iter().flatten() {
+                    let bt = self.check_expr(bound);
+                    if !bt.is_unknown() && bt != Ty::Int {
+                        self.error(format!(
+                            "切片边界必须是 int，但得到 {}",
+                            bt.name()
+                        ));
+                    }
+                }
+                match &obj_ty {
+                    Ty::Array(inner) => {
+                        Ty::Array(Box::new(inner.as_ref().clone()))
+                    },
+                    _ => {
+                        self.error(format!(
+                            "只能切片数组，但被切对象的类型是 {}",
+                            obj_ty.name()
+                        ));
+                        Ty::Array(Box::new(Ty::Int))
+                    }
+                }
+            }
 
             Expr::Lambda { params, body } => {
                 self.push_scope();
