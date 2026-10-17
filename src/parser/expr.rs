@@ -270,19 +270,30 @@ impl Parser {
                 Ok(Expr::List(items))
             }
 
-            TokenKind::If => {
-                let cond = self.parse_expr()?;
-                let then = self.parse_block()?;
-                let els = if self.eat(&TokenKind::Else) {
-                    Some(self.parse_block()?)
-                } else {
-                    None
-                };
-                Ok(Expr::If(Box::new(cond), then, els))
-            }
+            TokenKind::If => self.parse_if_expr(),
 
             _ => Err(self.error("期待表达式")),
         }
+    }
+
+    /// if 表达式。支持 `else if` 链：
+    /// 内层 if 包成「只有一条表达式语句的块」，这样 els 保持
+    /// Option<Block> 不用改类型，single_expr 也能透过它拿到内层 if，
+    /// 由 gen_expr 递归展开成嵌套三元。
+    fn parse_if_expr(&mut self) -> Result<Expr, ParseError> {
+        let cond = self.parse_expr()?;
+        let then = self.parse_block()?;
+        let els = if self.eat(&TokenKind::Else) {
+            if self.check(&TokenKind::If) {
+                let inner = self.parse_if_expr()?;
+                Some(Block { stmts: vec![Stmt::Expr(inner)] })
+            } else {
+                Some(self.parse_block()?)
+            }
+        } else {
+            None
+        };
+        Ok(Expr::If(Box::new(cond), then, els))
     }
 
     // ── 字符串插值 ──
