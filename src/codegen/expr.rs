@@ -400,8 +400,12 @@ impl Codegen {
             _ => return None,
         };
         // self 场景（结构体方法内）元素类型仍走 infer_type：
-    // var_types 表在方法里登记过，self 的字段访问也走同一张表。
-    let elem_ty = self.infer_type(obj);
+        // var_types 表在方法里登记过，self 的字段访问也走同一张表。
+        //
+        // infer_type 给的是**元素**类型（"int64_t"），
+        // 声明指针时补 *；var_types / array_elem_types 也是元素类型，
+        // 这样 s[0] 的 infer_type 才和普通数组一致。
+        let elem_ty = self.infer_type(obj);
         let base = match fields {
             Some(f) => self.gen_expr_with_self(obj, f),
             None => self.gen_expr(obj),
@@ -431,10 +435,17 @@ impl Codegen {
         match expr {
             Expr::Ident(n) => self.array_len_exprs.get(n).cloned(),
             Expr::List(items) => Some(format!("{}LL", items.len())),
-            // 切片的长度带运行期边界检查，要 gen_expr（&mut self），
-            // 只能由 &mut 的调用方（gen_call_args / gen_slice_let）算。
-            // 这里返回 None 表示「不是能直接算出长度的表达式」。
             _ => None,
+        }
+    }
+
+    /// `&mut` 版 array_len_of：能算切片的伴生长度。
+    /// 切片的原数组本身可能是切片（`xs[1..][0..2]`），
+    /// 递归下去才能拿到长度，所以必须在 &mut self 上做。
+    pub(crate) fn array_len_of_mut(&mut self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Slice(obj, s, e, inc) => self.slice_len_expr(obj, s, e, *inc),
+            other => self.array_len_of(other),
         }
     }
 
@@ -450,7 +461,7 @@ impl Codegen {
         inclusive: bool,
     ) -> (String, String, String) {
         let base_len = self
-            .array_len_of(obj)
+            .array_len_of_mut(obj)
             .unwrap_or_else(|| "/* 未知原长度 */0LL".to_string());
         let s = match start {
             Some(e) => self.gen_expr(e),
@@ -486,6 +497,7 @@ impl Codegen {
     }
 
     /// 切片的长度 C 表达式，供函数实参的伴随长度参数用。
+    /// 原数组的长度拿不到就返回 None（调用方发一条注释占位）。
     pub(crate) fn slice_len_expr(
         &mut self,
         obj: &Expr,
@@ -493,7 +505,9 @@ impl Codegen {
         end: &Option<Box<Expr>>,
         inclusive: bool,
     ) -> Option<String> {
-        if self.array_len_of(obj).is_none() {
+        if self.array_len_of(obj).is_none()
+            && !matches!(obj, Expr::Slice(..))
+        {
             return None;
         }
         let base = self.gen_expr(obj);
@@ -647,7 +661,7 @@ impl Codegen {
                             )),
                         }
                     }
-                    other => match self.array_len_of(other) {
+                    other => match self.array_len_of_mut(other) {
                         Some(len) => out.push(len),
                         None => out.push(format!(
                             "/* 无法确定第 {} 个实参的数组长度 */0LL",

@@ -311,6 +311,32 @@ impl Codegen {
                 }
                 return;
             }
+            // for v in a[i..j]：切片有显式的指针 + 长度表达式，
+            // 不查 array_len_exprs（没有绑定名）
+            Expr::Slice(obj, start, end, inclusive) => {
+                let base = self.gen_expr(obj);
+                let (s, e, base_len) =
+                    self.slice_bounds(obj, start, end, *inclusive);
+                let elem_ty = self.infer_type(obj);
+                let ptr = format!(
+                    "({} + lume_slice_off({}, {}, {}, {}))",
+                    base, base, s, e, base_len
+                );
+                let len = format!(
+                    "lume_slice_len({}, {}, {}, {})",
+                    base, s, e, base_len
+                );
+                self.push_vectorize_hint();
+                self.push_line(&format!(
+                    "for (int64_t _i_s = 0; _i_s < {}; _i_s++) {{",
+                    len
+                ));
+                self.push_line(&format!(
+                    "{} {} = {}[_i_s];",
+                    elem_ty, var, ptr
+                ));
+                self.var_types.insert(var.to_string(), elem_ty);
+            }
             Expr::Ident(arr_name) => {
                 // 局部数组字面量和数组参数都在 array_len_exprs 里：
                 // 前者长度是常量，后者是伴随参数 {name}_len。
