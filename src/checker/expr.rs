@@ -10,7 +10,10 @@ impl Checker {
             Expr::FmtStr(parts) => {
                 for p in parts {
                     if let StrPart::Expr(e) = p {
-                        let _ = self.check_expr(e);
+                        let t = self.check_expr(e);
+                        if matches!(t, Ty::Void) {
+                            self.error("void 表达式不能用于字符串插值（free 只能作语句）");
+                        }
                     }
                 }
                 Ty::Str
@@ -122,6 +125,23 @@ impl Checker {
             if let Expr::Ident(name) = callee.as_ref() {
                 if let Some(ty) = self.check_array_hof(name, args) {
                     return ty;
+                }
+            }
+
+            // free(x)：显式释放 owned 数组。类型层面只校验「一个数组参数」，
+            // 真正的所有权检查在 codegen（它知道这个变量是不是函数/map/filter
+            // 新建出来的堆数组）。
+            if let Expr::Ident(name) = callee.as_ref() {
+                if name == "free" {
+                    if args.len() != 1 {
+                        self.error("free 需要 1 个参数");
+                    } else {
+                        let ty = self.check_expr(&args[0]);
+                        if !matches!(ty, Ty::Array(_) | Ty::Unknown) {
+                            self.error("free 只接受数组");
+                        }
+                    }
+                    return Ty::Void;
                 }
             }
 

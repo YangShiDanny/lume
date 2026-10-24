@@ -58,6 +58,12 @@ impl Checker {
         match stmt {
             Stmt::Let { name, ty, init } => {
                 let init_ty = self.check_expr(init);
+                if matches!(init_ty, Ty::Void) {
+                    self.error(format!(
+                        "void 表达式不能赋给变量 '{}'（free/say 只能作语句）",
+                        name
+                    ));
+                }
                 if let Some(Type::Array(_, Some(expected))) = ty {
                     let actual = match init {
                         Expr::List(items) => Some(items.len()),

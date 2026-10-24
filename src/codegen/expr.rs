@@ -306,6 +306,9 @@ impl Codegen {
                     if name == "flush" {
                         return "lume_log_flush()".to_string();
                     }
+                    if name == "free" {
+                        return self.gen_free(args);
+                    }
                     if name == "now" {
                         return "lume_now_ns()".to_string();
                     }
@@ -783,6 +786,38 @@ impl Codegen {
         Some(format!("{}({})", name, arg_strs.join(", ")))
     }
 
+    /// free(x)：只允许对 owned 数组变量调用。
+    ///
+    /// 不允许的情况都会进 codegen_errors，最终以 #error 形式让 clang 失败：
+    ///   - 字面量 / 参数 / 切片（不是新分配，free 会崩）
+    ///   - 表达式（先 let 绑定，才能跟踪所有权）
+    ///   - par for 循环体（多个 worker 会重复释放）
+    pub(crate) fn gen_free(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            self.codegen_errors.push("free 需要 1 个参数".to_string());
+            return "((void)0)".to_string();
+        }
+        match &args[0] {
+            Expr::Ident(name) if self.owned_arrays.remove(name) => {
+                format!("free((void*)({}))", name)
+            }
+            Expr::Ident(name) => {
+                self.codegen_errors.push(format!(
+                    "free({}) 不安全：{} 不是函数/map/filter 新建的数组。\
+                     字面量、数组参数、切片、返回入参别名的函数都不能 free",
+                    name, name
+                ));
+                "((void)0)".to_string()
+            }
+            _ => {
+                self.codegen_errors.push(
+                    "free 只接受变量名：先 `let r = ...` 再 free(r)".to_string(),
+                );
+                "((void)0)".to_string()
+            }
+        }
+    }
+
     /// `let r = f(...)` 且 f 返回数组：C 函数多一个长度出参，
     /// 必须拆成「声明指针 + 声明长度 + 赋值」三行，长度才有地方落。
     /// 返回 None 表示不是这种情况，走普通 let。
@@ -825,6 +860,11 @@ impl Codegen {
             .insert(name.to_string(), elem_ty.clone());
         self.var_types
             .insert(name.to_string(), format!("{}*", elem_ty));
+        if self.owned_return_fns.contains(&fname) {
+            self.owned_arrays.insert(name.to_string());
+        } else {
+            self.owned_arrays.remove(name);
+        }
         // builtin（如 str_split）在 C 里叫 lume_str_split
         let c_name = builtin_map(&fname)
             .map(|s| s.to_string())
@@ -958,6 +998,9 @@ impl Codegen {
                     }
                     if name == "flush" {
                         return "lume_log_flush()".to_string();
+                    }
+                    if name == "free" {
+                        return self.gen_free(args);
                     }
                 }
                 // now

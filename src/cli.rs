@@ -145,7 +145,15 @@ pub fn compile_to_c(program: &crate::ast::Program, opts: &Opts) -> String {
     for (name, table) in precomputed {
         codegen.set_precomputed(name, table);
     }
-    codegen.generate(program)
+    let c_code = codegen.generate(program);
+    // free 误用之类的所有权错误：直接按编译器错误报，不进入 clang
+    if !codegen.codegen_errors.is_empty() {
+        for e in &codegen.codegen_errors {
+            eprintln!("error: {}", e);
+        }
+        std::process::exit(1);
+    }
+    c_code
 }
 
 fn compile_c(src: &Path, out: &Path, opts: &Opts) {

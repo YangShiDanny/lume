@@ -38,6 +38,15 @@ pub struct Codegen {
     pub(crate) array_params: HashSet<String>,
     // 已证明为纯函数、可以打 __attribute__((const)) 的函数名
     pub(crate) const_fns: HashSet<String>,
+    // 当前函数里「归调用方所有」的数组变量：由函数返回 / map / filter
+    // 新建出来的堆数组。只有这些能 free；字面量、参数、切片都不行。
+    pub(crate) owned_arrays: HashSet<String>,
+    // 返回**新分配**数组的函数（所有 return 都是 [..] / [v; n] / 局部数组）。
+    // `let r = f()` 据此把 r 登记成 owned。
+    pub(crate) owned_return_fns: HashSet<String>,
+    // codegen 阶段的安全错误（目前只有 free 误用）。生成结束后以 #error 形式
+    // 插到 C 文件开头，让 clang 带着可读信息失败。
+    pub(crate) codegen_errors: Vec<String>,
     // 会在 par for 里被调用到的 @cache 函数。这些必须用带锁的包装器，
     // 否则多个 worker 并发读写同一个全局哈希表（realloc 时直接崩）。
     pub(crate) thread_safe_cached: HashSet<String>,
@@ -102,6 +111,9 @@ impl Codegen {
             array_elem_types: HashMap::new(),
             array_params: HashSet::new(),
             const_fns: HashSet::new(),
+            owned_arrays: HashSet::new(),
+            owned_return_fns: HashSet::new(),
+            codegen_errors: Vec::new(),
             thread_safe_cached: HashSet::new(),
             precomputed: HashMap::new(),
             generic_fns: HashMap::new(),
@@ -234,6 +246,10 @@ impl Codegen {
         //     这些要用带锁的缓存包装器，其余保持无锁快路径。
         self.thread_safe_cached = collect_par_cached_fns(program);
 
+        // 2.7 哪些函数返回的是**新分配**数组（而非入参别名）。
+        //     `let r = f()` 只有对这类函数才把 r 标记成 owned，允许 free。
+        self.owned_return_fns = collect_owned_return_fns(program);
+
         // 3. 生成 struct 定义
         for item in &program.items {
             if let Item::Struct(s) = item {
@@ -348,6 +364,18 @@ impl Codegen {
             placeholder,
             if uses_log { "    lume_log_init_main();\n" } else { "" },
         );
+
+        // free 误用之类的安全错误：放在文件最前面，clang 会立刻带着
+        // 可读信息停下，而不是生成一段会崩的 C。
+        if !self.codegen_errors.is_empty() {
+            let mut pre = String::new();
+            for e in &self.codegen_errors {
+                let escaped = e.replace('\\', "\\\\").replace('"', "\\\"");
+                pre.push_str(&format!("#error \"{}\"\n", escaped));
+            }
+            pre.push_str(&out);
+            out = pre;
+        }
         out
     }
 
@@ -471,6 +499,7 @@ impl Codegen {
         self.array_len_exprs.clear();
         self.array_elem_types.clear();
         self.array_params.clear();
+        self.owned_arrays.clear();
     }
 
     pub(crate) fn push_line(&mut self, s: &str) {
@@ -801,6 +830,74 @@ fn collect_calls_expr(e: &Expr, out: &mut HashSet<String>) {
             collect_calls_expr(v, out);
             for a in arms {
                 collect_calls_expr(&a.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ── 数组返回值所有权分析 ──
+//
+// 只认「一定新分配」的返回：
+//   return [1, 2, 3]      → codegen malloc
+//   return [0; N]         → codegen malloc
+//   return local_array    → 局部数组是栈上的，codegen 会 malloc 拷贝
+// 入参（array param）直接返回的是调用方内存，绝不能算 owned。
+// 其他形式（字段、调用、切片表达式……）一律保守地当作「不是新分配」，
+// 这样 free 会在编译期被拒绝，而不是运行期 free 到栈/别名。
+
+fn collect_owned_return_fns(program: &Program) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            if !f.generics.is_empty() || !is_array_ty(&f.ret) {
+                continue;
+            }
+            let params: HashSet<String> =
+                f.params.iter().map(|p| p.name.clone()).collect();
+            let mut rets: Vec<&Expr> = Vec::new();
+            collect_returns_block(&f.body, &mut rets);
+            if !rets.is_empty()
+                && rets.iter().all(|e| array_return_is_fresh(e, &params))
+            {
+                out.insert(f.name.clone());
+            }
+        }
+    }
+    out
+}
+
+fn array_return_is_fresh(e: &Expr, params: &HashSet<String>) -> bool {
+    match e {
+        Expr::List(_) | Expr::Repeat(..) => true,
+        Expr::Ident(n) => !params.contains(n),
+        _ => false,
+    }
+}
+
+fn collect_returns_block<'a>(b: &'a Block, out: &mut Vec<&'a Expr>) {
+    for s in &b.stmts {
+        collect_returns_stmt(s, out);
+    }
+}
+
+fn collect_returns_stmt<'a>(s: &'a Stmt, out: &mut Vec<&'a Expr>) {
+    match s {
+        Stmt::Return(Some(e)) => out.push(e),
+        Stmt::If { then, els, .. } => {
+            collect_returns_block(then, out);
+            if let Some(e) = els {
+                collect_returns_stmt(e, out);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::ParFor { body, .. } => {
+            collect_returns_block(body, out)
+        }
+        // `else { ... }` 被 parser 包成 Expr::If(true, block)
+        Stmt::Expr(Expr::If(_, then, els)) => {
+            collect_returns_block(then, out);
+            if let Some(b) = els {
+                collect_returns_block(b, out);
             }
         }
         _ => {}

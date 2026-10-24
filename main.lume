@@ -554,5 +554,14 @@ fn main() {
     }
     say("[31] nested par via call={nested}  期望 50000")
 
+    // 32. 显式所有权：函数新建的数组归调用方，用 free 释放
+    free_total := 0
+    for i in 0..20000 {
+        tmp := scaled(xs, i)
+        free_total += tmp[0]
+        free(tmp)
+    }
+    say("[32] free owned array={free_total}  期望 199990000")
+
     say("===== 完成 =====")
 }

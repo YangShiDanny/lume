@@ -266,6 +266,8 @@ impl Codegen {
         self.array_len_exprs.insert(name.to_string(), format!("{}_len", name));
         self.array_elem_types.insert(name.to_string(), out_elem.clone());
         self.var_types.insert(name.to_string(), format!("{}*", out_elem));
+        // 管道输出是新 malloc 的堆数组 → 调用方拥有，可以 free
+        self.owned_arrays.insert(name.to_string());
         Some(lines)
     }
 
@@ -348,6 +350,8 @@ impl Codegen {
         self.array_len_exprs.insert(name.to_string(), format!("{}_len", name));
         self.array_elem_types.insert(name.to_string(), out_elem.clone());
         self.var_types.insert(name.to_string(), format!("{}*", out_elem));
+        // 管道输出是新 malloc 的堆数组 → 调用方拥有，可以 free
+        self.owned_arrays.insert(name.to_string());
         Some(lines)
     }
 

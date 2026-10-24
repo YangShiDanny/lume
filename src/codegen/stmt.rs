@@ -46,6 +46,7 @@ impl Codegen {
                     for l in lines {
                         self.push_line(&l);
                     }
+                    self.owned_arrays.remove(name); // 切片是借用，不能 free
                     return;
                 }
 
@@ -55,6 +56,7 @@ impl Codegen {
                     self.array_len_exprs.insert(name.clone(), format!("{}LL", len));
                     self.array_elem_types.insert(name.clone(), elem_ty.clone());
                     self.var_types.insert(name.clone(), format!("{}*", elem_ty));
+                    self.owned_arrays.remove(name); // 栈数组，不能 free
                     return;
                 }
 
@@ -68,6 +70,7 @@ impl Codegen {
                     self.array_len_exprs.insert(name.clone(), format!("{}LL", len));
                     self.array_elem_types.insert(name.clone(), elem_ty.clone());
                     self.var_types.insert(name.clone(), format!("{}*", elem_ty));
+                    self.owned_arrays.remove(name); // 栈数组，不能 free
                     return;
                 }
 
@@ -83,12 +86,22 @@ impl Codegen {
                     self.gen_expr(init)
                 };
                 self.var_types.insert(name.clone(), c_ty.clone());
+                // `let b := a` 是别名：a 是 owned 的话 b 也共享同一块内存
+                let aliases_owned = matches!(init, Expr::Ident(src) if self.owned_arrays.contains(src));
+                if aliases_owned {
+                    self.owned_arrays.insert(name.clone());
+                } else {
+                    self.owned_arrays.remove(name);
+                }
                 self.push_line(&format!("{} {} = {};", c_ty, name, value));
             }
 
             Stmt::Assign { target, value } => {
                 let t = self.gen_expr(target);
                 let v = self.gen_expr(value);
+                if let Expr::Ident(name) = target {
+                    self.owned_arrays.remove(name);
+                }
                 self.push_line(&format!("{} = {};", t, v));
             }
 
@@ -189,6 +202,7 @@ impl Codegen {
                     for l in lines {
                         self.push_line(&l);
                     }
+                    self.owned_arrays.remove(name); // 切片是借用，不能 free
                     return;
                 }
 
@@ -198,6 +212,7 @@ impl Codegen {
                     self.array_len_exprs.insert(name.clone(), format!("{}LL", len));
                     self.array_elem_types.insert(name.clone(), elem_ty.clone());
                     self.var_types.insert(name.clone(), format!("{}*", elem_ty));
+                    self.owned_arrays.remove(name); // 栈数组，不能 free
                     return;
                 }
 
@@ -211,6 +226,7 @@ impl Codegen {
                     self.array_len_exprs.insert(name.clone(), format!("{}LL", len));
                     self.array_elem_types.insert(name.clone(), elem_ty.clone());
                     self.var_types.insert(name.clone(), format!("{}*", elem_ty));
+                    self.owned_arrays.remove(name); // 栈数组，不能 free
                     return;
                 }
 
@@ -226,12 +242,21 @@ impl Codegen {
                     self.gen_expr_with_self(init, fields)
                 };
                 self.var_types.insert(name.clone(), c_ty.clone());
+                let aliases_owned = matches!(init, Expr::Ident(src) if self.owned_arrays.contains(src));
+                if aliases_owned {
+                    self.owned_arrays.insert(name.clone());
+                } else {
+                    self.owned_arrays.remove(name);
+                }
                 self.push_line(&format!("{} {} = {};", c_ty, name, value));
             }
 
             Stmt::Assign { target, value } => {
                 let t = self.gen_expr_with_self(target, fields);
                 let v = self.gen_expr_with_self(value, fields);
+                if let Expr::Ident(name) = target {
+                    self.owned_arrays.remove(name);
+                }
                 self.push_line(&format!("{} = {};", t, v));
             }
 

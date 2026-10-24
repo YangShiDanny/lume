@@ -38,7 +38,7 @@ lume run   main.lume [选项]   # 编译并立即运行
 
 本项目里用 `cargo run -- run main.lume`（`run.bat` 走 WSL）。
 
-`main.lume` 是本项目的**优化验证套件**，31 项，每行末尾都印了期望值。WSL 实测（clang -O3）全对：
+`main.lume` 是本项目的**优化验证套件**，32 项，每行末尾都印了期望值。WSL 实测（clang -O3）全对：
 
 | 项 | 覆盖点 | 实测 |
 |---|---|---|
@@ -480,6 +480,7 @@ par for i in 0..1000000 {
 | 函数 | 返回 | 说明 |
 |---|---|---|
 | `say(...)` | void | 打印，支持插值 |
+| `free(x)` | void | 释放 owned 数组（函数/`map`/`filter`/管道新建的） |
 | `now()` | int | 当前纳秒时间戳（单调时钟） |
 | `str_len(s)` `str_upper(s)` `str_lower(s)` `str_trim(s)` | int / str | 字符串处理 |
 | `str_to_int(s)` `str_to_float(s)` | int / float | 解析 |
@@ -488,6 +489,19 @@ par for i in 0..1000000 {
 | `float_abs` `float_pow`/`pow` | float | |
 | `float_sin`/`sin` `float_cos`/`cos` `float_tan`/`tan` | float | |
 | `float_floor`/`floor` `float_ceil`/`ceil` `float_round`/`round` | float | |
+
+### 数组所有权与 `free`
+
+- `let r = f()` 且 `f` 的 `return` 是 `[..]` / `[v; n]` / 局部数组 → `r` 是
+  **owned**，用 `free(r)` 释放。
+- `map` / `filter` / `|>` 管道的结果同样是 owned。
+- 字面量、数组参数、切片、`return a`（返回入参）得到的数组**不是** owned，
+  对它们调用 `free` 会在编译期报错。
+- `b := a` 是别名：`a` owned 时 `b` 也共享同一块内存；`free` 其中一个后，
+  其余别名一并失效（和 C 手动内存管理一样）。
+- `par for` 循环体里不能 `free`（多个 worker 会重复释放）。
+- `free(x)` 只能作为语句；写进插值或 `let` 会报类型错误。
+- 忘记 `free` 仍会泄漏；自动释放/值语义还没做。
 
 其他 C 标准函数**没有 extern 通路**，用不了。
 
@@ -520,13 +534,11 @@ par for i in 0..1000000 {
 
 | 别写 | 原因 |
 |---|---|
-| `x := if c { 1 } else { 2 }` | if 表达式未实现，生成非法 C |
-| `fn f(a: int = 1)` | 默认值不生效 |
-| `f(port: 9090)` | 命名参数不支持 |
 | `trait` `impl` `async` `await` `spawn` `app` `use` `extern` | 能解析，未实现 |
 | `import` | 完全无作用，内置函数本来就全局可用 |
-| 数组传参、动态数组、闭包捕获、异常 `?` `!` | 未实现 |
-| 非整数的 `match` | 值被转成 `int64_t` 再比较 |
+| 动态数组 `Vec`、闭包捕获、`map` 类型 | 未实现 |
+| `free(字面量/数组参数/切片)` | 不是新分配的堆数组，编译期报错 |
+| `free` 后再用同一变量 | 手动所有权：free 后变量失效，编译器不跟踪 use-after-free |
 | 泛型函数里调泛型函数 | 不会单态化，生成未定义函数 |
 
 ---

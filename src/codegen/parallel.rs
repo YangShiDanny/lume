@@ -696,6 +696,13 @@ impl Codegen {
                 self.gen_expr(expr)
             }
             Expr::Ident(name) => name.clone(),
+            // par worker 里禁止 free：多个 worker 可能拿到同一个 owned 数组
+            Expr::Call(c, _) if matches!(c.as_ref(), Expr::Ident(n) if n == "free") => {
+                self.codegen_errors.push(
+                    "par for 循环体里不能 free（多个 worker 会重复释放）".to_string()
+                );
+                "((void)0)".to_string()
+            }
             _ => self.gen_expr(expr),
         }
     }
