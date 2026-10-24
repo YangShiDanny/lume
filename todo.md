@@ -24,7 +24,7 @@
 | std | 默认自动导入，`@no_std` 关闭 |
 | 任务并行 | `par f(x)` + `await t`（A 方案，AI 友好） |
 | 数据并行 | `par for`，自动 reduction |
-| 数组语义 | 值类型，无别名，自动加 `restrict` |
+| 数组语义 | **引用语义**（当前实现，`b := a` 共享内存）。`restrict` 已撤回；真正的值语义/所有权待做 |
 | 线程安全标记 | 函数级 `@thread_safe` / `@not_thread_safe`，默认自动推断 |
 | 循环依赖 | 禁止，编译期报错 |
 
@@ -52,7 +52,7 @@
 - [x] 前向声明（互相递归、调用后面定义的函数）
 
 ### 性能特性（已有）
-- [x] `@precompute` 编译期查表（+ OpenMP + 文件缓存）
+- [x] `@precompute` 编译期查表（有 libomp 并行填表，没有就串行；文件缓存）
 - [x] `@cache` 运行时缓存（开放寻址哈希表，O(1)）
 - [x] `par for` 自动并行（切分 + reduction + 串行阈值）
 - [x] 泛型单态化（每类型一份代码，零开销）
@@ -101,6 +101,21 @@
 - [x] `INT64_MIN / -1` 溢出是 UB —— 已修：`lume_checked_div_i64` 内置 `a == INT64_MIN && b == -1` 检查，abort；`lume_checked_mod_i64` 同条件返回 0（C99 下 UB，数学余数 0）
 - [x] 数组不能跨函数传 —— 已修：隐式伴随长度参数 + 数组返回 malloc 拷贝
 - [x] `nums.len()` 对数组参数返回不存在的 `nums_len` —— 已修：数组参数登记 array_len_exprs
+- [x] 浮点 `x * 2^n` 被强度削弱成整数移位（`2.5 * 8` 得 16）—— 已修：AST 没有类型信息，
+  `optimize.rs` 不再对 `Expr::Ident` 做乘法强度削弱，交给知道类型的 clang
+- [x] `LUME_OPT=safe` 无效 —— 已修：`cli.rs` 以前先无条件跑 Aggressive 再按 env 跑第二遍，
+  现在只跑一遍
+- [x] `@cache` 被 `par for` 调用时生成非法 C（worker 在原型之前）+ 无锁数据竞争 ——
+  已修：args 结构体/worker 声明提前、worker 定义后置；被 par 调用到的 @cache 自动换带锁包装器
+- [x] 空循环体/无输出程序也起日志 writer 线程 —— 已修：主函数占位符，生成完再看有没有
+  真正的 `lume_logf`/`lume_log_write_literal`/`lume_log_flush`
+- [x] 每个 `par for` 都全量 `lume_log_flush()` 等 I/O —— 已修：改成只提交（`lume_log_flush_thread`）
+- [x] 强制 `vectorize(enable)` 发给含 `say` 的循环 → 每次构建两条 `-Wpass-failed` ——
+  已修：先扫循环体，含未证明纯度的调用就不发 pragma
+- [ ] **数组返回值没有所有权/`free`** —— 每次返回新建数组都 malloc，长循环内存持续增长
+  （20k 次 × 1000 元素 = 155 MB）。需要所有权设计，不能靠 codegen 猜
+- [ ] **数组没有值语义** —— 文档过去写「值语义、无别名」，实际是引用；已改文档，
+  真正的复制语义/所有权是 v0.3 的设计任务
 
 ---
 
@@ -108,11 +123,11 @@
 
 ### 一、clang 不敢做（Lume 的独有优势）
 
-- [x] **#1 数组参数加 `restrict`** — 无裸指针，值语义保证无别名 → 向量化 2~8 倍
+- [ ] **#1 数组参数加 `restrict`** — **已撤回（2026-10-24）**：数组实际会别名（`shift(x, x)` 曾经算错），`restrict` 是 UB。要恢复必须先做值拷贝或全程序别名分析。
 - [x] **#2 纯函数加 `__attribute__((const))`** — `purity.rs` 保守证明 → 消除重复调用
 - [x] **#3 函数级 `@fastmath`** — 只对标注函数启用重结合、FMA contract、倒数优化；不放宽全局 NaN/Inf 语义
 - [x] **#4 边界检查消除** — 编译期知道数组长度 → 快 10~30%
-- [x] **#5 无别名下的自动并行** — `par for` 是显式契约 → 多核 5~8 倍
+- [x] **#5 显式 `par for` 自动并行** — 常驻线程池 + 自动 reduction，8 核 400k 元素 2.4 倍
 - [x] **#6 管道融合成单循环** — `xs |> map(f) |> map(g) |> filter(p)` 编译成**单个** for 循环，中间值全在栈上单个标量 `_pc` 里。内存 3N → 1 份输出，遍历 3 趟 → 1 趟。实现见 `src/codegen/pipe.rs`（`parse_chain` 拆链 + `type_plan` 校验签名 + `gen_fused_pipe_let` 发循环）。新增 `map`/`filter`/`reduce` 三个数组高阶内置：前两个产出两个值只能在 `let` 位置，`reduce` 返回标量可内联在表达式位置。测试 `tests_pipe.lume`（11 项）。
 - [x] **#7 编译期执行纯函数** — `@precompute` 执行整个函数 → 运行时零开销
 - [x] **#8 自动 reduction** — `par for` 里识别 `sum +=` → 并行求和 5~8 倍
@@ -232,7 +247,8 @@
 - [ ] **`par f(x)` + `await t`**（`Task[T]` 类型 + codegen）
 - [x] **异步日志与多线程 print**（线程本地缓冲 + FIFO 后台 writer；`flush()` 等待屏障，worker 退出只提交）
 - [x] **`write` 内置（不换行）**
-- [ ] **线程池**（替代裸 `pthread_create`）
+- [x] **线程池** — 常驻 N-1 worker + 主线程抢任务；按元素数只唤醒前几个；
+  `LUME_PAR_THREADS` 可覆盖线程数；嵌套并行退化成串行。见 `runtime.rs` / `parallel.rs`
 - [ ] **`par for` 支持嵌套控制流**（`while` / `for` / `match` 进 worker）
 - [ ] **`par for` 支持 struct 字段数组**
 - [ ] **`atomic_add` 内置**
@@ -360,7 +376,7 @@
 | v0.2.0 | 数组跨函数 + `if` 表达式 + `match` 解构 + 字符串操作 | ✅ 已完成 未发布 |
 | v0.3.0 | `T?` / `T!` + 切片 + 元组 + 泛型 struct | 待做 |
 | v0.4.0 | 模块系统 + 自动扫描 + VS Code 扩展 | 待做 |
-| v0.5.0 | `par f()` + `await` + 线程池 + `lume_say` | 待做 |
+| v0.5.0 | `par f()` + `await` + `lume_say` | 待做 |
 | v1.0.0 | 包管理 + 文档站 + 示例项目 + 动态数组 | 待做 |
 | v2.0.0 | 自举 | 长期 |
 

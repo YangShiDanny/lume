@@ -5,7 +5,13 @@ use crate::parser::Parser;
 use crate::ast::{Expr, Item};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// @precompute 的填表程序能不能用 OpenMP。
+/// 0 = 还没试过，2 = libomp 不可用（以后都走串行）。
+/// 串行填表只是编译期慢一点，生成的表完全一样。
+static PRECOMPUTE_OPENMP: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Copy)]
 pub struct Opts {
@@ -102,7 +108,8 @@ pub fn compile_to_program(file: &str) -> crate::ast::Program {
     }
     
     let mut program = program;
-    crate::optimize::optimize(&mut program);   // ← 新增
+    // 只跑一遍。以前先调 optimize()（无条件 Aggressive）再按 LUME_OPT
+    // 跑第二遍，导致 LUME_OPT=safe 实际无效、编译期也多跑一次。
     let opt_level = match std::env::var("LUME_OPT").as_deref() {
         Ok("safe") => crate::optimize::Level::Safe,
         _ => crate::optimize::Level::Aggressive,
@@ -246,29 +253,63 @@ fn compute_precompute_table(
 
     std::fs::write(&tmp_c, c_code).map_err(|e| format!("写失败: {}", e))?;
 
-    let mut cmd = Command::new("clang");
-    cmd.arg(&tmp_c).arg("-o").arg(&tmp_bin)
-        .arg(format!("-O{}", opts.opt));
+    // 编译填表程序。openmp=true 时加 -fopenmp（只影响编译期填表速度）。
+    let compile = |openmp: bool| -> std::io::Result<bool> {
+        let mut cmd = Command::new("clang");
+        cmd.arg(&tmp_c).arg("-o").arg(&tmp_bin)
+            .arg(format!("-O{}", opts.opt));
 
-    if opts.native {
-        cmd.arg("-march=native");
-    }
+        if opts.native {
+            cmd.arg("-march=native");
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            if openmp {
+                cmd.arg("-fopenmp");
+            }
+            cmd.arg("-lm");
+            cmd.arg("-lpthread");
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = openmp;
+        }
+
+        // 第一次探路（带 -fopenmp）时把 clang 的链接错误吞掉：
+        // 没有 libomp 是正常情况，后面会自动串行重试。
+        if openmp {
+            cmd.stderr(Stdio::null());
+        }
+
+        // 没有 libomp 时 `#pragma omp` 会被忽略；别让它的警告刷屏
+        if !openmp {
+            cmd.arg("-Wno-unknown-pragmas");
+        }
+
+        // 预计算程序只读表、不算 errno；关掉 errno 让 sqrt/pow 保持纯函数
+        cmd.arg("-fno-math-errno");
+        if opts.fastmath {
+            cmd.arg("-ffast-math");
+        }
+
+        cmd.status().map(|s| s.success())
+    };
 
     #[cfg(not(target_os = "windows"))]
-    {
-        cmd.arg("-fopenmp");
-        cmd.arg("-lm");
-        cmd.arg("-lpthread");
-    }
+    let openmp = PRECOMPUTE_OPENMP.load(Ordering::Relaxed) != 2;
+    #[cfg(target_os = "windows")]
+    let openmp = false;
 
-    // 预计算程序只读表、不算 errno；关掉 errno 让 sqrt/pow 保持纯函数
-    cmd.arg("-fno-math-errno");
-    if opts.fastmath {
-        cmd.arg("-ffast-math");
+    let mut ok = compile(openmp).map_err(|e| format!("clang: {}", e))?;
+    if !ok && openmp {
+        // 大多数发行版只装 clang 不装 libomp：链接失败会让 @precompute
+        // 整个退化成运行时缓存。填表本来就是编译期一次性的，串行即可。
+        eprintln!("// 预计算: libomp 不可用，改用串行填表");
+        PRECOMPUTE_OPENMP.store(2, Ordering::Relaxed);
+        ok = compile(false).map_err(|e| format!("clang: {}", e))?;
     }
-
-    let status = cmd.status().map_err(|e| format!("clang: {}", e))?;
-    if !status.success() {
+    if !ok {
         let _ = std::fs::remove_file(&tmp_c);
         return Err("clang 失败".to_string());
     }

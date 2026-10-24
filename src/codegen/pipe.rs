@@ -197,12 +197,15 @@ impl Codegen {
         let uid = self.next_tmp_id();
 
         // 循环体：所有中间值都落在栈上单个标量 _pc 里
+        let vectorizable = stages.iter().all(|st| self.is_vectorizable_fn(st.func()));
         let mut body = String::new();
-        body.push_str(
-            "#if defined(__clang__)\n\
-             #pragma clang loop vectorize(enable) interleave(enable)\n\
-             #endif\n",
-        );
+        if vectorizable {
+            body.push_str(
+                "#if defined(__clang__)\n\
+                 #pragma clang loop vectorize(enable) interleave(enable)\n\
+                 #endif\n",
+            );
+        }
         body.push_str(&format!(
             "for (int64_t _pi{} = 0; _pi{} < {}; _pi{}++) {{\n",
             uid, uid, src_len, uid
@@ -251,6 +254,12 @@ impl Codegen {
         lines.push(body);
         if !all_map {
             lines.push(format!("{}_len = _pk{};", name, uid));
+            // filter 的输出按输入长度分配，选择性很强时会浪费几个数量级。
+            // 命中率不到一半才收缩（realloc 也不是免费的）。
+            lines.push(format!(
+                "if ({}_len * 2 < ({})) {{ {}* _sh{} = ({}*)realloc({}, (size_t)({}_len > 0 ? {}_len : 1) * sizeof({})); if (_sh{} != NULL) {} = _sh{}; }}",
+                name, src_len, out_elem, uid, out_elem, name, name, name, out_elem, uid, name, uid
+            ));
         }
 
         // 登记成普通数组，后面 r.len() / for v in r 都能用
@@ -309,9 +318,11 @@ impl Codegen {
             "map" => {
                 let uid = self.next_tmp_id();
                 lines.push(format!("int64_t {}_len = {};", name, len));
-                lines.push(format!(
-                    "#if defined(__clang__)\n#pragma clang loop vectorize(enable) interleave(enable)\n#endif"
-                ));
+                if self.is_vectorizable_fn(&f) {
+                    lines.push(format!(
+                        "#if defined(__clang__)\n#pragma clang loop vectorize(enable) interleave(enable)\n#endif"
+                    ));
+                }
                 lines.push(format!(
                     "for (int64_t _pi{} = 0; _pi{} < {}; _pi{}++) {{ {}[_pi{}] = {}({}[_pi{}]); }}",
                     uid, uid, len, uid, name, uid, f, arr_c, uid
@@ -327,6 +338,10 @@ impl Codegen {
                     uid, uid, len, uid, f, arr_c, uid, name, uid, arr_c, uid
                 ));
                 lines.push(format!("{}_len = _pk{};", name, uid));
+                lines.push(format!(
+                    "if ({}_len * 2 < ({})) {{ {}* _sh{} = ({}*)realloc({}, (size_t)({}_len > 0 ? {}_len : 1) * sizeof({})); if (_sh{} != NULL) {} = _sh{}; }}",
+                    name, len, out_elem, uid, out_elem, name, name, name, out_elem, uid, name, uid
+                ));
             }
         }
 

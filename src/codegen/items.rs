@@ -38,9 +38,12 @@ impl Codegen {
 
     // ── 参数生成 ──
     //
-    // 数组/列表参数统一加 LUME_RESTRICT。
-    // Lume 里数组是值语义、没有裸指针，两个数组参数不可能重叠，
-    // 这个信息只有编译器知道 —— 加上之后 clang 才能放心把循环向量化。
+    // 数组/列表参数**不加 restrict**。
+    // 文档以前写「数组是值语义、无别名」，但实现是引用语义：
+    // `b := a` 直接指针赋值，函数参数也不复制。两个参数完全可能指向
+    // 同一块内存（`shift(x, x)`），此时 restrict 是 UB —— 实测会让
+    // clang 在错误假设下向量化并算错。要恢复 restrict，得先实现
+    // 真正的值拷贝（或全程序别名分析），不能只靠注释。
     //
     // 数组参数还会额外带一个 `int64_t {name}_len` 伴随参数（见 gen_params）。
     // 这是「数组跨函数」的关键：长度跟着数组一起走，调用点由编译器自动补，
@@ -52,7 +55,7 @@ impl Codegen {
             None => "int64_t".to_string(),
         };
         if is_array_ty(&p.ty) {
-            format!("{} LUME_RESTRICT {}", ty, p.name)
+            format!("{} {}", ty, p.name)
         } else {
             format!("{} {}", ty, p.name)
         }
@@ -68,7 +71,7 @@ impl Codegen {
             None => "int64_t".to_string(),
         };
         if is_array_ty(&p.ty) {
-            format!("{} LUME_RESTRICT {}", ty, p.name)
+            format!("{} {}", ty, p.name)
         } else {
             format!("{} {}", ty, p.name)
         }
@@ -231,7 +234,8 @@ impl Codegen {
         }
 
         if f.decorators.iter().any(|d| d.name == "cache") {
-            self.gen_cached_fn(f);
+            let thread_safe = self.thread_safe_cached.contains(&f.name);
+            self.gen_cached_fn(f, thread_safe);
             return;
         }
 
@@ -276,7 +280,10 @@ impl Codegen {
         }
 
         if is_main {
-            self.push_line("lume_log_init_main();");
+            // 占位符：generate() 末尾确认整个程序真的有日志调用才替换成
+            // lume_log_init_main()。没有 say/write/flush 的程序不该白起
+            // 一个 writer 线程（进程启动实测多 ~40 µs）。
+            self.push_line("/*__LUME_LOG_INIT__*/");
         }
 
         for stmt in &f.body.stmts {
@@ -519,9 +526,34 @@ impl Codegen {
         self.push_line("}");
     }
 
-    // ── @cache（单线程，无锁）──
+    // ── @cache ──
+    //
+    // 默认无锁：命中路径只要 ~2ns。如果 collect_par_cached_fns 发现它会被
+    // par for 调到（直接或间接），改用带锁包装器。锁只包住哈希表操作，
+    // _impl 调用在锁外 —— 递归缓存函数（fib / csteps）不会死锁。
 
-    fn gen_cached_fn(&mut self, f: &FnDecl) {
+    pub(crate) fn cached_wrapper_shape(f: &FnDecl, precompute: bool) -> bool {
+        if f.params.len() != 1 || is_array_ty(&f.params[0].ty) {
+            return false;
+        }
+        if precompute {
+            return true;
+        }
+        // @cache 的 void / 数组返回值退化成普通函数，不生成包装器
+        f.ret.is_some() && !is_array_ty(&f.ret)
+    }
+
+    pub(crate) fn gen_cached_wrapper_decl(&mut self, f: &FnDecl, precompute: bool) {
+        let ret_type = match &f.ret {
+            None if precompute => "int64_t".to_string(),
+            None => "void".to_string(),
+            Some(t) => self.gen_type(t),
+        };
+        let pdecl = self.gen_param(&f.params[0]);
+        self.push_line(&format!("static {} {}({});", ret_type, f.name, pdecl));
+    }
+
+    fn gen_cached_fn(&mut self, f: &FnDecl, thread_safe: bool) {
         if f.params.len() != 1 || is_array_ty(&f.params[0].ty) {
             self.push_line(&format!(
                 "/* @cache 需要单个标量参数，退化成普通函数: {} */",
@@ -536,10 +568,16 @@ impl Codegen {
             None => "void".to_string(),
             Some(t) => self.gen_type(t),
         };
-        if ret_type == "void" {
-            // 没有返回值，缓存没有意义：退化成普通函数
-            self.push_line(&format!("/* @cache: {} 无返回值，跳过缓存 */", f.name));
-            self.gen_fn(f);
+        if ret_type == "void" || is_array_ty(&f.ret) {
+            // 以前这里递归调用 gen_fn(f)，@cache 修饰无返回值函数会
+            // 直接把编译器栈打爆；数组返回值则缺 _ret_len 参数。
+            // 两种情况都按普通函数生成。
+            self.push_line(&format!(
+                "/* @cache: {} 的返回类型不适合缓存，退化成普通函数 */",
+                f.name
+            ));
+            self.gen_fn_decl(f);
+            self.gen_fn_body_impl(f, &f.name);
             return;
         }
 
@@ -547,6 +585,7 @@ impl Codegen {
         let impl_name = format!("_{}_impl", fname);
         let pname = f.params[0].name.clone();
         let pdecl = self.gen_param(&f.params[0]);
+        let mutex = format!("_cache_{}_mutex", fname);
         let cap = format!("_cache_{}_cap", fname);
         let keys = format!("_cache_{}_keys", fname);
         let values = format!("_cache_{}_values", fname);
@@ -555,6 +594,12 @@ impl Codegen {
 
         self.output.push('\n');
         self.push_line(&format!("static {} {}({});", ret_type, fname, pdecl));
+        if thread_safe {
+            self.push_line(&format!(
+                "static LUME_MUTEX_T {} = LUME_MUTEX_INIT;",
+                mutex
+            ));
+        }
         self.emit_cache_state(&fname, &ret_type);
         self.emit_cache_grow(&fname, &ret_type);
         self.gen_fn_body_impl(f, &impl_name);
@@ -565,39 +610,64 @@ impl Codegen {
         ));
         self.indent += 1;
 
+        let on_hit_first: Vec<String> = if thread_safe {
+            vec![
+                format!("{} _v = %V%;", ret_type),
+                format!("LUME_MUTEX_UNLOCK({});", mutex),
+                "return _v;".to_string(),
+            ]
+        } else {
+            vec!["return %V%;".to_string()]
+        };
+        let on_hit_second: Vec<String> = if thread_safe {
+            vec![
+                "_result = %V%;".to_string(),
+                format!("LUME_MUTEX_UNLOCK({});", mutex),
+                "return _result;".to_string(),
+            ]
+        } else {
+            vec!["_result = %V%;".to_string(), "return _result;".to_string()]
+        };
+
         // 命中直接返回
+        if thread_safe {
+            self.push_line(&format!("LUME_MUTEX_LOCK({});", mutex));
+        }
         self.push_line(&format!("if ({} > 0) {{", len));
         self.indent += 1;
-        self.emit_cache_probe(&fname, &pname, "_j", &["return %V%;".to_string()]);
+        self.emit_cache_probe(&fname, &pname, "_j", &on_hit_first);
         self.indent -= 1;
         self.push_line("}");
+        if thread_safe {
+            self.push_line(&format!("LUME_MUTEX_UNLOCK({});", mutex));
+        }
 
+        // 锁外计算，避免递归缓存函数自死锁
         self.push_line(&format!("{} _result = {}({});", ret_type, impl_name, pname));
 
+        if thread_safe {
+            self.push_line(&format!("LUME_MUTEX_LOCK({});", mutex));
+        }
         // 负载因子 0.75 时扩容
         self.push_line(&format!(
             "if (({} + 1) * 4 >= {} * 3) _cache_{}_grow();",
             len, cap, fname
         ));
-        self.emit_cache_probe(
-            &fname,
-            &pname,
-            "_j2",
-            &["_result = %V%;".to_string(), "return _result;".to_string()],
-        );
+        self.emit_cache_probe(&fname, &pname, "_j2", &on_hit_second);
 
         self.push_line(&format!("{}[_j2] = {};", keys, pname));
         self.push_line(&format!("{}[_j2] = _result;", values));
         self.push_line(&format!("{}[_j2] = 1;", used));
         self.push_line(&format!("{}++;", len));
+        if thread_safe {
+            self.push_line(&format!("LUME_MUTEX_UNLOCK({});", mutex));
+        }
         self.push_line("return _result;");
 
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');
     }
-
-    // ── 线程安全版（用于 @precompute 与预计算程序）──
 
     pub(crate) fn gen_thread_safe_cached_fn(&mut self, f: &FnDecl) {
         if f.params.len() != 1 || is_array_ty(&f.params[0].ty) {

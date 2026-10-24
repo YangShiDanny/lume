@@ -9,7 +9,7 @@
 > `self.x` 可用、`|>` 可用、算术表达式类型推断、`@cache` 改 O(1) 哈希表、
 > 锁与预计算临时文件跨平台、`par for` 闭区间切块、字符串函数缓冲区轮转。
 >
-> 本轮（性能优化）：数组参数 `restrict`、纯函数 `__attribute__((const))`、
+> 本轮（性能优化）：纯函数 `__attribute__((const))`、
 > `par for` 自动 reduction、循环向量化提示、默认 `-O3` + `--native` + `--lto`、
 > `par for` worker 提到文件顶层（clang/MSVC 可编译）。
 >
@@ -54,31 +54,32 @@ lume run   main.lume [选项]   # 编译并立即运行
 | [9] | 串行 vs `par for` vs 闭区间 reduction | 55 / 55 / 55 |
 | [9b] | `-=` / `*=` 归约（符号不能反） | -55 / 3628800 |
 | [9c] | 归约识别失败 → 退化成串行，结果仍对 | 28 |
-| [9d] | **1500 个元素，超过串行阈值，强制走多线程+合并** | 1500 |
+| [9d] | **40000 个元素，超过串行阈值，强制走线程池+合并** | 40000 |
 | [9e] | 循环体读只读外层标量（按值传进 worker） | 3 / 6 / 9 / 12 |
-| [10] | `par for` 元素级 + restrict | 2 4 6 8 10 |
-| [11] | float 数组参数 restrict + 向量化提示 | 2.5 / 4.5 / 6.5 |
+| [10] | `par for` 元素级写回 | 2 4 6 8 10 |
+| [11] | float 数组参数 + 向量化提示 | 2.5 / 4.5 / 6.5 |
 | [12] | `@precompute` 编译期查表 | fib(30)=832040，**84 ns** |
 | [13] | `@cache` 哈希表记忆化 | 128，首次 33 µs → 命中 138 ns |
 
 想加新优化时，往 `main.lume` 里加一项、把期望值印在同行最省事。
-注意 `[9d]` 故意用 1500 个元素来超过 `LUME_PAR_SERIAL_THRESHOLD`（1024），
-这样多线程 + 合并那条路径才有人覆盖；改阈值时记得同步改这个数。
+注意 `[9d]` 故意用 40000 个元素来超过 `LUME_PAR_SERIAL_THRESHOLD`（32768），
+这样线程池 + 合并那条路径才有人覆盖；改阈值时记得同步改这个数。
 
 规则：
 - 源文件扩展名必须是 **`.lume`**（不是 `.lm`）。传别的后缀只 warning，不报错。
 - 产物：`<文件名>.c` 和 `<文件名>`（Windows 下 `<文件名>.exe`），都落在当前目录。
 - **依赖 `clang` 在 PATH 里**。默认 `-O3`，并默认加 `-fno-math-errno`（让 `sqrt`/`pow` 成为真正的纯函数）。
 - Linux 下链接 `-lm -lpthread`；Windows 下不加。
-- `@precompute` 额外需要支持 `-fopenmp` 的 clang。
+- `@precompute` 需要 clang；有 libomp 时并行填表，没有就自动串行填表。
 
 编译器自身会做的优化（不用加开关）：
-- 数组/列表参数自动加 `restrict` → clang 敢向量化
 - 证明过的纯函数自动加 `__attribute__((const))` → 重复调用被消除
-- 每个 `for` / `while` 前发 `#pragma clang loop vectorize(enable) interleave(enable)`
+- 对可向量化的循环发 `#pragma clang loop vectorize(enable) interleave(enable)`；
+  含 `say` / 未证明纯度调用的循环不发
 - `par for` 自动 reduction（见"并行"一节）
-- `par for` 小循环自动串行：元素数 < `LUME_PAR_SERIAL_THRESHOLD`（1024）时
-  直接调用 worker，不开线程（改这个阈值只需改 runtime header 里那一行）
+- `par for` 用常驻线程池：元素数 < `LUME_PAR_SERIAL_THRESHOLD`（32768）时
+  主线程串行跑完；否则按元素数只唤醒前几个 worker，`LUME_PAR_THREADS` 可覆盖线程数
+- 数组参数**不加** `restrict`：数组是引用语义，可能别名，加了会算错
 - `par for` 循环体里的只读外层标量按值传进 worker；写外层变量直接 `#error`
 
 `par for` 的硬限制（违反会生成 `#error`，不会静默出错）：
@@ -443,8 +444,8 @@ par for i in 0..1000000 {
 
 规则：
 - `par` 前缀只能修饰 `for`，且迭代器**只支持范围**。
-- 自动按 `cpu_count` 切块、最多 64 个线程，引用的外部数组打包进 worker 结构体，
-  并在 worker 里拷成带 `restrict` 的局部指针（循环体可以向量化）。
+- 自动按 `cpu_count` 切块、最多 64 个任务块，引用的外部数组打包进 worker 结构体。
+  线程池常驻，主线程也参与抢任务。
 - worker 函数生成在文件顶层，不嵌在函数里 —— clang / gcc / MSVC 都能编过。
 - 循环体支持：赋值、`let`、`if`（可嵌套）；其他语句生成 `/* par body: 暂不支持 */`。
 - `0..N` 与 `0..=N` 切块都正确，区间按 `[start, stop)` 均分给各线程，不会重复也不会漏。
@@ -452,7 +453,8 @@ par for i in 0..1000000 {
 - 循环体里的只读外层变量按值传进 worker；**写外层变量会直接 `#error`**
   （多线程写同一个变量是数据竞争，宁可编译不过也不要错得悄无声息）。
 - **不支持嵌套** `par for`，会 `#error`。
-- 元素数 < `LUME_PAR_SERIAL_THRESHOLD`（1024）时自动串行跑，不开线程。
+- 元素数 < `LUME_PAR_SERIAL_THRESHOLD`（32768）时自动串行跑，不进线程池。
+- 嵌套并行（`par for` 里再 `par for`，含经函数间接调用）运行期退化成串行。
 
 **自动 reduction**：识别 `v += rhs` / `v -= rhs` / `v *= rhs`，每个线程用私有累加器，
 结束后合并回 `v`，等价于 OpenMP 的 `reduction(+:v)`。触发条件很严格：
@@ -565,6 +567,7 @@ fn main() {
 3. 极致浮点性能加 `--fastmath`；本机跑的话加 `--native` 用上 AVX 等向量指令；
    想要极限再加 `--lto`。默认已经是 `-O3`。
 4. 生成的函数都带 `static`，小函数内联交给 clang。
-5. 数组参数自动带 `restrict`，不用自己操心别名 —— 这是 Lume 能对齐 Fortran 向量化的关键。
+5. 数组参数**没有** `restrict`：数组是引用语义、可能别名。想让 clang 更放心地
+   向量化，就避免把同一个数组同时传给一个函数的多个参数。
 6. 写完可以看一眼生成的 `<文件名>.c`：确认你的热点函数有没有拿到
    `LUME_PURE`、循环前面有没有 `#pragma clang loop vectorize`。

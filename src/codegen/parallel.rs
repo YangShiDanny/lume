@@ -145,6 +145,9 @@ impl Codegen {
         }
         self.indent -= 1;
         self.push_line(&format!("}} {};", args_struct));
+        // 结构体必须在调用点（方法/函数体）之前定义，先单独收走
+        let struct_text = std::mem::take(&mut self.output);
+        self.par_structs.push_str(&struct_text);
 
         // worker 函数（跨平台宏）
         self.push_line(&format!(
@@ -154,14 +157,14 @@ impl Codegen {
         self.indent += 1;
         self.push_line(&format!("{}* _p = ({}*)arg;", args_struct, args_struct));
 
-        // 数组指针拷成带 restrict 的局部变量。
-        // Lume 的数组互不别名，这个保证只有编译器知道，
-        // 说出来之后 clang 才敢对循环体做向量化。
+        // 数组指针拷成局部变量。
+        // 不能加 restrict：调用方完全可能把同一个数组传进多个参数，
+        // 或者传的是切片。clang 在需要时会自己做运行时别名检查。
         for arr in &used_arrays {
             let elem_ty = self.array_elem_types.get(arr)
                 .cloned().unwrap_or_else(|| "int64_t".to_string());
             self.push_line(&format!(
-                "{}* LUME_RESTRICT {} = _p->{};",
+                "{}* {} = _p->{};",
                 elem_ty, arr, arr
             ));
         }
@@ -178,17 +181,34 @@ impl Codegen {
         // 拷成 const 局部量之后，这个别名可能性就消失了。
         self.push_line("const int64_t _par_lo = _p->start;");
         self.push_line("const int64_t _par_hi = _p->end;");
-        self.push_line("#if defined(__clang__)");
-        self.push_line("#pragma clang loop vectorize(enable) interleave(enable)");
-        self.push_line("#endif");
+        // 循环体里有 say / 未证明纯的函数 → 发 vectorize(enable) 只会
+        // 让 clang 报 -Wpass-failed，没有收益。
+        if !self.body_has_unsafe_call(body) {
+            self.push_line("#if defined(__clang__)");
+            self.push_line("#pragma clang loop vectorize(enable) interleave(enable)");
+            self.push_line("#endif");
+        }
         self.push_line(&format!(
             "for (int64_t {} = _par_lo; {} < _par_hi; {}++) {{",
             var, var, var
         ));
         self.indent += 1;
 
+        // 和普通 for 一样：起点是非负字面量时，循环变量一定 >= 0。
+        // 不登记的话循环体里的 i % 2^n 会走 lume_checked_mod_i64，
+        // 登记后能直接发 (i & (2^n-1))。
+        let non_neg = matches!(start, Expr::Int(n) if *n >= 0);
+        let was_non_neg = self.non_neg_vars.contains(var);
+        if non_neg {
+            self.non_neg_vars.insert(var.to_string());
+        }
+
         for stmt in &body.stmts {
             self.gen_par_body_stmt(stmt, &used_arrays, &reductions);
+        }
+
+        if non_neg && !was_non_neg {
+            self.non_neg_vars.remove(var);
         }
 
         self.indent -= 1;
@@ -201,6 +221,10 @@ impl Codegen {
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');
+        self.par_worker_decls.push_str(&format!(
+            "static LUME_WORKER_RET _par_worker_{}(void* arg);\n",
+            id
+        ));
 
         // 把 worker 收进顶层缓冲区，恢复原来的输出位置
         let hoisted = std::mem::replace(&mut self.output, saved_out);
@@ -219,12 +243,14 @@ impl Codegen {
         ));
         self.push_line("int64_t _total = _total_stop - _total_start;");
         self.push_line("if (_total < 1) _total = 1;");
-        self.push_line("lume_log_flush();");
+        // 只提交本线程缓冲，不等 writer 写完：顺序靠 FIFO 保证，
+        // 以前这里是全量 flush，par for 会卡在上一批输出上。
+        self.push_line("lume_log_flush_thread();");
 
         // 小循环直接串行跑。
-        // pthread_create / CreateThread 一次就要几十 µs，而 10 个元素的加法
-        // 是纳秒级 —— 不设阈值的话 par for 在小数据上是净亏几千倍。
-        // 这里不复制一份循环体，而是直接调用 hoisted worker，代码量不涨。
+        // 线程池虽然把固定成本从 ~100 µs 降到几 µs，一次广播 + 唤醒
+        // 仍然比几十个元素的加法贵。这里不复制循环体，而是直接调用
+        // hoisted worker，代码量不涨。
         self.push_line(&format!(
             "if (_total < LUME_PAR_SERIAL_THRESHOLD) {{"
         ));
@@ -259,7 +285,11 @@ impl Codegen {
 
         self.push_line("int _n_threads = lume_cpu_count();");
         self.push_line("if (_n_threads > 64) _n_threads = 64;");
-        self.push_line("LumeThread _threads[64];");
+        // 小循环只叫醒前几个 worker：每个参与线程至少要分到
+        // LUME_PAR_CHUNK_ELEMS 个元素，否则唤醒成本比并行收益大。
+        self.push_line("int _n_active = (int)(_total / LUME_PAR_CHUNK_ELEMS) + 1;");
+        self.push_line("if (_n_active > _n_threads) _n_active = _n_threads;");
+        self.push_line("if (_n_active < 1) _n_active = 1;");
         self.push_line(&format!("{} _args[64];", args_struct));
         self.push_line("int64_t _chunk = (_total + _n_threads - 1) / _n_threads;");
         self.push_line("for (int _t = 0; _t < _n_threads; _t++) {");
@@ -283,17 +313,14 @@ impl Codegen {
         for (name, _) in &scalars {
             self.push_line(&format!("_args[_t].{} = {};", name, name));
         }
+        self.indent -= 1;
+        self.push_line("}");
+        // 线程池：worker 是常驻的，这里只做一次代际广播。
+        // 主线程也参与抢任务（池里是 N-1 个 worker）。
         self.push_line(&format!(
-            "LUME_THREAD_CREATE(_threads[_t], _par_worker_{}, &_args[_t]);",
+            "lume_par_run(_par_worker_{}, _args, sizeof(_args[0]), _n_threads, _n_active);",
             id
         ));
-        self.indent -= 1;
-        self.push_line("}");
-        self.push_line("for (int _t = 0; _t < _n_threads; _t++) {");
-        self.indent += 1;
-        self.push_line("LUME_THREAD_JOIN(_threads[_t]);");
-        self.indent -= 1;
-        self.push_line("}");
         // 合并各线程的私有累加器
         if !reductions.is_empty() {
             self.push_line("for (int _t = 0; _t < _n_threads; _t++) {");
@@ -563,7 +590,7 @@ impl Codegen {
 
     fn gen_par_expr(&mut self, expr: &Expr, arrays: &[String]) -> String {
         match expr {
-            // 数组已经在 worker 顶部拷成 restrict 局部指针，直接用名字
+            // 数组已经在 worker 顶部拷成局部指针，直接用名字
             Expr::Ident(name) if arrays.contains(name) => name.clone(),
             // 只读外层标量走 args 结构体（worker 是顶层函数，看不见它们）
             Expr::Ident(name) if self.par_scalars.contains(name) => {
@@ -581,6 +608,28 @@ impl Codegen {
                     BinOp::And => "&&", BinOp::Or => "||",
                     BinOp::Pipe => "/* pipe */",
                 };
+                // 非负循环变量的 % 2^n → & (2^n-1)，同 gen_expr。
+                // par worker 的 i 从 _par_lo 开始，起点为 0 时 i 一定 >= 0
+                // （gen_par_for_range 已把它登记进 non_neg_vars）。
+                if let BinOp::Mod = op {
+                    if let Expr::Int(b) = r.as_ref() {
+                        if *b > 0 && (*b as u64).is_power_of_two() {
+                            let is_non_neg = match l.as_ref() {
+                                Expr::Ident(name) => {
+                                    self.non_neg_vars.contains(name)
+                                        || self.var_types.get(name)
+                                            .map(|t| t.starts_with("uint"))
+                                            .unwrap_or(false)
+                                }
+                                _ => false,
+                            };
+                            if is_non_neg {
+                                let mask = (*b as u64) - 1;
+                                return format!("({} & {}LL)", ls, mask as i64);
+                            }
+                        }
+                    }
+                }
                 // 整数除零/溢出检查，同 gen_expr 的 Binary 分支
                 if matches!(op, BinOp::Div | BinOp::Mod) {
                     let lt = self.infer_type(l);

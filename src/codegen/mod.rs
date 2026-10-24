@@ -38,6 +38,9 @@ pub struct Codegen {
     pub(crate) array_params: HashSet<String>,
     // 已证明为纯函数、可以打 __attribute__((const)) 的函数名
     pub(crate) const_fns: HashSet<String>,
+    // 会在 par for 里被调用到的 @cache 函数。这些必须用带锁的包装器，
+    // 否则多个 worker 并发读写同一个全局哈希表（realloc 时直接崩）。
+    pub(crate) thread_safe_cached: HashSet<String>,
     pub(crate) precomputed: HashMap<String, Vec<i64>>,
     pub(crate) generic_fns: HashMap<String, FnDecl>,
     // 普通函数的返回类型（供插值/类型推断用，见 generate 步骤 2.4）
@@ -63,7 +66,10 @@ pub struct Codegen {
     pub(crate) monomorphized: HashMap<String, String>,
     pub(crate) pending_monos: Vec<(FnDecl, String, HashMap<String, String>)>,
     pub(crate) par_counter: usize,
-    // par for 的 worker 函数（提到文件顶层，不能嵌在函数里）
+    // par for 的 args 结构体（必须早于调用点）和 worker 声明
+    pub(crate) par_structs: String,
+    pub(crate) par_worker_decls: String,
+    // par for 的 worker 定义（放在所有函数原型之后，才能调用 @cache 等）
     pub(crate) par_workers: String,
     // 当前 par worker 里通过 _p-> 访问的只读外层标量（见 parallel.rs）
     pub(crate) par_scalars: Vec<String>,
@@ -96,6 +102,7 @@ impl Codegen {
             array_elem_types: HashMap::new(),
             array_params: HashSet::new(),
             const_fns: HashSet::new(),
+            thread_safe_cached: HashSet::new(),
             precomputed: HashMap::new(),
             generic_fns: HashMap::new(),
             fn_ret_types: HashMap::new(),
@@ -109,6 +116,8 @@ impl Codegen {
             monomorphized: HashMap::new(),
             pending_monos: Vec::new(),
             par_counter: 0,
+            par_structs: String::new(),
+            par_worker_decls: String::new(),
             par_workers: String::new(),
             par_scalars: Vec::new(),
             non_neg_vars: std::collections::HashSet::new(),
@@ -221,6 +230,10 @@ impl Codegen {
         //     因为 __attribute__((const)) 要写在声明上，调用点才能看到
         self.collect_const_fns(program);
 
+        // 2.6 哪些 @cache 会被 par for 调到（含经由普通函数间接调用）。
+        //     这些要用带锁的缓存包装器，其余保持无锁快路径。
+        self.thread_safe_cached = collect_par_cached_fns(program);
+
         // 3. 生成 struct 定义
         for item in &program.items {
             if let Item::Struct(s) = item {
@@ -243,11 +256,18 @@ impl Codegen {
         }
         for item in &program.items {
             if let Item::Fn(f) = item {
-                // 泛型函数走单态化；cache/precompute 会生成包装器并自行发原型。
-                // 其他装饰器（例如 @fastmath）仍是直接函数定义，必须正常前向声明。
-                let has_wrapper = f.decorators.iter()
-                    .any(|d| d.name == "cache" || d.name == "precompute");
-                if f.generics.is_empty() && !has_wrapper {
+                if !f.generics.is_empty() {
+                    continue;
+                }
+                // cache/precompute 的包装器签名和普通函数不完全一样
+                // （单参数、不带数组伴随参数），要单独发原型。
+                // 以前整个跳过，结果 par worker 里调用 @cache 函数会生成
+                // “call to undeclared function” 的非法 C。
+                let is_cache = f.decorators.iter().any(|d| d.name == "cache");
+                let is_pre = f.decorators.iter().any(|d| d.name == "precompute");
+                if (is_cache || is_pre) && Self::cached_wrapper_shape(f, is_pre) {
+                    self.gen_cached_wrapper_decl(f, is_pre);
+                } else {
                     self.gen_fn_decl(f);
                 }
             }
@@ -300,11 +320,34 @@ impl Codegen {
         }
 
         let mut out = std::mem::take(&mut self.output);
-        if !self.par_workers.is_empty() {
-            out.insert_str(worker_pos, &self.par_workers);
+        // par for 的 args 结构体 + worker 声明必须早于方法/函数定义；
+        // worker **定义**则要等所有函数原型（含 @cache 包装器、泛型单态化）
+        // 都发完之后再追加 —— 否则 worker 里调用它们会变成隐式声明。
+        if !self.par_structs.is_empty() || !self.par_worker_decls.is_empty() {
+            out.insert_str(
+                worker_pos,
+                &format!("{}{}", self.par_structs, self.par_worker_decls),
+            );
         }
         // 可空 typedef 必须早于所有使用点（struct 字段/函数原型）
         out.insert_str(opt_pos, &self.gen_opt_typedefs());
+        if !self.par_workers.is_empty() {
+            out.push('\n');
+            out.push_str(&self.par_workers);
+        }
+
+        // 日志线程懒启动：主函数里先放占位符，这里看生成代码里有没有
+        // 真正的日志调用。没有就整行删掉 —— 空程序不再起 writer 线程。
+        // 只扫 runtime header 之后的部分，避免把 header 自己的定义算进去。
+        let body = &out[runtime::RUNTIME_HEADER.len()..];
+        let uses_log = body.contains("lume_logf(")
+            || body.contains("lume_log_write_literal(")
+            || body.contains("lume_log_flush()");
+        let placeholder = "    /*__LUME_LOG_INIT__*/\n";
+        out = out.replace(
+            placeholder,
+            if uses_log { "    lume_log_init_main();\n" } else { "" },
+        );
         out
     }
 
@@ -553,5 +596,213 @@ impl Codegen {
             }
             _ => {}
         }
+    }
+}
+
+
+// ── @cache 在 par for 里的线程安全判定 ──
+//
+// 直接看 AST：把所有 par for 循环体里调到的函数名当种子，
+// 再沿普通函数/方法的调用图传递闭包。落在 @cache 集合里的，
+// 生成带锁包装器；其余保持无锁（单线程快路径 +2ns，不能白送 20ns）。
+fn collect_par_cached_fns(program: &Program) -> HashSet<String> {
+    let mut cache_fns: HashSet<String> = HashSet::new();
+    let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut seeds: HashSet<String> = HashSet::new();
+
+    for item in &program.items {
+        match item {
+            Item::Fn(f) => {
+                if f.decorators.iter().any(|d| d.name == "cache") {
+                    cache_fns.insert(f.name.clone());
+                }
+                let mut calls = HashSet::new();
+                collect_calls_block(&f.body, &mut calls);
+                edges.insert(f.name.clone(), calls);
+                collect_par_seeds_block(&f.body, &mut seeds);
+            }
+            Item::Struct(s) => {
+                for m in &s.methods {
+                    let mut calls = HashSet::new();
+                    collect_calls_block(&m.body, &mut calls);
+                    edges.insert(m.name.clone(), calls);
+                    collect_par_seeds_block(&m.body, &mut seeds);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut reach = seeds;
+    let mut work: Vec<String> = reach.iter().cloned().collect();
+    while let Some(n) = work.pop() {
+        if let Some(callees) = edges.get(&n) {
+            for c in callees {
+                if reach.insert(c.clone()) {
+                    work.push(c.clone());
+                }
+            }
+        }
+    }
+    reach.intersection(&cache_fns).cloned().collect()
+}
+
+fn collect_par_seeds_block(b: &Block, out: &mut HashSet<String>) {
+    for s in &b.stmts {
+        match s {
+            Stmt::ParFor { body, .. } => collect_calls_block(body, out),
+            Stmt::If { then, els, .. } => {
+                collect_par_seeds_block(then, out);
+                if let Some(e) = els {
+                    collect_par_seeds_stmt(e, out);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                collect_par_seeds_block(body, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_par_seeds_stmt(s: &Stmt, out: &mut HashSet<String>) {
+    match s {
+        Stmt::ParFor { body, .. } => collect_calls_block(body, out),
+        Stmt::If { then, els, .. } => {
+            collect_par_seeds_block(then, out);
+            if let Some(e) = els {
+                collect_par_seeds_stmt(e, out);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::For { body, .. } => collect_par_seeds_block(body, out),
+        Stmt::Expr(Expr::If(_, then, els)) => {
+            collect_par_seeds_block(then, out);
+            if let Some(e) = els {
+                collect_par_seeds_block(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_calls_block(b: &Block, out: &mut HashSet<String>) {
+    for s in &b.stmts {
+        collect_calls_stmt(s, out);
+    }
+}
+
+fn collect_calls_stmt(s: &Stmt, out: &mut HashSet<String>) {
+    match s {
+        Stmt::Let { init, .. } => collect_calls_expr(init, out),
+        Stmt::Assign { target, value } => {
+            collect_calls_expr(target, out);
+            collect_calls_expr(value, out);
+        }
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => collect_calls_expr(e, out),
+        Stmt::If { cond, then, els } => {
+            collect_calls_expr(cond, out);
+            collect_calls_block(then, out);
+            if let Some(e) = els {
+                collect_calls_stmt(e, out);
+            }
+        }
+        Stmt::While { cond, body } => {
+            collect_calls_expr(cond, out);
+            collect_calls_block(body, out);
+        }
+        Stmt::For { iter, body, .. } | Stmt::ParFor { iter, body, .. } => {
+            collect_calls_expr(iter, out);
+            collect_calls_block(body, out);
+        }
+        Stmt::Match { value, arms } => {
+            collect_calls_expr(value, out);
+            for a in arms {
+                collect_calls_expr(&a.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_calls_expr(e: &Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::FmtStr(parts) => {
+            for p in parts {
+                if let StrPart::Expr(x) = p {
+                    collect_calls_expr(x, out);
+                }
+            }
+        }
+        Expr::Binary(l, _, r) => {
+            collect_calls_expr(l, out);
+            collect_calls_expr(r, out);
+        }
+        Expr::Unary(_, x) | Expr::Await(x) | Expr::Try(x) | Expr::Force(x) => {
+            collect_calls_expr(x, out)
+        }
+        Expr::Call(callee, args) => {
+            match callee.as_ref() {
+                Expr::Ident(n) => {
+                    out.insert(n.clone());
+                }
+                Expr::Field(_, m) => {
+                    out.insert(m.clone());
+                }
+                other => collect_calls_expr(other, out),
+            }
+            for a in args {
+                collect_calls_expr(a, out);
+            }
+        }
+        Expr::Field(o, _) => collect_calls_expr(o, out),
+        Expr::Index(o, i) => {
+            collect_calls_expr(o, out);
+            collect_calls_expr(i, out);
+        }
+        Expr::Slice(o, a, b, _) => {
+            collect_calls_expr(o, out);
+            if let Some(x) = a {
+                collect_calls_expr(x, out);
+            }
+            if let Some(x) = b {
+                collect_calls_expr(x, out);
+            }
+        }
+        Expr::Lambda { body, .. } | Expr::Spawn(body) => collect_calls_block(body, out),
+        Expr::Tuple(v) | Expr::List(v) => {
+            for x in v {
+                collect_calls_expr(x, out);
+            }
+        }
+        Expr::Map(pairs) => {
+            for (k, v) in pairs {
+                collect_calls_expr(k, out);
+                collect_calls_expr(v, out);
+            }
+        }
+        Expr::StructLit(_, fields) => {
+            for (_, v) in fields {
+                collect_calls_expr(v, out);
+            }
+        }
+        Expr::Repeat(x, _) => collect_calls_expr(x, out),
+        Expr::Range(a, b, _) => {
+            collect_calls_expr(a, out);
+            collect_calls_expr(b, out);
+        }
+        Expr::If(c, t, e) => {
+            collect_calls_expr(c, out);
+            collect_calls_block(t, out);
+            if let Some(b) = e {
+                collect_calls_block(b, out);
+            }
+        }
+        Expr::Match(v, arms) => {
+            collect_calls_expr(v, out);
+            for a in arms {
+                collect_calls_expr(&a.body, out);
+            }
+        }
+        _ => {}
     }
 }

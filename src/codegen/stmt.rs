@@ -128,7 +128,7 @@ impl Codegen {
             Stmt::While { cond, body } => {
                 let c = self.gen_expr(cond);
                 // while 循环同样吃向量化提示（clang 会自动判断能不能向量化）
-                self.push_vectorize_hint();
+                self.push_vectorize_hint(body);
                 self.push_line(&format!("while ({}) {{", bare_parens(&c)));
                 self.indent += 1;
                 for s in &body.stmts {
@@ -268,7 +268,7 @@ impl Codegen {
 
             Stmt::While { cond, body } => {
                 let c = self.gen_expr_with_self(cond, fields);
-                self.push_vectorize_hint();
+                self.push_vectorize_hint(body);
                 self.push_line(&format!("while ({}) {{", bare_parens(&c)));
                 self.indent += 1;
                 for s in &body.stmts {
@@ -309,9 +309,14 @@ impl Codegen {
         }
     }
 
-    // Lume 的数组不会别名，循环一定可以向量化。
-    // 加上这个提示，clang 会跳过代价模型判断直接向量化（安全依赖不变）
-    fn push_vectorize_hint(&mut self) {
+    // 提示 clang 跳过代价模型、直接尝试向量化。
+    // 但循环体里有 say / 未证明纯度的函数调用时，向量化根本不可能，
+    // 强制 pragma 只会让 clang 每次构建都报 -Wpass-failed。
+    // 所以先扫一遍循环体：只有纯算术 + 已证明纯函数才发提示。
+    fn push_vectorize_hint(&mut self, body: &Block) {
+        if self.body_has_unsafe_call(body) {
+            return;
+        }
         self.push_line("#if defined(__clang__)");
         self.push_line("#pragma clang loop vectorize(enable) interleave(enable)");
         self.push_line("#endif");
@@ -331,7 +336,7 @@ impl Codegen {
                     self.non_neg_vars.insert(var.to_string());
                 }
 
-                self.push_vectorize_hint();
+                self.push_vectorize_hint(body);
                 self.push_line(&format!(
                     "for (int64_t {} = {}; {} {} {}; {}++) {{",
                     var, s, var, cmp, e, var
@@ -370,7 +375,7 @@ impl Codegen {
                     "lume_slice_len({}, {}, {}, {})",
                     base, s, e, base_len
                 );
-                self.push_vectorize_hint();
+                self.push_vectorize_hint(body);
                 self.push_line(&format!(
                     "for (int64_t _i_s = 0; _i_s < {}; _i_s++) {{",
                     len
@@ -389,7 +394,7 @@ impl Codegen {
                     let elem_ty = self.array_elem_types.get(arr_name)
                         .cloned().unwrap_or_else(|| "int64_t".to_string());
                     let idx = format!("_i_{}", arr_name);
-                    self.push_vectorize_hint();
+                    self.push_vectorize_hint(body);
                     self.push_line(&format!(
                         "for (int64_t {} = 0; {} < {}; {}++) {{",
                         idx, idx, len_expr, idx
@@ -588,6 +593,111 @@ impl Codegen {
                 }
             }
             _ => {}
+        }
+    }
+}
+// ── 向量化可行性扫描 ──
+//
+// 只用来决定「要不要发 #pragma clang loop vectorize」。
+// 保守：遇到任何未被 proves 纯的函数调用就放弃提示（clang 自己仍会尝试，
+// 只是不强制跳过代价模型）。say/write/flush 一定不是纯函数，所以含日志的
+// 循环自动不再收到 pragma —— 构建时的 -Wpass-failed 噪音就没了。
+
+impl Codegen {
+    pub(crate) fn is_vectorizable_fn(&self, name: &str) -> bool {
+        self.const_fns.contains(name)
+            || matches!(
+                name,
+                "sqrt" | "pow" | "sin" | "cos" | "tan" | "floor" | "ceil" | "round"
+                    | "abs" | "fabs" | "int_abs" | "float_abs" | "int_min" | "int_max"
+            )
+    }
+
+    pub(crate) fn body_has_unsafe_call(&self, body: &Block) -> bool {
+        body.stmts.iter().any(|s| self.stmt_has_unsafe_call(s))
+    }
+
+    fn stmt_has_unsafe_call(&self, s: &Stmt) -> bool {
+        match s {
+            Stmt::Let { init, .. } => self.expr_has_unsafe_call(init),
+            Stmt::Assign { target, value } => {
+                self.expr_has_unsafe_call(target) || self.expr_has_unsafe_call(value)
+            }
+            Stmt::Expr(e) => self.expr_has_unsafe_call(e),
+            Stmt::If { cond, then, els } => {
+                self.expr_has_unsafe_call(cond)
+                    || self.body_has_unsafe_call(then)
+                    || els.as_ref().map(|s| self.stmt_has_unsafe_call(s)).unwrap_or(false)
+            }
+            Stmt::While { cond, body } => {
+                self.expr_has_unsafe_call(cond) || self.body_has_unsafe_call(body)
+            }
+            Stmt::For { iter, body, .. } | Stmt::ParFor { iter, body, .. } => {
+                self.expr_has_unsafe_call(iter) || self.body_has_unsafe_call(body)
+            }
+            Stmt::Return(Some(e)) => self.expr_has_unsafe_call(e),
+            Stmt::Match { value, arms } => {
+                self.expr_has_unsafe_call(value)
+                    || arms.iter().any(|a| self.expr_has_unsafe_call(&a.body))
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_has_unsafe_call(&self, e: &Expr) -> bool {
+        match e {
+            Expr::FmtStr(parts) => parts.iter().any(|p| match p {
+                StrPart::Expr(x) => self.expr_has_unsafe_call(x),
+                StrPart::Text(_) => false,
+            }),
+            Expr::Binary(l, _, r) => {
+                self.expr_has_unsafe_call(l) || self.expr_has_unsafe_call(r)
+            }
+            Expr::Unary(_, x) | Expr::Await(x) | Expr::Try(x) | Expr::Force(x) => {
+                self.expr_has_unsafe_call(x)
+            }
+            Expr::Call(callee, args) => {
+                // 方法调用（callee 是 Field）一律当作不可向量化
+                let ok = match callee.as_ref() {
+                    Expr::Ident(name) => self.is_vectorizable_fn(name),
+                    _ => false,
+                };
+                if !ok {
+                    return true;
+                }
+                args.iter().any(|a| self.expr_has_unsafe_call(a))
+            }
+            Expr::Field(o, _) => self.expr_has_unsafe_call(o),
+            Expr::Index(o, i) => {
+                self.expr_has_unsafe_call(o) || self.expr_has_unsafe_call(i)
+            }
+            Expr::Slice(o, a, b, _) => {
+                self.expr_has_unsafe_call(o)
+                    || a.as_ref().map(|x| self.expr_has_unsafe_call(x)).unwrap_or(false)
+                    || b.as_ref().map(|x| self.expr_has_unsafe_call(x)).unwrap_or(false)
+            }
+            Expr::Lambda { body, .. } | Expr::Spawn(body) => self.body_has_unsafe_call(body),
+            Expr::Tuple(v) | Expr::List(v) => v.iter().any(|x| self.expr_has_unsafe_call(x)),
+            Expr::Map(pairs) => pairs.iter().any(|(k, v)| {
+                self.expr_has_unsafe_call(k) || self.expr_has_unsafe_call(v)
+            }),
+            Expr::StructLit(_, fields) => {
+                fields.iter().any(|(_, v)| self.expr_has_unsafe_call(v))
+            }
+            Expr::Repeat(x, _) => self.expr_has_unsafe_call(x),
+            Expr::Range(a, b, _) => {
+                self.expr_has_unsafe_call(a) || self.expr_has_unsafe_call(b)
+            }
+            Expr::If(c, t, e) => {
+                self.expr_has_unsafe_call(c)
+                    || self.body_has_unsafe_call(t)
+                    || e.as_ref().map(|b| self.body_has_unsafe_call(b)).unwrap_or(false)
+            }
+            Expr::Match(v, arms) => {
+                self.expr_has_unsafe_call(v)
+                    || arms.iter().any(|a| self.expr_has_unsafe_call(&a.body))
+            }
+            _ => false,
         }
     }
 }

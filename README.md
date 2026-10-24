@@ -4,8 +4,8 @@
 
 一门静态类型、编译到 C 的语言。目标是「简单调用又最高效」。
 
-你写直观的递归和循环，编译器负责把它们展开成查表、多线程和带 `restrict` /
-向量化提示的 C 代码，剩下的交给 clang。
+你写直观的递归和循环，编译器负责把它们展开成查表、多线程和带向量化提示的
+C 代码，剩下的交给 clang。
 
 ```lume
 struct Point {
@@ -89,18 +89,24 @@ VS Code 语法扩展位于 `vscode-extension/`，可在该目录打开后按 `F5
 
 不用加任何开关：
 
-- **数组参数加 `restrict`** —— Lume 的数组是值语义，两个数组参数不可能互相
-  别名。说出来之后 clang 才敢把循环向量化。
 - **纯函数打 `__attribute__((const))`** —— 由 `src/codegen/purity.rs` 做保守
   证明（只写局部变量、只引用参数和局部 `let`、只调数学白名单或已证明的函数）。
   证明不了的（读数组、`say`、字段访问）一律放弃。重复调用因此被消除。
-- **每个 `for` 前发 `#pragma clang loop vectorize(enable) interleave(enable)`**。
+- **对可向量化的循环发 `#pragma clang loop vectorize(enable) interleave(enable)`**
+  —— 循环体含 `say` / 未证明纯度的函数调用时不发，避免无意义的
+  `-Wpass-failed`（clang 自己仍会尝试）。
+- **数组参数不加 `restrict`** —— 当前实现里数组是**引用**语义（`b := a` 直接
+  共享内存，函数参数也不复制），两个参数完全可能指向同一块内存。加 `restrict`
+  会让 clang 在错误假设下向量化并算错（实测 `shift(x, x)` 输出 10 10 20 30），
+  所以这条优化已撤回。
 - **`par for` 自动 reduction** —— 识别 `v += / -= /= *= rhs`，每线程私有累加器，
   结束后合并，语义等同 OpenMP 的 `reduction`。要求该变量在循环体里只出现在
   累加式中（出现 3 次就放弃，归约后语义会变）。
 - **`par for` worker 提到文件顶层** —— 嵌套函数是 GCC 扩展，clang/MSVC 不认。
-- **小循环自动串行** —— 元素数少于 `LUME_PAR_SERIAL_THRESHOLD`（1024）时直接
-  调用 worker，不开线程。一次 `pthread_create` 几十 µs，小数据上开线程净亏。
+- **`par for` 常驻线程池** —— 第一次 `par for` 建 N-1 个 worker，之后每次只做
+  代际广播。小循环按元素数只唤醒前几个 worker；元素数少于
+  `LUME_PAR_SERIAL_THRESHOLD`（32768）时主线程直接串行跑完。
+  `LUME_PAR_THREADS=4` 可指定总线程数（含主线程）。
 
 ## 测试
 
@@ -135,9 +141,18 @@ src/
 
 ## 已知限制
 
-- 多维数组、切片（`a[1..3]`）、map、`match` 表达式、`spawn`、默认参数、
-  `pub`/模块系统：AST 里已有定义，codegen 未实现（见 `src/ast.rs` 文件头的待办清单）。
+- 多维数组、map、`match` 表达式、`spawn`、`pub`/模块系统、元组：AST 里已有
+  定义，codegen 未实现（见 `src/ast.rs` 文件头的待办清单）。
+- **数组是引用语义，不是值语义**：`b := a` 之后改 `b[0]` 会改到 `a[0]`；
+  传参也不复制。切片同样是借用（零拷贝）。
+- **数组返回值有所有权问题**：函数里新建的数组（`return out`、`map`/`filter`）
+  由被调用方 `malloc`，语言目前没有 `free`/析构，长循环会持续增长。这是下一步
+  要做的所有权设计，不是「值语义」。
+- `@cache` 默认无锁；被 `par for` 直接/间接调用时自动换成带锁包装器。
+- `@precompute` 需要 clang；没有 libomp 时自动串行填表（结果相同，只是编译期
+  慢一点），不再静默退化成运行时缓存。
 - `par for` 不支持嵌套；循环体不能写外层变量（只有归约变量能跨线程累加）。
-  两种情况都会生成 `#error`，不会静默出错。
+  两种情况都会生成 `#error`，不会静默出错。嵌套并行（含跨函数间接调用）
+  在运行期退化成串行。
 - `say` 插值的类型推断依赖编译期已知的信息；调用普通函数时查返回类型表
   （`fn_ret_types`），查不到才退回 `int64_t`。

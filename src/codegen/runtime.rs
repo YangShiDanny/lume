@@ -280,17 +280,204 @@ static inline void lume_log_flush(void) {
     LUME_MUTEX_UNLOCK(lume_log_mutex_);
 }
 
+/* ── par for 常驻线程池 ──
+   以前每个 par for 都 pthread_create/join 一轮，固定成本约 100 µs：
+   10 万元素以下的循环开线程净亏（实测 1 万元素慢 60 倍）。
+   现在第一次 par for 建 N-1 个常驻 worker，主线程也一起抢任务；
+   之后每次只做一次代际广播 + 等待。
+
+   唤醒几个 worker 由调用方按元素数算：元素数 / LUME_PAR_CHUNK_ELEMS + 1。
+   小循环只叫 1~2 个，大循环才全叫醒 —— 每个 worker 都用**自己的**
+   条件变量，唤醒成本只和真正参与的数量成正比。 */
+
+#define LUME_POOL_MAX_WORKERS 63
+#define LUME_PAR_CHUNK_ELEMS 32768
+
+typedef LUME_WORKER_RET (*LumeWorkerFn)(void*);
+
+#ifdef _WIN32
+#  define LUME_COND_INIT_ONE(c) InitializeConditionVariable(&(c))
+#else
+#  define LUME_COND_INIT_ONE(c) pthread_cond_init(&(c), NULL)
+#endif
+
+static LUME_MUTEX_T lume_pool_mutex_ = LUME_MUTEX_INIT;
+static LumeCond lume_pool_done_ = LUME_COND_INIT;
+static LumeCond lume_pool_conds_[LUME_POOL_MAX_WORKERS];
+static LumeThread lume_pool_threads_[LUME_POOL_MAX_WORKERS];
+static int lume_pool_nworkers_ = 0;
+static int lume_pool_started_ = 0;
+static int lume_pool_stopping_ = 0;
+static uint64_t lume_pool_generation_ = 0;
+static LumeWorkerFn lume_pool_fn_ = NULL;
+static char* lume_pool_args_ = NULL;
+static size_t lume_pool_stride_ = 0;
+static int lume_pool_ntasks_ = 0;
+static int lume_pool_active_ = 0;
+static long lume_pool_next_ = 0;
+static int lume_pool_busy_ = 0;
+/* 当前线程是否正在执行 par 任务。par for 里再调 par for（含跨函数）
+   会把池状态冲掉，这种递归并行直接退化成串行。 */
+static LUME_THREAD_LOCAL int lume_pool_depth_ = 0;
+
+static inline void lume_pool_call_(LumeWorkerFn fn, void* arg) {
+    lume_pool_depth_++;
+    fn(arg);
+    lume_pool_depth_--;
+}
+
+static void lume_par_shutdown(void);
+static LUME_WORKER_RET lume_pool_worker_(void* arg);
+
+static void lume_par_init_locked(void) {
+    if (lume_pool_started_) return;
+    int total = lume_cpu_count();
+    /* 运行时旋钮：LUME_PAR_THREADS=4 表示总共用 4 个线程（含主线程）。
+       默认用全部逻辑核；内存带宽受限的循环往往少开几个更快。 */
+    const char* env = getenv("LUME_PAR_THREADS");
+    if (env != NULL && env[0] != 0) {
+        int v = atoi(env);
+        if (v > 0) total = v;
+    }
+    int n = total - 1;  /* 主线程也抢任务 */
+    if (n < 0) n = 0;
+    if (n > LUME_POOL_MAX_WORKERS) n = LUME_POOL_MAX_WORKERS;
+    lume_pool_nworkers_ = n;
+    lume_pool_started_ = 1;
+    for (int i = 0; i < n; i++) {
+        LUME_COND_INIT_ONE(lume_pool_conds_[i]);
+        LUME_THREAD_CREATE(
+            lume_pool_threads_[i], lume_pool_worker_, (void*)(size_t)i
+        );
+    }
+    atexit(lume_par_shutdown);
+}
+
+static LUME_WORKER_RET lume_pool_worker_(void* arg) {
+    int idx = (int)(size_t)arg;
+    uint64_t seen = 0;
+    for (;;) {
+        LUME_MUTEX_LOCK(lume_pool_mutex_);
+        while (!lume_pool_stopping_ && lume_pool_generation_ == seen) {
+            LUME_COND_WAIT(lume_pool_conds_[idx], lume_pool_mutex_);
+        }
+        if (lume_pool_stopping_) {
+            LUME_MUTEX_UNLOCK(lume_pool_mutex_);
+            break;
+        }
+        uint64_t gen = lume_pool_generation_;
+        if (idx >= lume_pool_active_) {
+            /* 本次没叫我（或信号丢失后我晚到了）—— 标记已读，继续睡 */
+            seen = gen;
+            LUME_MUTEX_UNLOCK(lume_pool_mutex_);
+            continue;
+        }
+        seen = gen;
+        LumeWorkerFn fn = lume_pool_fn_;
+        char* base = lume_pool_args_;
+        size_t stride = lume_pool_stride_;
+        int ntasks = lume_pool_ntasks_;
+        LUME_MUTEX_UNLOCK(lume_pool_mutex_);
+
+        int ran = 0;
+        for (;;) {
+            int t = (int)LUME_NEXT_SLOT(&lume_pool_next_);
+            if (t >= ntasks) break;
+            lume_pool_call_(fn, base + (size_t)t * stride);
+            ran = 1;
+        }
+        if (ran) lume_log_flush_thread();
+
+        LUME_MUTEX_LOCK(lume_pool_mutex_);
+        lume_pool_busy_--;
+        if (lume_pool_busy_ == 0) LUME_COND_BROADCAST(lume_pool_done_);
+        LUME_MUTEX_UNLOCK(lume_pool_mutex_);
+    }
+    LUME_WORKER_RETURN;
+}
+
+static void lume_par_shutdown(void) {
+    if (!lume_pool_started_) return;
+    LUME_MUTEX_LOCK(lume_pool_mutex_);
+    lume_pool_stopping_ = 1;
+    for (int i = 0; i < lume_pool_nworkers_; i++) {
+        LUME_COND_SIGNAL(lume_pool_conds_[i]);
+    }
+    LUME_MUTEX_UNLOCK(lume_pool_mutex_);
+    for (int i = 0; i < lume_pool_nworkers_; i++) {
+        LUME_THREAD_JOIN(lume_pool_threads_[i]);
+    }
+    lume_pool_started_ = 0;
+    lume_pool_nworkers_ = 0;
+    lume_pool_stopping_ = 0;
+}
+
+/* 提交一批任务：args 是结构体数组，stride 是 sizeof(结构体)。
+   nactive 是本次参与的线程总数（含主线程），1 表示主线程串行跑完。 */
+static inline void lume_par_run(
+    LumeWorkerFn fn, void* args, size_t stride, int ntasks, int nactive
+) {
+    if (ntasks <= 0) return;
+
+    /* 嵌套并行（par for 里再 par for，或经由函数间接调用）→ 串行 */
+    if (lume_pool_depth_ > 0 || nactive <= 1) {
+        for (int t = 0; t < ntasks; t++) {
+            lume_pool_call_(fn, (char*)args + (size_t)t * stride);
+        }
+        lume_log_flush_thread();
+        return;
+    }
+
+    LUME_MUTEX_LOCK(lume_pool_mutex_);
+    if (!lume_pool_started_) lume_par_init_locked();
+    int max_parts = lume_pool_nworkers_ + 1;
+    if (nactive > max_parts) nactive = max_parts;
+    if (nactive <= 1) {
+        LUME_MUTEX_UNLOCK(lume_pool_mutex_);
+        for (int t = 0; t < ntasks; t++) {
+            lume_pool_call_(fn, (char*)args + (size_t)t * stride);
+        }
+        lume_log_flush_thread();
+        return;
+    }
+    int active = nactive - 1;  /* 唤醒的 worker 数，主线程也算一个 */
+
+    lume_pool_fn_ = fn;
+    lume_pool_args_ = (char*)args;
+    lume_pool_stride_ = stride;
+    lume_pool_ntasks_ = ntasks;
+    lume_pool_next_ = 0;
+    lume_pool_active_ = active;
+    lume_pool_busy_ = active;
+    lume_pool_generation_++;
+    for (int i = 0; i < active; i++) {
+        LUME_COND_SIGNAL(lume_pool_conds_[i]);
+    }
+    LUME_MUTEX_UNLOCK(lume_pool_mutex_);
+
+    /* 主线程也抢任务 */
+    for (;;) {
+        int t = (int)LUME_NEXT_SLOT(&lume_pool_next_);
+        if (t >= ntasks) break;
+        lume_pool_call_(fn, (char*)args + (size_t)t * stride);
+    }
+    lume_log_flush_thread();
+
+    LUME_MUTEX_LOCK(lume_pool_mutex_);
+    while (lume_pool_busy_ > 0) {
+        LUME_COND_WAIT(lume_pool_done_, lume_pool_mutex_);
+    }
+    LUME_MUTEX_UNLOCK(lume_pool_mutex_);
+}
+
 /* ── 优化提示 ── */
 
-/* 少于这个元素数，par for 直接串行跑、不开线程。
-   一次 pthread_create / CreateThread 就要几十 µs，而几千个元素的循环
-   是微秒级——不设阈值的话小数据上开线程纯属净亏。
-   阈值改这一个地方就行。 */
-#define LUME_PAR_SERIAL_THRESHOLD 1024
-
-/* Lume 的数组是值语义，两个数组参数不可能互相别名。
-   给数组参数加 restrict，clang 才敢把循环向量化（这是打平 Fortran 的关键）。 */
-#define LUME_RESTRICT __restrict
+/* 少于这个元素数，par for 直接串行跑、不进线程池。
+   线程池把固定成本从 ~100 µs 降到几 µs，但一次广播 + 唤醒
+   仍然要和几十个元素的加法比。实测（8 核）：
+     1 万元素求和 串行 1.3 µs，线程池 ~8 µs；10 万元素 14 µs vs ~14 µs。
+   阈值取 32768：轻循环到这里才开始不亏，重循环（sqrt 等）也够长。 */
+#define LUME_PAR_SERIAL_THRESHOLD 32768
 
 /* __attribute__((const))：函数只看参数、只返回值，不读不写全局状态。
    clang 因此可以消除重复调用、把调用提到循环外。

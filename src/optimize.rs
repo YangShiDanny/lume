@@ -3,9 +3,12 @@
 //! 在 checker 之后、codegen 之前运行。只做「对整数安全」的变换，
 //! 不改变运行时行为。
 //!
-//! 关键假设：`x * 2^n` 里的 `x` 是整数。`x` 是浮点时，
-//! `x * 8` 变成 `x << 3` 是错的（double 不能移位）。
-//! 所以只对 `Expr::Int` 和 `Expr::Ident` 做——`Ident` 假设是整数。
+//! 只做**有类型把握**的变换：字面量与字面量。
+//!
+//! 曾经这里对 `Expr::Ident` 也做 `x * 2^n → x << n`，但 AST 里没有类型信息，
+//! 而 `x` 完全可能是 `float`：`x * 8` 生成 `lume_shl(x, 3)` 会把 double
+//! 隐式截成 int64（2.5 * 8 得 16）。这类强度削弱 clang 自己会做，且知道类型，
+//! 所以变量参与的部分一律交回给 clang。
 //!
 //! 移位和位与通过内部函数 `__shl` / `__bitand` 表达，
 //! codegen 映射到 runtime 的 `lume_shl` / `lume_bitand`。
@@ -15,20 +18,12 @@ use crate::ast::*;
 /// 优化级别
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
-    /// 只优化字面量（绝对安全）
+    /// 只做绝对安全的字面量变换
     Safe,
-    /// 也优化 `Ident`（假设是整数）
+    /// 允许将来加入需要类型证明的变换。
+    /// 现在与 Safe 等价：变量参与的强度削弱已移除（AST 没有类型，
+    /// 无法区分 `int * 8` 和 `float * 8`）。
     Aggressive,
-}
-
-impl Default for Level {
-    fn default() -> Self {
-        Level::Aggressive
-    }
-}
-
-pub fn optimize(program: &mut Program) {
-    optimize_with(program, Level::default());
 }
 
 pub fn optimize_with(program: &mut Program, level: Level) {
@@ -146,7 +141,7 @@ fn rewrite(e: &Expr, level: Level) -> Option<Expr> {
     }
 }
 
-fn rewrite_binary(l: &Expr, op: &BinOp, r: &Expr, level: Level) -> Option<Expr> {
+fn rewrite_binary(l: &Expr, op: &BinOp, r: &Expr, _level: Level) -> Option<Expr> {
     // ── 常量折叠 ──
 
     // 整数比较 → Bool
@@ -191,33 +186,10 @@ fn rewrite_binary(l: &Expr, op: &BinOp, r: &Expr, level: Level) -> Option<Expr> 
     }
 
     // ── 强度削弱：乘以 2^n → 左移 ──
-
-    if let BinOp::Mul = op {
-        // x * 2^n → x << n
-        if let Expr::Int(n) = r {
-            if *n > 1 && (*n as u64).is_power_of_two() {
-                let shift = (*n as u64).trailing_zeros();
-                if shift <= 62 && should_optimize_operand(l, level) {
-                    return Some(make_shl(l.clone(), shift));
-                }
-            }
-            // x * 3/5/7/9/15/17/31/33 → 移位 + 加减
-            if should_optimize_operand(l, level) {
-                if let Some(repl) = strength_reduce_mul(l.clone(), *n) {
-                    return Some(repl);
-                }
-            }
-        }
-        // 2^n * x → x << n
-        if let Expr::Int(n) = l {
-            if *n > 1 && (*n as u64).is_power_of_two() {
-                let shift = (*n as u64).trailing_zeros();
-                if shift <= 62 && should_optimize_operand(r, level) {
-                    return Some(make_shl(r.clone(), shift));
-                }
-            }
-        }
-    }
+    //
+    // 只在**两边都是整数字面量**时成立；`x * 2^n` 里的 x 在 AST 层
+    // 没有类型（可能是 float），这里不碰，交给知道类型的 clang。
+    // 字面量乘法已经被上面的 fold_int 折叠，所以这一节没有实际分支。
 
     // ── 取模 2^n → 位与（仅非负字面量）──
     //    变量可能是负数（-7 % 8 = -7，-7 & 7 = 1），不安全。
@@ -244,53 +216,6 @@ fn rewrite_binary(l: &Expr, op: &BinOp, r: &Expr, level: Level) -> Option<Expr> 
     }
 
     None
-}
-
-/// 是否对这个操作数做强度削弱
-fn should_optimize_operand(e: &Expr, level: Level) -> bool {
-    match level {
-        Level::Safe => matches!(e, Expr::Int(_)),
-        // 只对字面量和标识符做。Call / Binary 可能是浮点，跳过。
-        Level::Aggressive => matches!(e, Expr::Int(_) | Expr::Ident(_)),
-    }
-}
-
-/// 构造 `__shl(x, n)`
-fn make_shl(x: Expr, shift: u32) -> Expr {
-    Expr::Call(
-        Box::new(Expr::Ident("__shl".into())),
-        vec![x, Expr::Int(shift as i64)],
-    )
-}
-
-/// `x * 3` 这类非 2 的幂 → `x + (x << 1)` 等
-fn strength_reduce_mul(x: Expr, n: i64) -> Option<Expr> {
-    if n <= 1 { return None; }
-    let n = n as u64;
-    if n.is_power_of_two() {
-        return None; // 已经在调用处处理
-    }
-
-    let x_box = Box::new(x.clone());
-    let shl = |s: u32| -> Box<Expr> {
-        Box::new(Expr::Call(
-            Box::new(Expr::Ident("__shl".into())),
-            vec![x.clone(), Expr::Int(s as i64)],
-        ))
-    };
-
-    let repl = match n {
-        3  => Expr::Binary(x_box, BinOp::Add, shl(1)),
-        5  => Expr::Binary(x_box, BinOp::Add, shl(2)),
-        7  => Expr::Binary(shl(3), BinOp::Sub, x_box),
-        9  => Expr::Binary(x_box, BinOp::Add, shl(3)),
-        15 => Expr::Binary(shl(4), BinOp::Sub, x_box),
-        17 => Expr::Binary(x_box, BinOp::Add, shl(4)),
-        31 => Expr::Binary(shl(5), BinOp::Sub, x_box),
-        33 => Expr::Binary(x_box, BinOp::Add, shl(5)),
-        _ => return None,
-    };
-    Some(repl)
 }
 
 fn fold_int(op: BinOp, a: i64, b: i64) -> Option<i64> {
