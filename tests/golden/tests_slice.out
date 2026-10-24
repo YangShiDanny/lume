@@ -1,0 +1,16 @@
+// 编译成功: tests_slice
+[sl] mid.len()=2  期望 2
+[sl] total(mid)=50  期望 50
+[sl] total(xs[2..])=120  期望 120
+[sl] total(xs[..2])=30  期望 30
+[sl] total(xs[0..=1])=30  期望 30
+[sl] total(xs[..3])=60  期望 60
+[sl] mid[0]=20  期望 20
+[sl] mid[1]=30  期望 30
+[sl] 改切片后 xs[1]=99  期望 99
+[sl] empty.len()=0  期望 0
+[sl] total(empty)=0  期望 0
+[sl] total(mid[0..1])=99  期望 99
+[sl] total(xs[1..][0..2])=129  期望 129
+[sl] 遍历 xs[3..]=90  期望 90
+[sl] names 切两段=bob,cyd  期望 bob,cyd

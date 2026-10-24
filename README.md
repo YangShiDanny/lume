@@ -76,6 +76,7 @@ cargo run -- build main.lume        # 只生成 main.c + 可执行文件
 | `--lto` | `-flto` |
 | `--fastmath` | `-ffast-math`（只影响 clang，编译器自身不做 fast-math 变换） |
 | `-O2` | 把默认的 `-O3` 降回去 |
+| `--unchecked` | 关掉 `a[i]` 的运行期边界检查（默认开） |
 
 Windows 上目前只能由用户手动跑（见 `run.bat`，走 WSL）。
 
@@ -110,14 +111,26 @@ VS Code 语法扩展位于 `vscode-extension/`，可在该目录打开后按 `F5
 
 ## 测试
 
-`main.lume` 是优化验证套件，32 项，每行末尾印期望值。跑：
-
 ```bash
-cargo run -- run main.lume
+bash scripts/run_tests.sh            # 全跑（CI 也跑这个）
+UPDATE=1 bash scripts/run_tests.sh   # 输出有意变了，重写 golden 基线
 ```
 
-WSL + clang -O3 实测全对。想加新优化，往 `main.lume` 里加一项、把期望值印在
-同行最省事。
+两类用例：
+
+- **正向**：`main.lume`（优化验证套件，33 项）+ `tests_*.lume`。
+  退出码必须 0，输出和 `tests/golden/<stem>.out` **逐字节**比对。
+  早先这些套件只把「期望值」印在 `say` 里靠人眼看，退出码永远 0 —— 值算错了照样绿；
+  现在值错了就 diff 不过，CI 也拦得住。
+- **负向**：`tests/fail/*.lume`，第一行 `// expect: <子串>` 声明期望的报错，
+  必须退出码非 0 且输出含该子串（越界、除零、未定义变量、`free` 误用等）。
+
+golden 只归一化两样真正随机的输出：各类耗时（`123 ns` → `<Ns>`）和并行 worker 的
+输出顺序。其余逐字节比对，别把归一化写宽。
+
+想加新特性：写 `tests_<feature>.lume`，它会自动被脚本收进来，然后
+`UPDATE=1` 生成基线。想加新优化项，往 `main.lume` 里加一项、把期望值印在同行，
+再更新 golden。
 
 ## 源码结构
 
@@ -160,3 +173,11 @@ src/
   （`fn_ret_types`），查不到才退回 `int64_t`。
 - `u1` / `u2` / `u4` / `u8` / `u16` / `u32` / `u64` / `u128` 是类型关键字
   （对应位宽的无符号整数），不能当变量名。
+- 返回数组的函数不能直接写在实参/表达式位置（`total(make3())` 会生成占位注释），
+  要先 `let r = make3()`；因此这类临时数组也没法 `free`。
+- `map` / `filter` / `reduce` 的方法体版本只支持局部数组源；struct 字段数组
+  （`map(arr, f)`，arr 是字段）还不支持。
+- 空 struct 的构造 `E()` 会被当成函数调用（需要至少一个字段）。
+- `free` 是手动所有权：别名重复 `free`、`free` 后继续使用都不做检查（和 C 一样）。
+  owned 跟踪是函数级、按变量名（不是块级）：嵌套块里 `free` 同名变量后，外层同名
+  变量的 `free` 会误报。

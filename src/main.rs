@@ -13,8 +13,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("用法:");
-        eprintln!("  lume build <file.lume> [--fastmath] [--native] [--lto] [-O2]");
-        eprintln!("  lume run   <file.lume> [--fastmath] [--native] [--lto] [-O2]");
+        eprintln!("  lume build <file.lume> [--fastmath] [--native] [--lto] [-O2] [--unchecked]");
+        eprintln!("  lume run   <file.lume> [--fastmath] [--native] [--lto] [-O2] [--unchecked]");
+        eprintln!("  --unchecked  关掉 a[i] 的运行期边界检查（默认开，热点内核才用）");
         std::process::exit(1);
     }
 
@@ -23,6 +24,7 @@ fn main() {
     opts.fastmath = args.iter().any(|a| a == "--fastmath");
     opts.native = args.iter().any(|a| a == "--native");
     opts.lto = args.iter().any(|a| a == "--lto");
+    opts.unchecked = args.iter().any(|a| a == "--unchecked");
     // 默认 -O3，可以显式降到 -O2
     if args.iter().any(|a| a == "-O2") {
         opts.opt = 2;

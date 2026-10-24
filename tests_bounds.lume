@@ -1,0 +1,76 @@
+// 数组下标边界检查（tests_bounds.lume）
+//
+// a[i] 在 C 里是裸指针运算，越界读写都不报错。现在编译期能定长时直接报错，
+// 定不了长就插 lume_idx_check。这个文件验证「界内不会被误伤」；
+// 越界必须崩的用例在 tests/fail/ 下（那些进程会 abort，不能混在这里跑）。
+
+fn first(a: [int]) -> int {
+    return a[0]
+}
+
+fn sum_all(a: [int]) -> int {
+    s := 0
+    i := 0
+    // while + 动态下标：clang 消不掉检查的那条路径
+    while i < a.len() {
+        s = s + a[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn last_or(a: [int], fallback: int) -> int {
+    if a.len() == 0 {
+        return fallback
+    }
+    return a[a.len() - 1]
+}
+
+struct Row {
+    k: int
+
+    fn pick(a: [int], i: int) -> int {
+        // 方法体里的下标也走同一条检查
+        return a[i] + 1
+    }
+}
+
+fn main() {
+    a := [10, 20, 30]
+
+    say("[bd] 常量下标 a[0]={a[0]} a[2]={a[2]}  期望 10 / 30")
+    say("[bd] a.len()={a.len()}  期望 3")
+
+    i := 2
+    say("[bd] 动态下标 a[i]={a[i]}  期望 30")
+
+    // 每次迭代都检查，界内不能误伤
+    say("[bd] while 求和={sum_all(a)}  期望 60")
+
+    // 数组参数：长度由伴随参数带进来
+    say("[bd] 参数首元素={first(a)}  期望 10")
+    say("[bd] 参数末元素={last_or(a, -1)}  期望 30")
+
+    // a[a.len() - 1] 这种算出来的下标
+    empty := [0; 1]
+    say("[bd] 单元素数组 last_or={last_or(empty, -1)}  期望 0")
+
+    // 切片长度收窄后，检查用的是切片的长度
+    s := a[1..]
+    say("[bd] 切片 s[0]={s[0]} s[1]={s[1]}  期望 20 / 30")
+
+    // 结构体方法里
+    row := Row(k: 1)
+    say("[bd] 方法体 a[1]+1={row.pick(a, 1)}  期望 21")
+
+    // 循环变量直接当下标（最常见的写法）
+    total := 0
+    for k in 0..a.len() {
+        total = total + a[k]
+    }
+    say("[bd] for + a[k] 求和={total}  期望 60")
+
+    // 下标是算出来的
+    base := 1
+    say("[bd] 运算下标 a[base * 2 - 1]={a[base * 2 - 1]}  期望 20")
+}

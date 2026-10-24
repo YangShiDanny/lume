@@ -2,7 +2,7 @@
   "name": "lume-language-support",
   "displayName": "Lume Language Support",
   "description": "Syntax highlighting and file icons for the Lume programming language.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "lume-language",
   "license": "MIT",
   "repository": {

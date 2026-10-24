@@ -1,0 +1,7 @@
+// expect: index 10 out of range
+// a[i] 的运行期边界检查：变量下标，编译期算不出来 → lume_idx_check abort
+fn main() {
+    a := [1, 2, 3]
+    i := 10
+    say("越界读={a[i]}")
+}

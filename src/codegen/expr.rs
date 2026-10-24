@@ -402,6 +402,7 @@ impl Codegen {
                     Some(s) => s,
                     None => self.gen_expr(idx),
                 };
+                let i = self.checked_index(obj, idx, i);
                 format!("{}[{}]", o, i)
             }
 
@@ -489,7 +490,35 @@ impl Codegen {
         ])
     }
 
-/// 数组实参的长度表达式。
+    /// `a[i]` 下标位置的 C 表达式（含边界处理）。
+    ///
+    /// 三种情况：
+    ///   - 长度和下标都是编译期常量 → 越界直接报编译错误，界内裸写 `a[k]`
+    ///   - 长度已知（局部数组 / 数组参数 / 切片）→ `a[lume_idx_check(i, len)]`
+    ///   - 长度未知（函数返回值、struct 字段数组）→ 原样 `a[i]`
+    pub(crate) fn checked_index(&mut self, obj: &Expr, idx: &Expr, i: String) -> String {
+        let len = match self.array_len_of(obj) {
+            Some(l) => l,
+            None => return i,
+        };
+        // array_len_of 给字面量长度时带 LL 后缀（"5LL"）
+        let len_const = len.strip_suffix("LL").and_then(|s| s.parse::<i64>().ok());
+        if let (Some(n), Expr::Int(k)) = (len_const, idx) {
+            if *k < 0 || *k >= n {
+                self.codegen_errors.push(format!(
+                    "下标越界：对长度 {} 的{}取下标 {}",
+                    n, describe_array(obj), k
+                ));
+            }
+            return i;
+        }
+        if !self.bounds_check {
+            return i;
+        }
+        format!("lume_idx_check({}, {})", i, len)
+    }
+
+    /// 数组实参的长度表达式。
     /// 数组变量查 array_len_exprs；数组字面量直接用元素个数
     /// （C99 复合字面量的生命周期覆盖整次调用，作为实参是安全的）。
     pub(crate) fn array_len_of(&self, expr: &Expr) -> Option<String> {
@@ -1002,6 +1031,12 @@ impl Codegen {
                     if name == "free" {
                         return self.gen_free(args);
                     }
+                    // reduce 返回标量，可在方法体表达式位置内联
+                    if name == "reduce" {
+                        if let Some(c) = self.gen_reduce_call(expr) {
+                            return c;
+                        }
+                    }
                 }
                 // now
                 if let Expr::Ident(name) = callee.as_ref() {
@@ -1205,6 +1240,7 @@ impl Codegen {
                     Some(s) => s,
                     None => self.gen_expr_with_self(idx, fields),
                 };
+                let i = self.checked_index(obj, idx, i);
                 format!("{}[{}]", o, i)
             }
 
@@ -1275,6 +1311,16 @@ fn gen_index(idx: &Expr) -> Option<String> {
     match idx {
         Expr::Int(n) => Some(format!("{}", n)),
         _ => None,
+    }
+}
+
+/// 报错时说清是哪个数组：`a[10]` 比「某个数组取下标 10」好查。
+fn describe_array(obj: &Expr) -> String {
+    match obj {
+        Expr::Ident(n) => format!("数组 `{}` ", n),
+        Expr::List(_) => "数组字面量 ".to_string(),
+        Expr::Repeat(_, _) => "重复数组字面量 ".to_string(),
+        _ => "数组 ".to_string(),
     }
 }
 

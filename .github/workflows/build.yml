@@ -8,7 +8,26 @@ on:
   workflow_dispatch:
 
 jobs:
+  # 测试先跑：.lume 套件不过就不该出包。
+  # 以前 CI 只 cargo build，四个测试套件一次都没在这里跑过。
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Run .lume test suites
+        run: bash scripts/run_tests.sh
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:

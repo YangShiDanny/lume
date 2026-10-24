@@ -1,12 +1,28 @@
 target/
 .lume_cache/
+
+# lume 把生成的 C 和可执行文件写在 CWD（cli.rs::output_c_path 只用文件名，不带目录），
+# 所以文件名 = 源文件 stem。这里按已知的源文件逐个忽略。
+# 调试用的临时文件一律放 .workbuddy/scratch/，不要留在仓库根。
 main.c
 main
-main.exe
 output.c
 output
-output.exe
 _precompute_*
+tests_*.c
+tests_optional
+tests_slice
+tests_pipe
+tests_bounds
+print_1_100.c
+print_1_100
+*.exe
+
+*.o
+*.dylib
+*.so
+*.dll
+
 .vscode/
 !vscode-extension/.vscode/
 !vscode-extension/.vscode/launch.json
@@ -15,21 +31,13 @@ vscode-extension/*.vsix
 *.swp
 .DS_Store
 Thumbs.db
+
+# 本地工作区（memory + scratch 临时文件）
 .workbuddy/
+
+# 只在本地留着的笔记/素材
 Lume vs Fortran.md
-test_opt.c
-test_opt.lume
 未来优化方向.md
-Cargo.lock
 _*
 lume gen by user.svg
 Lume icon.jpg
-# 测试生成的 C（源文件 tests_*.lume 要提交）
-tests_*.c
-
-# Lume generated executables (sources are tests_*.lume / benchmarks/*.lume)
-print_1_100
-print_1_100.c
-tests_optional
-tests_slice
-tests_pipe

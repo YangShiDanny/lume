@@ -7,6 +7,14 @@ fn sq(x: int) -> int {
     return x * x
 }
 
+fn even_bool(x: int) -> bool {
+    return x % 2 == 0
+}
+
+fn sum2(a: int, x: int) -> int {
+    return a + x
+}
+
 // ── 前向声明：main 在它前面，调用没问题 ──
 fn later(x: int) -> int {
     return x * 3
@@ -46,6 +54,21 @@ fn is_odd(n: int) -> int {
 }
 
 // ── 数组参数（自动带 restrict）──
+
+struct ArrBox {
+    k: int
+
+    // 方法体里的 map / filter / reduce + free（曾经生成非法 C）
+    fn hofs() -> int {
+        xs := [1, 2, 3, 4]
+        ys := map(xs, sq)
+        zs := filter(xs, even_bool)
+        n := ys.len() + zs.len() + reduce(xs, sum2, 0)
+        free(ys)
+        free(zs)
+        return n
+    }
+}
 
 struct LimbProbe {
     limbs: [int; 4]
@@ -562,6 +585,10 @@ fn main() {
         free(tmp)
     }
     say("[32] free owned array={free_total}  期望 199990000")
+
+    // 33. 方法体里的 HOF：map / filter / reduce + free
+    ab := ArrBox(k: 1)
+    say("[33] method HOFs={ab.hofs()}  期望 4 + 2 + 10 = 16")
 
     say("===== 完成 =====")
 }

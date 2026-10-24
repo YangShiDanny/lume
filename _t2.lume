@@ -1,4 +1,0 @@
-fn f(v: int) -> int {
-    return if v < 0 { 1 } else if v > 5 { 2 } else { 3 }
-}
-fn main() { say("{f(-1)}") }

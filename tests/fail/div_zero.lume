@@ -1,0 +1,6 @@
+// expect: division by zero
+// 运行期除零检查
+fn main() {
+    z := 0
+    say("1/z={1 / z}")
+}

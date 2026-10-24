@@ -210,9 +210,14 @@ impl Codegen {
             .map(|f| f.iter().map(|(n, _)| n.clone()).collect())
             .unwrap_or_default();
 
+        let saved_bounds = self.bounds_check;
+        if m.decorators.iter().any(|d| d.name == "unchecked") {
+            self.bounds_check = false;
+        }
         for stmt in &m.body.stmts {
             self.gen_stmt_with_self(stmt, &field_names);
         }
+        self.bounds_check = saved_bounds;
 
         self.indent -= 1;
         self.push_line("}");
@@ -286,14 +291,20 @@ impl Codegen {
             self.push_line("/*__LUME_LOG_INIT__*/");
         }
 
+        // @unchecked：这个函数的 a[i] 不插边界检查。只该用在已经手工
+        // 验证过下标、且被边界分支拖慢的热点内核上。
+        let saved_bounds = self.bounds_check;
+        if f.decorators.iter().any(|d| d.name == "unchecked") {
+            self.bounds_check = false;
+        }
         for stmt in &f.body.stmts {
             self.gen_stmt(stmt);
         }
+        self.bounds_check = saved_bounds;
 
         if is_main {
             self.push_line("return 0;");
         }
-
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');

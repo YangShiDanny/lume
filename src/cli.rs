@@ -19,11 +19,14 @@ pub struct Opts {
     pub native: bool,
     pub lto: bool,
     pub opt: u8,
+    /// 关掉 a[i] 的运行期边界检查（默认开）。
+    /// 只给已经手工验证过下标的热点内核用；单个函数可以写 @unchecked。
+    pub unchecked: bool,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { fastmath: false, native: false, lto: false, opt: 3 }
+        Self { fastmath: false, native: false, lto: false, opt: 3, unchecked: false }
     }
 }
 
@@ -142,6 +145,7 @@ pub fn compile_to_c(program: &crate::ast::Program, opts: &Opts) -> String {
     }
 
     let mut codegen = Codegen::new();
+    codegen.set_bounds_check(!opts.unchecked);
     for (name, table) in precomputed {
         codegen.set_precomputed(name, table);
     }

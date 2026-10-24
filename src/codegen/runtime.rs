@@ -517,6 +517,26 @@ static inline int64_t lume_checked_mod_i64(int64_t a, int64_t b) {
     return a % b;
 }
 
+/* ── 数组下标检查 ── */
+/* a[i] 在 C 里是裸的指针运算：越界读拿到垃圾值、越界写静默踩内存，
+   两边都不报错。和切片/除零一样，崩得明明白白好过静默算错。
+   返回 i 本身，所以能直接塞进下标位置，读写两条路径都覆盖
+   （赋值语句也是走 gen_expr(target) 生成的）。
+   长度只在编译期能确定时才插检查：局部字面量、数组参数、切片。
+   函数返回值/struct 字段数组拿不到长度，仍然不检查。
+   热点循环里 clang 通常能证明 i < len 从而消掉这个分支；
+   消不掉又不想付代价的，用 @unchecked 或 --unchecked。 */
+static inline int64_t lume_idx_check(int64_t i, int64_t len) {
+    /* 一次比较同时挡负数：转成无符号后负数必然 >= len */
+    if ((uint64_t)i >= (uint64_t)len) {
+        fprintf(stderr,
+                "lume: runtime error: index %lld out of range (len=%lld)\n",
+                (long long)i, (long long)len);
+        abort();
+    }
+    return i;
+}
+
 /* ── 切片边界检查 ── */
 /* a[i..j] 生成 (a + off, len) 两个值。越界在 C 里是静默的越界读写，
    编译期能算出来的（都是字面量）checker 直接报错，这里兜运行期变量。

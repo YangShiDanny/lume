@@ -198,6 +198,14 @@ impl Codegen {
                     }
                     return;
                 }
+                // 方法体里的 map / filter（以前漏了这一步，会生成
+                // `int64_t ys = map(xs, f);` 这种非法 C）
+                if let Some(lines) = self.gen_hof_let(name, init) {
+                    for l in lines {
+                        self.push_line(&l);
+                    }
+                    return;
+                }
                 if let Some(lines) = self.gen_slice_let(name, init, Some(fields)) {
                     for l in lines {
                         self.push_line(&l);

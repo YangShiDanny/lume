@@ -101,6 +101,21 @@
 - [x] `INT64_MIN / -1` 溢出是 UB —— 已修：`lume_checked_div_i64` 内置 `a == INT64_MIN && b == -1` 检查，abort；`lume_checked_mod_i64` 同条件返回 0（C99 下 UB，数学余数 0）
 - [x] 数组不能跨函数传 —— 已修：隐式伴随长度参数 + 数组返回 malloc 拷贝
 - [x] `nums.len()` 对数组参数返回不存在的 `nums_len` —— 已修：数组参数登记 array_len_exprs
+- [x] 方法体里的 `map` / `filter` / `reduce` 生成非法 C —— 已修：`gen_stmt_with_self` 接上
+  `gen_hof_let`，`gen_expr_with_self` 补 `reduce`；测试 `main.lume` [33]
+- [x] **`a[i]` 越界静默读写内存** —— 已修：长度能编译期确定时插 `lume_idx_check`
+  （`fprintf + abort`），长度和下标都是常量时直接报编译错；`@unchecked` / `--unchecked`
+  可关。struct 字段数组和函数返回数组的长度还拿不到，仍不检查。测试 `tests_bounds.lume` +
+  `tests/fail/index_oob_*.lume`
+- [x] **测试没有断言** —— 已修：`scripts/run_tests.sh` + `tests/golden/*.out` 逐字节比对
+  （只归一化耗时和 worker 顺序），`tests/fail/` 放必须报错的用例
+- [x] **CI 不跑测试** —— 已修：`build.yml` 加 `test` job，`build` 依赖它
+- [ ] 返回数组的调用不能出现在实参/表达式位置（`total(make3())`）—— 需要语句级临时提升
+- [ ] `map`/`filter` 的源不能是 struct 字段数组
+- [ ] 空 struct 构造 `E()` 被当成函数调用
+- [ ] checker 的错误没有行号列号（`CheckError` 只有 msg/hint）—— 要大改，先记着
+- [ ] codegen 的「暂不支持」以 `/* 注释 */` 降级，靠 clang 兜底报错且指向 .c —— 应改成
+  `codegen_errors` 硬报错（`free` 误用已经是这么做的）
 - [x] 浮点 `x * 2^n` 被强度削弱成整数移位（`2.5 * 8` 得 16）—— 已修：AST 没有类型信息，
   `optimize.rs` 不再对 `Expr::Ident` 做乘法强度削弱，交给知道类型的 clang
 - [x] `LUME_OPT=safe` 无效 —— 已修：`cli.rs` 以前先无条件跑 Aggressive 再按 env 跑第二遍，

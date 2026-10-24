@@ -47,6 +47,8 @@ pub struct Codegen {
     // codegen 阶段的安全错误（目前只有 free 误用）。生成结束后以 #error 形式
     // 插到 C 文件开头，让 clang 带着可读信息失败。
     pub(crate) codegen_errors: Vec<String>,
+    // a[i] 的运行期边界检查（默认开）。见 set_bounds_check。
+    pub(crate) bounds_check: bool,
     // 会在 par for 里被调用到的 @cache 函数。这些必须用带锁的包装器，
     // 否则多个 worker 并发读写同一个全局哈希表（realloc 时直接崩）。
     pub(crate) thread_safe_cached: HashSet<String>,
@@ -114,6 +116,7 @@ impl Codegen {
             owned_arrays: HashSet::new(),
             owned_return_fns: HashSet::new(),
             codegen_errors: Vec::new(),
+            bounds_check: true,
             thread_safe_cached: HashSet::new(),
             precomputed: HashMap::new(),
             generic_fns: HashMap::new(),
@@ -144,6 +147,13 @@ impl Codegen {
 
     pub fn set_precomputed(&mut self, name: String, table: Vec<i64>) {
         self.precomputed.insert(name, table);
+    }
+
+    /// a[i] 的运行期边界检查开关（默认开）。
+    /// 关掉之后越界又会回到静默读写内存，只给手工验证过的热点内核用；
+    /// 单个函数可以用 `@unchecked` 关，不必整份文件关。
+    pub fn set_bounds_check(&mut self, on: bool) {
+        self.bounds_check = on;
     }
 
     pub fn generate(&mut self, program: &Program) -> String {

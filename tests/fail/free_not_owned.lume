@@ -1,0 +1,7 @@
+// expect: 不安全
+// free 只能作用于函数/map/filter 新建的堆数组
+fn main() {
+    a := [1, 2, 3]
+    free(a)
+    say("done")
+}

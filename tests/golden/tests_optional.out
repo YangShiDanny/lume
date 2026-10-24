@@ -1,0 +1,9 @@
+// 编译成功: tests_optional
+[opt] a val=42  期望 42
+[opt] b 是 None  期望 None
+[opt] c val=10  期望 10
+[opt] d 是 None  期望 None
+[opt] e val=43  期望 43
+[opt] f 是 None（? 传播生效）  期望 None
+[opt] g 是 None（传播穿透）  期望 None
+[opt] h bang=42  期望 42

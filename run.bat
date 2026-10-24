@@ -6,11 +6,11 @@ set WIN_DIR=/mnt/e/TUAN2/LANGUAGE/lume
 set WSL_DIR=~/projects/lume
 set DISTRO=Ubuntu
 
-REM 要跑的测试。每个都会 lume run <file>，一路串行跑完。
-REM 想临时只测一个，把 TESTS 改成只留那一项。
-set TESTS=main.lume tests_optional.lume tests_slice.lume tests_pipe.lume
-
-REM ==================
+REM 测试由 scripts/run_tests.sh 驱动（WSL 里跑）：
+REM   - 正向：main.lume + tests_*.lume，输出逐字节比对 tests/golden/
+REM   - 负向：tests/fail/*.lume，必须按预期报错
+REM 输出有意变了（比如改了期望值）之后，用 UPDATE=1 重写基线：
+REM   wsl -d Ubuntu bash -lc "cd ~/projects/lume && UPDATE=1 bash scripts/run_tests.sh"
 
 echo [1/3] Syncing %WIN_DIR% to WSL:%WSL_DIR%
 
@@ -23,14 +23,10 @@ if errorlevel 1 (
 )
 
 echo [2/3] Running tests
-for %%F in (%TESTS%) do (
-    echo.
-    echo ---------------- %%F ----------------
-    wsl -d %DISTRO% bash -lc "cd %WSL_DIR% && cargo run --quiet -- run %%F"
-    if errorlevel 1 (
-        echo [ERROR] %%F failed
-        exit /b 1
-    )
+wsl -d %DISTRO% bash -lc "cd %WSL_DIR% && bash scripts/run_tests.sh"
+if errorlevel 1 (
+    echo [ERROR] tests failed
+    exit /b 1
 )
 
 echo [3/3] Done
