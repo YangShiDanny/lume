@@ -25,11 +25,36 @@ impl Codegen {
                     return;
                 }
 
+                // 管道融合：xs |> map(f) |> map(g) 编译成单个循环
+                if let Some(lines) = self.gen_fused_pipe_let(name, init, None) {
+                    for l in lines {
+                        self.push_line(&l);
+                    }
+                    return;
+                }
+
+                // 数组高阶内置直调：let r = map(xs, f) / filter(xs, p)
+                if let Some(lines) = self.gen_hof_let(name, init) {
+                    for l in lines {
+                        self.push_line(&l);
+                    }
+                    return;
+                }
+
                 // 切片：同样要拆行（指针 + 长度两个值）
                 if let Some(lines) = self.gen_slice_let(name, init, None) {
                     for l in lines {
                         self.push_line(&l);
                     }
+                    return;
+                }
+
+                if let Some((elem_ty, len)) =
+                    self.gen_repeat_array_init(name, ty.as_ref(), init, None)
+                {
+                    self.array_len_exprs.insert(name.clone(), format!("{}LL", len));
+                    self.array_elem_types.insert(name.clone(), elem_ty.clone());
+                    self.var_types.insert(name.clone(), format!("{}*", elem_ty));
                     return;
                 }
 
@@ -154,10 +179,25 @@ impl Codegen {
                     }
                     return;
                 }
+                if let Some(lines) = self.gen_fused_pipe_let(name, init, Some(fields)) {
+                    for l in lines {
+                        self.push_line(&l);
+                    }
+                    return;
+                }
                 if let Some(lines) = self.gen_slice_let(name, init, Some(fields)) {
                     for l in lines {
                         self.push_line(&l);
                     }
+                    return;
+                }
+
+                if let Some((elem_ty, len)) =
+                    self.gen_repeat_array_init(name, ty.as_ref(), init, Some(fields))
+                {
+                    self.array_len_exprs.insert(name.clone(), format!("{}LL", len));
+                    self.array_elem_types.insert(name.clone(), elem_ty.clone());
+                    self.var_types.insert(name.clone(), format!("{}*", elem_ty));
                     return;
                 }
 
@@ -317,7 +357,11 @@ impl Codegen {
                 let base = self.gen_expr(obj);
                 let (s, e, base_len) =
                     self.slice_bounds(obj, start, end, *inclusive);
-                let elem_ty = self.infer_type(obj);
+                let base_ty = self.infer_type(obj);
+                let elem_ty = base_ty
+                    .strip_suffix('*')
+                    .unwrap_or(&base_ty)
+                    .to_string();
                 let ptr = format!(
                     "({} + lume_slice_off({}, {}, {}, {}))",
                     base, base, s, e, base_len

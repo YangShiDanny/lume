@@ -10,16 +10,7 @@ impl Codegen {
 
     fn push_fastmath(&mut self, f: &FnDecl) {
         if Self::has_fastmath(f) {
-            self.push_line("#pragma clang fp push");
-            self.push_line("#pragma clang fp reassociate(on)");
             self.push_line("#pragma clang fp contract(fast)");
-            self.push_line("#pragma clang fp reciprocal(on)");
-        }
-    }
-
-    fn pop_fastmath(&mut self, f: &FnDecl) {
-        if Self::has_fastmath(f) {
-            self.push_line("#pragma clang fp pop");
         }
     }
 
@@ -220,7 +211,6 @@ impl Codegen {
             self.gen_stmt_with_self(stmt, &field_names);
         }
 
-        self.pop_fastmath(m);
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');
@@ -297,7 +287,6 @@ impl Codegen {
             self.push_line("return 0;");
         }
 
-        self.pop_fastmath(f);
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');
@@ -367,7 +356,6 @@ impl Codegen {
             self.gen_stmt(stmt);
         }
 
-        self.pop_fastmath(f);
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');
@@ -902,7 +890,6 @@ impl Codegen {
             self.gen_stmt(stmt);
         }
 
-        self.pop_fastmath(f);
         self.indent -= 1;
         self.push_line("}");
         self.output.push('\n');

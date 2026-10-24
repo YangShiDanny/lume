@@ -2,6 +2,7 @@
 mod expr;
 mod items;
 mod parallel;
+mod pipe;
 mod purity;
 mod runtime;
 mod say;
@@ -41,6 +42,12 @@ pub struct Codegen {
     pub(crate) generic_fns: HashMap<String, FnDecl>,
     // 普通函数的返回类型（供插值/类型推断用，见 generate 步骤 2.4）
     pub(crate) fn_ret_types: HashMap<String, String>,
+    // 函数名 → 每个参数的 C 类型。管道融合校验 f 的入参类型时用
+    // （见 codegen/pipe.rs 的 fusion_plan）。
+    pub(crate) fn_param_types: HashMap<String, Vec<String>>,
+    // 临时变量序号。同一作用域里出现两次的临时名（_pk / _pi / _pc / _acc）
+    // 必须带序号，否则 C 报 redeclaration。见 codegen/pipe.rs。
+    pub(crate) tmp_counter: u32,
     // 函数名 → 每个参数是不是数组（调用点据此补长度实参）
     pub(crate) fn_array_params: HashMap<String, Vec<bool>>,
     // 函数名 → 参数名表。命名参数调用 f(a: 1) 的重排依据
@@ -73,6 +80,7 @@ pub struct Codegen {
     pub(crate) match_val_member: Option<String>,
 
     pub(crate) non_neg_vars: std::collections::HashSet<String>,
+    pub(crate) repeat_counter: usize,
 }
 
 impl Codegen {
@@ -91,6 +99,8 @@ impl Codegen {
             precomputed: HashMap::new(),
             generic_fns: HashMap::new(),
             fn_ret_types: HashMap::new(),
+            tmp_counter: 0,
+            fn_param_types: HashMap::new(),
             fn_array_params: HashMap::new(),
             fn_param_names: HashMap::new(),
             fn_param_defaults: HashMap::new(),
@@ -102,6 +112,7 @@ impl Codegen {
             par_workers: String::new(),
             par_scalars: Vec::new(),
             non_neg_vars: std::collections::HashSet::new(),
+            repeat_counter: 0,
             cur_ret_is_array: false,
             cur_ret_c: String::new(),
             opt_names: RefCell::new(HashMap::new()),
@@ -169,6 +180,17 @@ impl Codegen {
                     Some(t) => self.gen_type(t),
                 };
                 self.fn_ret_types.insert(f.name.clone(), ret);
+                // 参数类型表：管道融合要校验 f 的入参类型接不接得上
+                self.fn_param_types.insert(
+                    f.name.clone(),
+                    f.params
+                        .iter()
+                        .map(|p| match &p.ty {
+                            Some(t) => self.gen_type(t),
+                            None => "int64_t".to_string(),
+                        })
+                        .collect(),
+                );
                 self.fn_array_params.insert(
                     f.name.clone(),
                     f.params.iter().map(|p| is_array_ty(&p.ty)).collect(),

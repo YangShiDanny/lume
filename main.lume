@@ -124,6 +124,10 @@ fn passthru(a: [int]) -> [int] {
     return a
 }
 
+fn repeat_values() -> [int] {
+    return [9; 3]
+}
+
 // ── @cache：运行时记忆化，哈希表 O(1) ──
 @cache
 fn csteps(n: int) -> int {
@@ -326,6 +330,18 @@ fn main() {
     bs := par_sum(big, 1500)
     say("[9d] 1500 个 1 并行求和={bs}                      期望 1500（大于就说明边界重复执行）")
 
+    // else 分支里的归约也必须落到 worker 的私有累加器
+    branch_values := [1; 1500]
+    branch_total := 0
+    par for i in 0..1500 {
+        if i % 2 == 0 {
+            branch_total += branch_values[i]
+        } else {
+            branch_total += branch_values[i] * 2
+        }
+    }
+    say("[9f] 条件归约={branch_total}                      期望 2250")
+
     // 9e. 循环体读只读外层标量：k 要按值传进 worker（以前生成编译不过的 C）
     yk := [1.0, 2.0, 3.0, 4.0]
     yo := [0.0, 0.0, 0.0, 0.0]
@@ -437,14 +453,27 @@ fn main() {
     q2 := 100 % 7
     q3 := 17 / 5
     say("[22] 100/4={q1} 100%7={q2} 17/5={q3}     期望 25 / 2 / 3")
+    generic_float_zero := maxv(1.5, 4.25) / 0
+    say("[22b] 泛型浮点除零={generic_float_zero}     期望 inf")
 
     // 23. BigInt 前置：定长数组字段、重复初始化和不换行输出
     zeros := [0; 4]
-    probe := LimbProbe(limbs: [0; 4])
+    filled := [7; 4]
+    fractions := [1.5; 3]
+    byte_marks: [u8; 4] = [7; 4]
+    byte_ones: [u8; 4] = [1; 4]
+    flags := [true; 3]
+    probe := LimbProbe(limbs: [6; 4])
     probe.limbs[0] = 42
-    write("[23] repeat={zeros[0]} len={zeros.len} struct={probe.limbs[0]}")
+    repeated_sum := total([7; 4])
+    repeated_return := repeat_values()
+    write("[23] zero={zeros[0]} len={zeros.len} nonzero={filled[0]}/{filled[3]} ")
+    write("float={fractions[0]}/{fractions[2]} struct={probe.limbs[0]}/{probe.limbs[1]}")
+    write(" byte={byte_marks[0]}/{byte_marks[3]} ones={byte_ones[0]}/{byte_ones[3]} ")
+    write("flags={flags[0]}/{flags[2]}")
     write(" +continued")
-    say(" 期望 0 / 4 / 42，write 之间不换行")
+    say(" sum={repeated_sum} return={repeated_return.len}/{repeated_return[2]}")
+    say(" 期望 0 / 4 / 7/7 / 1.5/1.5 / 42/6 / 7/7 / 1/1 / true/true / 28 / 3/9")
 
     // 24. 默认参数 + 命名参数：c 省略时用默认值 10；命名参数按名字重排
     say("[24] add3(1,2)={add3(1, 2)} add3(1,2,3)={add3(1, 2, 3)}     期望 13 / 6")

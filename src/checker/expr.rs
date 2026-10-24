@@ -56,12 +56,13 @@ impl Checker {
             Expr::Binary(l, op, r) => {
                 let lt = self.check_expr(l);
                 let rt = self.check_expr(r);
-                // 编译期除零：整数字面量 0 作除数/模数直接拒编译。
+                // 编译期除零：已知整数左操作数配整数字面量 0 时拒编译。
+                // 类型未知时不猜测整数，避免误拒泛型推导出的浮点表达式。
                 // 浮点除零是 IEEE 语义（inf），合法；变量的情况运行时
                 // 兜底（lume_checked_div_i64 / lume_checked_mod_i64）。
                 if matches!(op, BinOp::Div | BinOp::Mod) {
                     if let Expr::Int(0) = r.as_ref() {
-                        if lt == Ty::Int || lt.is_unknown() {
+                        if lt == Ty::Int {
                             let what = match op {
                                 BinOp::Div => "division",
                                 _ => "modulo",
@@ -115,9 +116,18 @@ impl Checker {
                     }
                 }
 
-                // 内置
-                if let Expr::Ident(name) = callee.as_ref() {
-                    if is_builtin(name) {
+// 数组高阶内置：map / filter / reduce。
+            // 管道融合（`xs |> map(f) |> map(g)` 编译成单个 for 循环）
+            // 的类型基础，见 codegen/pipe.rs。
+            if let Expr::Ident(name) = callee.as_ref() {
+                if let Some(ty) = self.check_array_hof(name, args) {
+                    return ty;
+                }
+            }
+
+            // 内置
+            if let Expr::Ident(name) = callee.as_ref() {
+                if is_builtin(name) {
                         for a in args {
                             let _ = self.check_expr(a);
                         }
@@ -589,5 +599,162 @@ impl Checker {
                 sig.ret.clone()
             }
         }
+    }
+
+    /// map / filter / reduce 的类型检查。不是这三个函数就返回 None。
+    ///
+    /// 语义：
+    ///   map(xs, f)     → [T]，长度同 xs
+    ///   filter(xs, f)  → [T]，长度 ≤ xs（运行期才知道）
+    ///   reduce(xs, f, init) → f 的返回类型
+    fn check_array_hof(&mut self, name: &str, args: &[Expr]) -> Option<Ty> {
+        let want = match name {
+            "map" => 2,
+            "filter" => 2,
+            "reduce" => 3,
+            _ => return None,
+        };
+        if args.len() != want {
+            self.error_hint(
+                format!("{} 需要 {} 个参数，但传了 {} 个", name, want, args.len()),
+                match name {
+                    "reduce" => "reduce(数组, 函数, 初始值)".to_string(),
+                    "filter" => "filter(数组, 谓词)".to_string(),
+                    _ => "map(数组, 函数)".to_string(),
+                },
+            );
+            for a in args {
+                let _ = self.check_expr(a);
+            }
+            return Some(Ty::Unknown);
+        }
+
+        // 第 1 个参数必须是数组
+        let arr_ty = self.check_expr(&args[0]);
+        // 空数组字面量 `[]` 推不出元素类型，别让它走到 codegen
+        // 生成 `map({}, f)` 这种非法 C
+        if let Expr::List(items) = &args[0] {
+            if items.is_empty() {
+                self.error_hint(
+                    format!("{} 的第 1 个参数是空数组，元素类型未知", name),
+                    "空数组请先给元素类型，比如 `es: [int] = []`".to_string(),
+                );
+                return Some(Ty::Unknown);
+            }
+        }
+        let elem = match &arr_ty {
+            Ty::Array(inner) => (**inner).clone(),
+            _ => {
+                if !arr_ty.is_unknown() {
+                    self.error_hint(
+                        format!(
+                            "{} 的第 1 个参数必须是数组，但得到 {}",
+                            name,
+                            arr_ty.name()
+                        ),
+                        "改成对数组调用".to_string(),
+                    );
+                }
+                Ty::Int
+            }
+        };
+
+        // 第 2 个参数必须是用户函数（map/reduce 取其返回类型，filter 取 bool）
+        let fname = match &args[1] {
+            Expr::Ident(f) => f.clone(),
+            other => {
+                self.error_hint(
+                    format!(
+                        "{} 的第 2 个参数必须是函数名，但得到 {}",
+                        name,
+                        describe_expr(other)
+                    ),
+                    "先定义这个函数，再传函数名（不带括号）".to_string(),
+                );
+                let _ = self.check_expr(other);
+                return Some(match name {
+                    "reduce" => Ty::Int,
+                    _ => Ty::Array(Box::new(elem)),
+                });
+            }
+        };
+        let sig = match self.functions.get(&fname).cloned() {
+            Some(s) => s,
+            None => {
+                self.error_hint(
+                    format!("未定义的函数 '{}'", fname),
+                    "先定义这个函数，或检查拼写".to_string(),
+                );
+                return Some(match name {
+                    "reduce" => Ty::Int,
+                    _ => Ty::Array(Box::new(elem)),
+                });
+            }
+        };
+        // map 的函数至少要 1 个参数（元素），reduce 要 2 个（累加器 + 元素）
+        let want_params = if name == "reduce" { 2 } else { 1 };
+        if sig.params.len() < want_params {
+            self.error_hint(
+                format!(
+                    "{} 的函数 '{}' 至少需要 {} 个参数，但只有 {} 个",
+                    name,
+                    fname,
+                    want_params,
+                    sig.params.len()
+                ),
+                format!(
+                    "{} 的第一个参数是{}",
+                    fname,
+                    if name == "reduce" { "累加器" } else { "元素" }
+                ),
+            );
+        }
+        if name == "filter" && sig.ret != Ty::Bool && sig.ret != Ty::Unknown {
+            self.error_hint(
+                format!(
+                    "filter 的谓词 '{}' 必须返回 bool，但返回 {}",
+                    fname,
+                    sig.ret.name()
+                ),
+                "让谓词返回 true / false".to_string(),
+            );
+        }
+
+        if name == "reduce" {
+            // 初始值类型要对得上累加器参数
+            let init_ty = self.check_expr(&args[2]);
+            if let Some(first) = sig.params.first() {
+                if !init_ty.is_unknown()
+                    && !first.is_unknown()
+                    && &init_ty != first
+                {
+                    self.error_hint(
+                        format!(
+                            "reduce 的初始值类型不匹配：累加器是 {}，初始值是 {}",
+                            first.name(),
+                            init_ty.name()
+                        ),
+                        format!("把初始值改成 {}", first.name()),
+                    );
+                }
+            }
+            return Some(sig.ret.clone());
+        }
+
+        // map 的返回类型 = 元素类型或函数的返回类型
+        // （只做管道融合的场景下 f(T)->U；codegen 会检查得更细）
+        Some(Ty::Array(Box::new(elem)))
+    }
+}
+
+fn describe_expr(e: &Expr) -> String {
+    match e {
+        Expr::Ident(n) => n.clone(),
+        Expr::Call(c, _) => format!("函数调用 {}", describe_expr(c)),
+        Expr::Int(n) => format!("整数 {}", n),
+        Expr::Float(_) => "浮点数".to_string(),
+        Expr::Str(_) => "字符串".to_string(),
+        Expr::List(_) => "数组字面量".to_string(),
+        _ => "该表达式".to_string(),
     }
 }

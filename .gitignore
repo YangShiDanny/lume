@@ -24,3 +24,5 @@ Cargo.lock
 _*
 lume gen by user.svg
 Lume icon.jpg
+# 测试生成的 C（源文件 tests_*.lume 要提交）
+tests_*.c

@@ -535,7 +535,16 @@ impl Codegen {
                 if let Some(e) = els {
                     self.push_line("} else {");
                     self.indent += 1;
-                    self.gen_par_body_stmt(e, arrays, reds);
+                    match e.as_ref() {
+                        Stmt::Expr(Expr::If(cond, block, _))
+                            if matches!(cond.as_ref(), Expr::Bool(true)) =>
+                        {
+                            for stmt in &block.stmts {
+                                self.gen_par_body_stmt(stmt, arrays, reds);
+                            }
+                        }
+                        other => self.gen_par_body_stmt(other, arrays, reds),
+                    }
                     self.indent -= 1;
                 }
                 self.push_line("}");

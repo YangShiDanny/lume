@@ -1,0 +1,114 @@
+// 管道融合：xs |> map(f) |> map(g) |> filter(p) 编译成**单个** for 循环
+//
+// 不融合：每段各 malloc 一个中间数组 → 内存 3N、三趟内存遍历。
+// 融合后：中间值全在栈上单个标量 _pc 里，只有输出 malloc → 1 份输出、1 趟遍历。
+// 实现见 src/codegen/pipe.rs。
+
+fn dbl(x: int) -> int {
+    return x * 2
+}
+
+fn sq(x: int) -> int {
+    return x * x
+}
+
+fn addk(x: int) -> int {
+    return x + 100
+}
+
+fn even(x: int) -> bool {
+    return x % 2 == 0
+}
+
+fn big(x: int) -> bool {
+    return x > 4
+}
+
+fn mult4(x: int) -> bool {
+    return x % 4 == 0
+}
+
+fn never(x: int) -> bool {
+    return false
+}
+
+fn acc_add(a: int, x: int) -> int {
+    return a + x
+}
+
+fn acc_max(a: int, x: int) -> int {
+    if x > a {
+        return x
+    }
+    return a
+}
+
+fn sum(xs: [int]) -> int {
+    s := 0
+    for x in xs {
+        s = s + x
+    }
+    return s
+}
+
+fn main() {
+    xs := [1, 2, 3, 4, 5]
+
+    // ── 1. 单段 map：长度恒等于源长度 ──
+    ys := xs |> map(dbl)
+    say("[pipe] 1 len={ys.len()}  期望 5")
+    say("[pipe] 1 {ys[0]} {ys[1]} {ys[2]} {ys[3]} {ys[4]}  期望 2 4 6 8 10")
+
+    // ── 2. 两段 map 融合：一个循环 ──
+    zs := xs |> map(dbl) |> map(sq)
+    say("[pipe] 2 len={zs.len()}  期望 5")
+    say("[pipe] 2 {zs[0]} {zs[1]} {zs[2]} {zs[3]} {zs[4]}  期望 4 16 36 64 100")
+    say("[pipe] 2 sum={sum(zs)}  期望 220")
+
+    // ── 3. 三段 map 融合 ──
+    ws := xs |> map(dbl) |> map(addk) |> map(sq)
+    say("[pipe] 3 {ws[0]} {ws[4]}  期望 10404 12100")
+
+    // ── 4. map 后 filter：filter 收窄长度 ──
+    // zs = [4,16,36,64,100]，全是偶数，5 个全留
+    ev := zs |> filter(even)
+    say("[pipe] 4 len={ev.len()}  期望 5")
+    say("[pipe] 4 {ev[0]} {ev[1]} {ev[2]}  期望 4 16 36")
+
+    // ── 4b. 更严的谓词：4 的倍数。zs 里 4/16/36/64/100 全是 4 的倍数 ──
+    ev3 := zs |> filter(mult4)
+    say("[pipe] 4b len={ev3.len()}  期望 5")
+    say("[pipe] 4b {ev3[0]} {ev3[1]} {ev3[2]} {ev3[3]} {ev3[4]}  期望 4 16 36 64 100")
+
+    // ── 5. map | filter | map：filter 不改元素类型，链继续 ──
+    // dbl 后 [2,4,6,8,10]，big(>4) 留 [6,8,10]，加 100 → [106,108,110]
+    mix := xs |> map(dbl) |> filter(big) |> map(addk)
+    say("[pipe] 5 len={mix.len()}  期望 3")
+    say("[pipe] 5 {mix[0]} {mix[1]} {mix[2]}  期望 106 108 110")
+
+    // ── 6. 纯 filter 链 ──
+    ev2 := xs |> filter(even)
+    say("[pipe] 6 len={ev2.len()} {ev2[0]} {ev2[1]}  期望 2 2 4")
+
+    // ── 7. 融合结果和「手写逐段」数值必须一致 ──
+    m1 := map(xs, dbl)
+    m2 := map(m1, sq)
+    say("[pipe] 7 融合 sum={sum(zs)} 逐段 sum={sum(m2)}  期望都 220")
+
+    // ── 8. reduce：单趟归约，可以内联在表达式位置 ──
+    say("[pipe] 8 sum={reduce(xs, acc_add, 0)}  期望 15")
+    say("[pipe] 8 max={reduce(zs, acc_max, 0)}  期望 100")
+
+    // ── 9. 切片当管道源 ──
+    sl := xs[1..] |> map(sq)
+    say("[pipe] 9 len={sl.len()} {sl[0]} {sl[1]} {sl[2]} {sl[3]}  期望 4 4 9 16 25")
+
+    // ── 10. map | filter 混合：sq 后 [1,4,9,16,25]，big(>4) 留 [9,16,25] ──
+    one := xs |> map(sq) |> filter(big)
+    say("[pipe] 10 len={one.len()} {one[0]} {one[1]} {one[2]}  期望 3 9 16 25")
+
+    // ── 11. 产出空数组：全部被 filter 掉，长度 0，不崩 ──
+    emp := xs |> filter(never)
+    say("[pipe] 11 空结果 len={emp.len()}  期望 0")
+    say("[pipe] 11 空结果 sum={sum(emp)}  期望 0")
+}

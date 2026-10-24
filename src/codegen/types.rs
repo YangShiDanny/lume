@@ -107,7 +107,12 @@ impl Codegen {
             Expr::Binary(l, op, r) => match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt |
                 BinOp::Le | BinOp::Ge | BinOp::And | BinOp::Or => "bool".to_string(),
-                BinOp::Pipe => self.infer_type(r),
+                // 管道：数组融合管道（xs |> map(f) |> filter(p)）的元素类型
+                // 由链条末端决定；普通标量管道照旧取右侧类型。
+                BinOp::Pipe => match self.fused_pipe_elem_ty(expr) {
+                    Some(t) => format!("{}*", t),
+                    None => self.infer_type(r),
+                },
                 _ => {
                     let lt = self.infer_type(l);
                     let rt = self.infer_type(r);
@@ -242,10 +247,13 @@ impl Codegen {
             }
             // 一元负号/取反：类型跟操作数走（否则 i128 的负值和取反会被当成 int64_t 截断）
             Expr::Unary(_, e) => self.infer_type(e),
-            // 切片：元素类型不变。数组变量的 C 类型已经是 `T*`，
-            // 别再加一层 *（否则 `let s = a[1..3]` 会声明成 `T** s`）。
-            Expr::Slice(obj, _, _, _) => self.infer_type(obj),
-            // ! 强制解包 / ? 传播：类型都是解包出的元素类型
+            // 切片：元素类型不变。infer_type(数组变量) 给的是 "int64_t*"
+            // （数组变量的 C 类型本身就是指针），这里要的是**元素**类型，
+            // 否则 `let s = a[1..3]` 会声明成 `int64_t** s`。
+            Expr::Slice(obj, _, _, _) => {
+                let t = self.infer_type(obj);
+                t.strip_suffix('*').unwrap_or(&t).to_string()
+            }
             Expr::Force(e) => self.infer_opt_elem(e),
             Expr::Try(e) => self.infer_opt_elem(e),
             _ => "int64_t".to_string(),

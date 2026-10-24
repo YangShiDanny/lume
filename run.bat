@@ -8,7 +8,7 @@ set DISTRO=Ubuntu
 
 REM 要跑的测试。每个都会 lume run <file>，一路串行跑完。
 REM 想临时只测一个，把 TESTS 改成只留那一项。
-set TESTS=main.lume tests_optional.lume
+set TESTS=main.lume tests_optional.lume tests_slice.lume tests_pipe.lume
 
 REM ==================
 

@@ -3,6 +3,48 @@ use super::Codegen;
 use crate::ast::*;
 
 impl Codegen {
+    pub(crate) fn gen_repeat_array_init(
+        &mut self,
+        name: &str,
+        ty: Option<&Type>,
+        init: &Expr,
+        fields: Option<&[String]>,
+    ) -> Option<(String, usize)> {
+        let (value, count) = match init {
+            Expr::Repeat(value, count) => (value.as_ref(), *count),
+            _ => return None,
+        };
+        let elem_ty = match ty {
+            Some(Type::Array(inner, Some(_))) => self.gen_type(inner),
+            _ => self.infer_type(value),
+        };
+        let value_code = match fields {
+            Some(fields) => self.gen_expr_with_self(value, fields),
+            None => self.gen_expr(value),
+        };
+        self.push_line(&format!("{} {}[{}];", elem_ty, name, count));
+
+        let byte_value = match (elem_ty.as_str(), value) {
+            ("int8_t" | "uint8_t", Expr::Int(0)) => Some(0),
+            ("int8_t" | "uint8_t", Expr::Int(1)) => Some(1),
+            _ => None,
+        };
+        if let Some(byte_value) = byte_value {
+            self.push_line(&format!("memset({}, {}, sizeof({}));", name, byte_value, name));
+        } else {
+            let id = self.repeat_counter;
+            self.repeat_counter += 1;
+            let value_name = format!("_lume_repeat_value_{}", id);
+            let index_name = format!("_lume_repeat_index_{}", id);
+            self.push_line(&format!("const {} {} = {};", elem_ty, value_name, value_code));
+            self.push_line(&format!(
+                "for (int64_t {} = 0; {} < {}LL; {}++) {{ {}[{}] = {}; }}",
+                index_name, index_name, count, index_name, name, index_name, value_name
+            ));
+        }
+        Some((elem_ty, count))
+    }
+
     pub(crate) fn gen_local_array_init(
         &mut self,
         ty: Option<&Type>,
@@ -222,6 +264,19 @@ impl Codegen {
             Expr::Slice(..) => self.slice_ptr_expr(expr),
 
             Expr::Call(callee, args) => {
+                // reduce 是单趟归约、返回标量，可以内联在表达式位置
+                if let Expr::Ident(name) = callee.as_ref() {
+                    if name == "reduce" {
+                        if let Some(c) = self.gen_reduce_call(expr) {
+                            return c;
+                        }
+                    }
+                }
+                // map/filter 产出两个值（指针+长度），只能在 let 位置
+                // （见 gen_hof_let）。表达式位置走到这里说明用法不对，
+                // 交给 checker 报错。
+                let _ = args;
+
                 // 内置构造：Some(x) / None
                 if let Expr::Ident(name) = callee.as_ref() {
                     if name == "Some" {
@@ -402,10 +457,13 @@ impl Codegen {
         // self 场景（结构体方法内）元素类型仍走 infer_type：
         // var_types 表在方法里登记过，self 的字段访问也走同一张表。
         //
-        // infer_type 给的是**元素**类型（"int64_t"），
-        // 声明指针时补 *；var_types / array_elem_types 也是元素类型，
-        // 这样 s[0] 的 infer_type 才和普通数组一致。
-        let elem_ty = self.infer_type(obj);
+        // infer_type 给数组变量的是 "int64_t*"，这里要**元素**类型
+        // （声明指针时补 *；array_elem_types / var_types 也存元素类型）。
+        let base_ty = self.infer_type(obj);
+        let elem_ty = base_ty
+            .strip_suffix('*')
+            .unwrap_or(&base_ty)
+            .to_string();
         let base = match fields {
             Some(f) => self.gen_expr_with_self(obj, f),
             None => self.gen_expr(obj),
@@ -435,6 +493,7 @@ impl Codegen {
         match expr {
             Expr::Ident(n) => self.array_len_exprs.get(n).cloned(),
             Expr::List(items) => Some(format!("{}LL", items.len())),
+            Expr::Repeat(_, count) => Some(format!("{}LL", count)),
             _ => None,
         }
     }
@@ -566,34 +625,38 @@ impl Codegen {
     /// 但出现在 `f({1,2,3})` 里根本不是表达式，clang 直接报语法错。
     /// 复合字面量的生命周期覆盖它所在的整个块，作为实参是安全的。
     pub(crate) fn gen_arg(&mut self, e: &Expr) -> String {
-        if let Expr::List(items) = e {
-            if !items.is_empty() {
-                let elem_ty = if let Some(first) = items.first() {
-                    self.infer_type(first)
-                } else {
-                    "int64_t".to_string()
-                };
+        match e {
+            Expr::List(items) if !items.is_empty() => {
+                let elem_ty = self.infer_type(&items[0]);
                 let strs: Vec<String> = items.iter().map(|x| self.gen_expr(x)).collect();
                 return format!("({}[]){{{}}}", elem_ty, strs.join(", "));
             }
+            Expr::Repeat(value, count) => {
+                let elem_ty = self.infer_type(value);
+                let item = self.gen_expr(value);
+                return format!("({}[]){{{}}}", elem_ty, vec![item; *count].join(", "));
+            }
+            _ => {}
         }
         self.gen_expr(e)
     }
 
     pub(crate) fn gen_arg_with_self(&mut self, e: &Expr, fields: &[String]) -> String {
-        if let Expr::List(items) = e {
-            if !items.is_empty() {
-                let elem_ty = if let Some(first) = items.first() {
-                    self.infer_type(first)
-                } else {
-                    "int64_t".to_string()
-                };
+        match e {
+            Expr::List(items) if !items.is_empty() => {
+                let elem_ty = self.infer_type(&items[0]);
                 let strs: Vec<String> = items
                     .iter()
                     .map(|x| self.gen_expr_with_self(x, fields))
                     .collect();
                 return format!("({}[]){{{}}}", elem_ty, strs.join(", "));
             }
+            Expr::Repeat(value, count) => {
+                let elem_ty = self.infer_type(value);
+                let item = self.gen_expr_with_self(value, fields);
+                return format!("({}[]){{{}}}", elem_ty, vec![item; *count].join(", "));
+            }
+            _ => {}
         }
         self.gen_expr_with_self(e, fields)
     }
@@ -804,6 +867,32 @@ impl Codegen {
                 out.push(format!("*_ret_len = {}LL;", n));
                 out.push("return _r;".to_string());
                 Some(out)
+            }
+            Expr::Repeat(value, n) => {
+                let elem_ty = self.infer_type(value);
+                let initial = match fields {
+                    Some(fields) => self.gen_expr_with_self(value, fields),
+                    None => self.gen_expr(value),
+                };
+                let id = self.repeat_counter;
+                self.repeat_counter += 1;
+                let repeated_value = format!("_lume_return_repeat_{}", id);
+                let result_name = format!("_lume_repeat_return_{}", id);
+                let index_name = format!("_lume_repeat_index_{}", id);
+                Some(vec![
+                    format!(
+                        "{}* {} = ({}*)malloc((size_t){} * sizeof({}));",
+                        elem_ty, result_name, elem_ty, n, elem_ty
+                    ),
+                    format!("{} {} = {};", elem_ty, repeated_value, initial),
+                    format!(
+                        "for (int64_t {} = 0; {} < {}LL; {}++) {{ {}[{}] = {}; }}",
+                        index_name, index_name, n, index_name,
+                        result_name, index_name, repeated_value
+                    ),
+                    format!("*_ret_len = {}LL;", n),
+                    format!("return {};", result_name),
+                ])
             }
             Expr::Ident(src) => {
                 let len = self.array_len_exprs.get(src).cloned()?;

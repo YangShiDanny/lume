@@ -337,13 +337,13 @@ static inline int64_t lume_checked_mod_i64(int64_t a, int64_t b) {
    注意 off 和 len 必须一致，所以两个函数共用同一条校验：
    0 <= i <= j <= 原长度。 */
 static inline void lume_slice_check(
-    const char* what, int64_t start, int64_t end, int64_t base_len
+    int64_t start, int64_t end, int64_t base_len
 ) {
     if (start < 0 || end < start || end > base_len) {
         fprintf(stderr,
-                "lume: runtime error: slice %s[%lld..%lld] out of range "
+                "lume: runtime error: slice [%lld..%lld] out of range "
                 "(len=%lld)\n",
-                what, (long long)start, (long long)end,
+                (long long)start, (long long)end,
                 (long long)base_len);
         abort();
     }
@@ -353,14 +353,14 @@ static inline int64_t lume_slice_len(
     const void* base, int64_t start, int64_t end, int64_t base_len
 ) {
     (void)base;
-    lume_slice_check("slice", start, end, base_len);
+    lume_slice_check(start, end, base_len);
     return end - start;
 }
 
 static inline int64_t lume_slice_off(
     const void* base, int64_t start, int64_t end, int64_t base_len
 ) {
-    lume_slice_check("slice", start, end, base_len);
+    lume_slice_check(start, end, base_len);
     return start;
 }
 

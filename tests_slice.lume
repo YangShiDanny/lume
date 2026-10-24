@@ -1,0 +1,62 @@
+// 切片 a[i..j] / a[i..=j] / a[..j] / a[..] / a[i..]
+//
+// 切片是**借用**，零拷贝：s 和 a 指向同一块内存。
+// 越界会在运行期报错并 abort（lume_slice_off / lume_slice_len）。
+
+fn total(xs: [int]) -> int {
+    s := 0
+    for x in xs {
+        s = s + x
+    }
+    return s
+}
+
+fn main() {
+    xs := [10, 20, 30, 40, 50]
+
+    // 基本切片 a[1..3]
+    mid := xs[1..3]
+    say("[sl] mid.len()={mid.len()}  期望 2")
+    say("[sl] total(mid)={total(mid)}  期望 50")
+
+    // 切片直接当实参（不需要先 let 绑定）
+    say("[sl] total(xs[2..])={total(xs[2..])}  期望 120")
+    say("[sl] total(xs[..2])={total(xs[..2])}  期望 30")
+
+    // 闭区间 a[0..=1] 含两端
+    say("[sl] total(xs[0..=1])={total(xs[0..=1])}  期望 30")
+
+    // 缺省起点 a[..3]
+    say("[sl] total(xs[..3])={total(xs[..3])}  期望 60")
+
+    // 索引切片结果
+    say("[sl] mid[0]={mid[0]}  期望 20")
+    say("[sl] mid[1]={mid[1]}  期望 30")
+
+    // 借用语义：改切片就是改原数组
+    mid[0] = 99
+    say("[sl] 改切片后 xs[1]={xs[1]}  期望 99")
+
+    // 空切片（起点 == 终点）
+    empty := xs[2..2]
+    say("[sl] empty.len()={empty.len()}  期望 0")
+    say("[sl] total(empty)={total(empty)}  期望 0")
+
+    // 切片再切片
+    say("[sl] total(mid[0..1])={total(mid[0..1])}  期望 99")
+
+    // 嵌套切片作实参（xs[1] 上面已被改成 99，所以是 99+30）
+    say("[sl] total(xs[1..][0..2])={total(xs[1..][0..2])}  期望 129")
+
+    // 遍历切片
+    acc := 0
+    for v in xs[3..] {
+        acc = acc + v
+    }
+    say("[sl] 遍历 xs[3..]={acc}  期望 90")
+
+    // 字符串数组切片
+    names := ["ada", "bob", "cyd", "dee"]
+    two := names[1..3]
+    say("[sl] names 切两段={two[0]},{two[1]}  期望 bob,cyd")
+}
