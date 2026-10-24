@@ -26,3 +26,10 @@ lume gen by user.svg
 Lume icon.jpg
 # 测试生成的 C（源文件 tests_*.lume 要提交）
 tests_*.c
+
+# Lume generated executables (sources are tests_*.lume / benchmarks/*.lume)
+print_1_100
+print_1_100.c
+tests_optional
+tests_slice
+tests_pipe

@@ -76,6 +76,33 @@ fn par_sum_incl(a: [int], n: int) -> int {
     return total
 }
 
+// 浮点乘 2^n：曾经被优化成整数移位（2.5*8 得 16）
+fn f_mul8(x: float) -> float {
+    return x * 8
+}
+
+// 同一个数组传给两个参数：restrict 已移除，按引用语义必须得到 10 10 10 10
+fn shift(a: [int], b: [int]) {
+    for i in 0..(a.len() - 1) {
+        b[i + 1] = a[i]
+    }
+}
+
+// 嵌套 par for（经函数间接调用）：运行期退化成串行
+fn inner_sum(a: [int], n: int) -> int {
+    total := 0
+    par for i in 0..n {
+        total += a[i]
+    }
+    return total
+}
+
+// par for 里调用 @cache：会自动生成带锁包装器
+@cache
+fn cached_dbl(x: int) -> int {
+    return x * 2
+}
+
 fn dbl(a: [int], out: [int], n: int) {
     par for i in 0..n {
         out[i] = a[i] * 2
@@ -503,6 +530,29 @@ fn main() {
     }
     flush()
     say("[26] worker logging complete")
+
+    // 28. 浮点 * 2^n 不能被当成整数移位（AST 没有类型，优化器已不再碰变量）
+    say("[28] 2.5*8={f_mul8(2.5)} 1.25*8={f_mul8(1.25)}  期望 20 / 10")
+
+    // 29. 数组是引用语义：别名参数不能被 restrict 假设骗到
+    nest_a := [1; 1000]
+    alias_x := [10, 20, 30, 40]
+    shift(alias_x, alias_x)
+    say("[29] shift(x,x)={alias_x[0]} {alias_x[1]} {alias_x[2]} {alias_x[3]}  期望 10 10 10 10")
+
+    // 30. @cache 在 par for 里：自动换带锁包装器
+    cache_total := 0
+    par for i in 0..40000 {
+        cache_total += cached_dbl(i)
+    }
+    say("[30] @cache in par for={cache_total}  期望 1599960000")
+
+    // 31. par 循环体里调用收数组的函数：worker 里长度要用 _p->a_len 而不是 a_len
+    nested := 0
+    par for i in 0..500 {
+        nested += inner_sum(nest_a, 100)
+    }
+    say("[31] nested par via call={nested}  期望 50000")
 
     say("===== 完成 =====")
 }

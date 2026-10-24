@@ -38,7 +38,7 @@ lume run   main.lume [选项]   # 编译并立即运行
 
 本项目里用 `cargo run -- run main.lume`（`run.bat` 走 WSL）。
 
-`main.lume` 是本项目的**优化验证套件**，20 项，每行末尾都印了期望值。WSL 实测（clang -O3）全对：
+`main.lume` 是本项目的**优化验证套件**，31 项，每行末尾都印了期望值。WSL 实测（clang -O3）全对：
 
 | 项 | 覆盖点 | 实测 |
 |---|---|---|

@@ -203,8 +203,32 @@ impl Codegen {
             self.non_neg_vars.insert(var.to_string());
         }
 
+        // worker 里数组的长度在 _p->{name}_len，不在外层的 {name}_len。
+        // 循环体调用收数组的函数时，gen_call_args 会来查这张表补伴随参数，
+        // 不临时改映射就会生成 `f(a, a_len)` —— worker 里 a_len 不存在。
+        let saved_lens: Vec<(String, Option<String>)> = used_arrays
+            .iter()
+            .map(|a| {
+                let old = self
+                    .array_len_exprs
+                    .insert(a.clone(), format!("_p->{}_len", a));
+                (a.clone(), old)
+            })
+            .collect();
+
         for stmt in &body.stmts {
             self.gen_par_body_stmt(stmt, &used_arrays, &reductions);
+        }
+
+        for (a, old) in saved_lens {
+            match old {
+                Some(v) => {
+                    self.array_len_exprs.insert(a, v);
+                }
+                None => {
+                    self.array_len_exprs.remove(&a);
+                }
+            }
         }
 
         if non_neg && !was_non_neg {
