@@ -125,44 +125,16 @@ impl Codegen {
                 let ls = self.gen_expr(l);
                 let rs = self.gen_expr(r);
 
-                // 除以 2^n → 右移（有符号加修正）
-                if let BinOp::Div = op {
-                    if let Expr::Int(d) = r.as_ref() {
-                        if *d > 1 && (*d as u64).is_power_of_two() {
-                            let shift = (*d as u64).trailing_zeros();
-                            let is_unsigned = match l.as_ref() {
-                                Expr::Ident(name) => self.var_types.get(name)
-                                    .map(|t| t.starts_with("uint"))
-                                    .unwrap_or(false),
-                                _ => false,
-                            };
-                            if is_unsigned {
-                                return format!("({} >> {})", ls, shift);
-                            }
-                            return format!("lume_sdiv_pow2({}, {}LL)", ls, shift);
+                // 整数除法/取模：常量除数安全化 + 强度削弱（见 gen_divmod）
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    let lt = self.infer_type(l);
+                    if lt != "double" && lt != "float" {
+                        if let Some(c) = self.gen_divmod(&ls, l, *op, r) {
+                            return c;
                         }
                     }
                 }
-                // 非负整数取模 2^n → 位与
-                if let BinOp::Mod = op {
-                    if let Expr::Int(b) = r.as_ref() {
-                        if *b > 0 && (*b as u64).is_power_of_two() {
-                            let is_non_neg = match l.as_ref() {
-                                Expr::Ident(name) => {
-                                    self.non_neg_vars.contains(name)
-                                        || self.var_types.get(name)
-                                            .map(|t| t.starts_with("uint"))
-                                            .unwrap_or(false)
-                                }
-                                _ => false,
-                            };
-                            if is_non_neg {
-                                let mask = (*b as u64) - 1;
-                                return format!("({} & {}LL)", ls, mask as i64);
-                            }
-                        }
-                    }
-                }
+                // （取模的强度削弱已并入上面的 gen_divmod）
                 let op_str = match op {
                     BinOp::Add => "+",
                     BinOp::Sub => "-",
@@ -488,6 +460,117 @@ impl Codegen {
             format!("{} = {};", name, ptr),
             format!("{}_len = {};", name, len),
         ])
+    }
+
+    /// 表达式能否解析成编译期整数常量。
+    ///
+    /// 认两种来源：
+    ///   - 字面量 `8` / `-8`
+    ///   - 顶层 `const NAME = 8`（`ident` 名字不在 `var_types` 里时）
+    ///
+    /// 局部变量同名时**不**当常量 —— `var_types` 里已经有这个名字，
+    /// 说明它被 `let` 遮蔽了，值可能在运行期变。
+    pub(crate) fn const_int_of(&self, e: &Expr) -> Option<i64> {
+        match e {
+            Expr::Int(v) => Some(*v),
+            Expr::Unary(UnOp::Neg, inner) => match inner.as_ref() {
+                Expr::Int(v) => v.checked_neg(),
+                _ => None,
+            },
+            Expr::Ident(n) => {
+                if self.var_types.contains_key(n) {
+                    return None;
+                }
+                self.const_ints.get(n).copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// 表达式的值能否证明**非负**。
+    ///
+    /// 判不出来就返回 false（保守）。这是 `% 2^n → & (2^n-1)` 和
+    /// `/ 2^n → >>` 的前提：有符号负数做位运算和做除法/取模结果不同
+    /// （`-7 / 2 == -3` 但 `-7 >> 1 == -4`，`-7 % 8 == -7` 但 `-7 & 7 == 1`）。
+    /// clang 因为不知道符号不敢换，Lume 知道就敢 —— 这是本文件的重点。
+    pub(crate) fn is_nonneg(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Int(v) => *v >= 0,
+            Expr::Rune(_) | Expr::Color(_) => true,
+            Expr::Ident(n) => {
+                // 循环变量（`for i in 0..n`）已在生成 for 时登记
+                if self.non_neg_vars.contains(n) {
+                    return true;
+                }
+                // 无符号类型天然非负
+                if let Some(t) = self.var_types.get(n) {
+                    if t.starts_with("uint") || t == "bool" {
+                        return true;
+                    }
+                }
+                // 顶层整型常量
+                self.const_int_of(e).map(|v| v >= 0).unwrap_or(false)
+            }
+            Expr::Binary(l, op, r) => match op {
+                // 非负 + 非负、非负 * 非负 一定非负
+                BinOp::Add | BinOp::Mul => self.is_nonneg(l) && self.is_nonneg(r),
+                // 非负 / 正、非负 % 正 都非负（C 的截断除法符号跟被除数走）
+                BinOp::Div | BinOp::Mod => self.is_nonneg(l),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// 整数 `/` `%` 的 C 表达式。返回 `None` 表示交给调用处的运行时检查包装。
+    ///
+    /// 核心结论：**除数只要是编译期常量 d ≠ 0，`lume_checked_*` 就是死代码。**
+    ///   - d ≠ 0        → 不存在除零
+    ///   - d > 0        → `a / d`、`a % d` 对任何 a 都有定义
+    ///   - d < -1       → 同上
+    ///   - d == -1      → `INT64_MIN / -1` 溢出，只能退回检查版
+    ///
+    /// 拿掉 abort 分支的收益不只是省几条指令 —— 带 `abort()` 的循环
+    /// clang 不敢做 SIMD，去掉它才能真正向量化。
+    ///
+    /// 在常量除数之上再叠一层强度削弱（只在被除数可证非负时）：
+    ///   - `x / 2^n`  → `x >> n`（有符号负数右移是算术右移，语义不同，必须证明非负）
+    ///   - `x % 2^n`  → `x & (2^n-1)`
+    pub(crate) fn gen_divmod(
+        &self,
+        ls: &str,
+        l: &Expr,
+        op: BinOp,
+        r: &Expr,
+    ) -> Option<String> {
+        let d = self.const_int_of(r)?;
+        if d == 0 || d == -1 {
+            return None;
+        }
+        // 无符号类型不用证明非负 —— 本来就非负
+        let unsigned = match l {
+            Expr::Ident(n) => self
+                .var_types
+                .get(n)
+                .map(|t| t.starts_with("uint"))
+                .unwrap_or(false),
+            _ => false,
+        };
+        let mag = d.unsigned_abs();
+        if (self.is_nonneg(l) || unsigned) && mag.is_power_of_two() && d > 0 {
+            let shift = mag.trailing_zeros();
+            if shift > 0 {
+                return Some(match op {
+                    BinOp::Div => format!("({} >> {})", ls, shift),
+                    _ => format!("({} & {}LL)", ls, mag - 1),
+                });
+            }
+        }
+        // 常量除数：用普通 C 运算符，clang 会自己变成乘法 + 移位（魔数除法）
+        Some(match op {
+            BinOp::Div => format!("({} / {})", ls, d),
+            _ => format!("({} % {})", ls, d),
+        })
     }
 
     /// `a[i]` 下标位置的 C 表达式（含边界处理）。
@@ -1118,45 +1201,17 @@ impl Codegen {
                 let ls = self.gen_expr_with_self(l, fields);
                 let rs = self.gen_expr_with_self(r, fields);
 
-                // 除以 2^n → 右移（有符号加修正）
-                if let BinOp::Div = op {
-                    if let Expr::Int(d) = r.as_ref() {
-                        if *d > 1 && (*d as u64).is_power_of_two() {
-                            let shift = (*d as u64).trailing_zeros();
-                            let is_unsigned = match l.as_ref() {
-                                Expr::Ident(name) => self.var_types.get(name)
-                                    .map(|t| t.starts_with("uint"))
-                                    .unwrap_or(false),
-                                _ => false,
-                            };
-                            if is_unsigned {
-                                return format!("({} >> {})", ls, shift);
-                            }
-                            return format!("lume_sdiv_pow2({}, {}LL)", ls, shift);
+                // 整数除法/取模：常量除数安全化 + 强度削弱（见 gen_divmod）
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    let lt = self.infer_type(l);
+                    if lt != "double" && lt != "float" {
+                        if let Some(c) = self.gen_divmod(&ls, l, *op, r) {
+                            return c;
                         }
                     }
                 }
                 
-                // 非负整数取模 2^n → 位与
-                if let BinOp::Mod = op {
-                    if let Expr::Int(b) = r.as_ref() {
-                        if *b > 0 && (*b as u64).is_power_of_two() {
-                            let is_non_neg = match l.as_ref() {
-                                Expr::Ident(name) => {
-                                    self.non_neg_vars.contains(name)
-                                        || self.var_types.get(name)
-                                            .map(|t| t.starts_with("uint"))
-                                            .unwrap_or(false)
-                                }
-                                _ => false,
-                            };
-                            if is_non_neg {
-                                let mask = (*b as u64) - 1;
-                                return format!("({} & {}LL)", ls, mask as i64);
-                            }
-                        }
-                    }
-                }
+                // （取模的强度削弱已并入上面的 gen_divmod）
                 let op_str = match op {
                     BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
                     BinOp::Div => "/", BinOp::Mod => "%",

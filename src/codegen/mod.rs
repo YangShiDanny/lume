@@ -97,6 +97,11 @@ pub struct Codegen {
     pub(crate) match_val_member: Option<String>,
 
     pub(crate) non_neg_vars: std::collections::HashSet<String>,
+    /// 顶层 `const NAME = <整数字面量>` 的值。
+    /// 用途：让 `x % M` 在 codegen 阶段就能看到除数是常量，
+    /// 从而走「常量除数无检查」+ 强度削弱，而不是等 clang 去猜。
+    /// 只收字面量（含一元负号）—— 复杂常量表达式留给 C 编译器。
+    pub(crate) const_ints: HashMap<String, i64>,
     pub(crate) repeat_counter: usize,
 }
 
@@ -136,6 +141,7 @@ impl Codegen {
             par_workers: String::new(),
             par_scalars: Vec::new(),
             non_neg_vars: std::collections::HashSet::new(),
+            const_ints: HashMap::new(),
             repeat_counter: 0,
             cur_ret_is_array: false,
             cur_ret_c: String::new(),
@@ -252,6 +258,10 @@ impl Codegen {
         //     因为 __attribute__((const)) 要写在声明上，调用点才能看到
         self.collect_const_fns(program);
 
+        // 2.55 顶层整数常量表：`x % M` 里的 M 要在这里就能解析成字面量，
+        //      才能在 codegen 阶段做常量除数安全化 + 强度削弱（见 expr.rs）。
+        self.collect_const_ints(program);
+
         // 2.6 哪些 @cache 会被 par for 调到（含经由普通函数间接调用）。
         //     这些要用带锁的缓存包装器，其余保持无锁快路径。
         self.thread_safe_cached = collect_par_cached_fns(program);
@@ -264,6 +274,15 @@ impl Codegen {
         for item in &program.items {
             if let Item::Struct(s) = item {
                 self.gen_struct_decl(s);
+            }
+        }
+
+        // 3.2 顶层常量：必须早于所有函数体。C 里的 `const T x = v;` 是**定义**，
+        //     没有「前向声明」的等效写法，函数体里引用时值必须已经出现过。
+        //     （以前跟着第 9 步的函数一起按源文件顺序发，常量写在函数后面就编不过。）
+        for item in &program.items {
+            if let Item::Const(c) = item {
+                self.gen_const(c);
             }
         }
 
@@ -336,12 +355,10 @@ impl Codegen {
             self.gen_monomorphized(f, name, tm);
         }
 
-       // 9. 普通函数
+       // 9. 普通函数（顶层常量已在 3.2 步发完）
         for item in &program.items {
-            match item {
-                Item::Fn(f) => self.gen_fn(f),
-                Item::Const(c) => self.gen_const(c),
-                _ => {}
+            if let Item::Fn(f) = item {
+                self.gen_fn(f);
             }
         }
 

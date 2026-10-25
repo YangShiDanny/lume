@@ -1,0 +1,15 @@
+// 编译成功: tests_divmod
+mod_pow2 -9 => -1
+div_pow2 -9 => -1
+mod_odd -10 => -1
+div_odd -10 => -3
+mod_neg_const 9 => 1
+div_neg_const 9 => -2
+mod_neg_const -9 => -1
+div_neg_const -9 => 2
+mod_by_const_name -9 => -1
+div_by_expr_const 9 => 3
+compound -3 -5 => 0
+float_div 3.0 => 0.375000
+float_div -3.0 => -0.375000
+loop_shift 20 => 78

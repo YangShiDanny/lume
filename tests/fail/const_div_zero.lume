@@ -1,0 +1,9 @@
+// expect: division by zero
+// 除数是「零常量」也必须在编译期拒绝。
+// 以前只认裸字面量 `x / 0`，包一层 const 名就漏到运行期才 abort。
+const ZERO = 0
+
+fn main() {
+    x := 5
+    say("x/ZERO={x / ZERO}")
+}

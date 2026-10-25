@@ -976,6 +976,21 @@ impl Codegen {
         self.output.push('\n');
     }
 
+    /// 收集顶层 `const NAME = <整数字面量>`（含 `-N`、`+N` 形式）。
+    ///
+    /// 只登记能一眼看出值的常量。表达式形式的常量（`const N = 1 + 2`）
+    /// 不在这里求值 —— 它们照样能编过，只是拿不到「常量除数」的优惠，
+    /// 退回 clang 的常量传播。保守但不会错。
+    pub(crate) fn collect_const_ints(&mut self, program: &Program) {
+        for item in &program.items {
+            if let Item::Const(c) = item {
+                if let Some(v) = literal_int(&c.value) {
+                    self.const_ints.insert(c.name.clone(), v);
+                }
+            }
+        }
+    }
+
     pub(crate) fn gen_const(&mut self, c: &ConstDecl) {
         let ty = match &c.ty {
             Some(t) => self.gen_type(t),

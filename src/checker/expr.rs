@@ -30,6 +30,9 @@ impl Checker {
                 }
                 if let Some(ty) = self.lookup(name) {
                     ty
+                } else if let Some(ty) = self.consts.get(name) {
+                    // 顶层 const：作用域里没有就是它（局部同名会先命中 lookup）
+                    ty.clone()
                 } else if self.functions.contains_key(name) {
                     Ty::Unknown
                 } else {
@@ -59,12 +62,14 @@ impl Checker {
             Expr::Binary(l, op, r) => {
                 let lt = self.check_expr(l);
                 let rt = self.check_expr(r);
-                // 编译期除零：已知整数左操作数配整数字面量 0 时拒编译。
+                // 编译期除零：已知整数左操作数配**零常量**时拒编译。
+                // 零既可以是裸字面量 `x / 0`，也可以是 `const Z = 0` 再 `x / Z`
+                // —— 后者以前漏过去了，要到运行期才 abort。
                 // 类型未知时不猜测整数，避免误拒泛型推导出的浮点表达式。
                 // 浮点除零是 IEEE 语义（inf），合法；变量的情况运行时
                 // 兜底（lume_checked_div_i64 / lume_checked_mod_i64）。
                 if matches!(op, BinOp::Div | BinOp::Mod) {
-                    if let Expr::Int(0) = r.as_ref() {
+                    if self.is_const_zero(r) {
                         if lt == Ty::Int {
                             let what = match op {
                                 BinOp::Div => "division",

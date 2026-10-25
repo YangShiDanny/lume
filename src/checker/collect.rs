@@ -81,6 +81,27 @@ impl Checker {
                     }
                     self.methods.insert(s.name.clone(), methods);
                 }
+                // 顶层常量：先登记名字 → 类型，函数体里的引用才不会报
+                // 「未定义的变量」。类型声明优先，没写就按字面量推断。
+                Item::Const(c) => {
+                    let ty = match &c.ty {
+                        Some(t) => self.ty_from_ast(Some(t)),
+                        None => match &c.value {
+                            Expr::Int(_) | Expr::Color(_) => Ty::Int,
+                            Expr::Float(_) => Ty::Float,
+                            Expr::Bool(_) => Ty::Bool,
+                            Expr::Str(_) => Ty::Str,
+                            Expr::Rune(_) => Ty::Rune,
+                            // 表达式形式的常量值：类型推不出来就交给
+                            // codegen 的 C 常量传播，checker 不猜。
+                            _ => Ty::Unknown,
+                        },
+                    };
+                    self.consts.insert(c.name.clone(), ty);
+                    if let Some(v) = literal_int(&c.value) {
+                        self.const_ints.insert(c.name.clone(), v);
+                    }
+                }
                 _ => {}
             }
         }

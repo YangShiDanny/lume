@@ -71,6 +71,13 @@ pub struct Checker {
     pub(crate) methods: HashMap<String, HashMap<String, FuncSig>>,
     pub(crate) scopes: Vec<HashMap<String, Ty>>,
     pub(crate) current_ret: Ty,
+    /// 顶层 `const` 名字 → 类型。作用域查找 `lookup` 找不到时兜底到这里，
+    /// 这样 `x % M` 里的 M 不会被当成「未定义的变量」。
+    pub(crate) consts: HashMap<String, Ty>,
+    /// 顶层 `const NAME = <整数字面量>` 的值。
+    /// 用来在**编译期**发现 `x / NAME` 这种「除数是零常量」的除零 ——
+    /// 以前只认裸字面量 `x / 0`，包一层常量名就漏过去了。
+    pub(crate) const_ints: HashMap<String, i64>,
 }
 
 impl Checker {
@@ -83,6 +90,8 @@ impl Checker {
             methods: HashMap::new(),
             scopes: Vec::new(),
             current_ret: Ty::Void,
+            consts: HashMap::new(),
+            const_ints: HashMap::new(),
         }
     }
 
@@ -152,6 +161,21 @@ impl Checker {
             }
         }
         None
+    }
+
+    /// `e` 是否可证明是编译期整数零。认 `0`、`-0` 和值为 0 的顶层常量。
+    /// 局部变量同名时不算 —— 那时值是运行期的事。
+    pub(crate) fn is_const_zero(&self, e: &Expr) -> bool {
+        match literal_int(e) {
+            Some(v) => v == 0,
+            None => match e {
+                Expr::Ident(n) => {
+                    self.lookup(n).is_none()
+                        && self.const_ints.get(n).copied() == Some(0)
+                }
+                _ => false,
+            },
+        }
     }
 }
 

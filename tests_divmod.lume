@@ -1,0 +1,92 @@
+// 常量除数安全化 + 非负强度削弱（todo #17 / #18 / #21）
+//
+// 优化的底线是**不许改答案**。这个文件专门喂容易出错的那几类输入：
+// 负数被除数、负常量除数、复合被除数、浮点、以及值来自常量的除数。
+//
+// 对应的生成规则见 src/codegen/expr.rs 的 `gen_divmod` / `is_nonneg`：
+//   - 除数是非零编译期常量 → 除零检查是死代码，直接出普通 C 运算符
+//     （顺手解锁 clang 的魔数除法和向量化）
+//   - 被除数可证非负 + 除数是 2^n → `>>` / `&` 掩码
+//   - 证明不了就老老实实保留 lume_checked_* 包装
+
+const M = 8
+const NEG = -4
+const EXPR = 1 + 2
+
+fn mod_pow2(x: int) -> int {
+    return x % 8
+}
+
+fn div_pow2(x: int) -> int {
+    return x / 8
+}
+
+fn mod_odd(x: int) -> int {
+    return x % 3
+}
+
+fn div_odd(x: int) -> int {
+    return x / 3
+}
+
+fn mod_neg_const(x: int) -> int {
+    return x % NEG
+}
+
+fn div_neg_const(x: int) -> int {
+    return x / NEG
+}
+
+fn mod_by_const_name(x: int) -> int {
+    return x % M
+}
+
+fn div_by_expr_const(x: int) -> int {
+    return x / EXPR
+}
+
+fn compound(x: int, y: int) -> int {
+    return (x + y) % 8
+}
+
+fn float_div(x: float) -> float {
+    return x / 8
+}
+
+fn loop_shift(n: int) -> int {
+    total := 0
+    for i in 0..n {
+        total += i / 8
+        total += i % 8
+    }
+    return total
+}
+
+fn main() {
+    // 负数：`%` 的符号跟被除数走，`/` 向零截断。
+    // 这里要是被错误地换成 `& 7` / `>> 3`，答案会明显偏掉。
+    say("mod_pow2 -9 => {mod_pow2(-9)}")
+    say("div_pow2 -9 => {div_pow2(-9)}")
+    say("mod_odd -10 => {mod_odd(-10)}")
+    say("div_odd -10 => {div_odd(-10)}")
+
+    // 负常量除数
+    say("mod_neg_const 9 => {mod_neg_const(9)}")
+    say("div_neg_const 9 => {div_neg_const(9)}")
+    say("mod_neg_const -9 => {mod_neg_const(-9)}")
+    say("div_neg_const -9 => {div_neg_const(-9)}")
+
+    // 除数来自 const（字面量常量能提前看到值；表达式常量只能交给 clang）
+    say("mod_by_const_name -9 => {mod_by_const_name(-9)}")
+    say("div_by_expr_const 9 => {div_by_expr_const(9)}")
+
+    // 复合被除数：证明不了非负，不该被换成掩码
+    say("compound -3 -5 => {compound(-3, -5)}")
+
+    // 浮点除法不能被整数移位吃掉（曾经会：`3.0 / 8` 得 0）
+    say("float_div 3.0 => {float_div(3.0)}")
+    say("float_div -3.0 => {float_div(-3.0)}")
+
+    // 循环变量可证非负 → 走 `>>` / `&`
+    say("loop_shift 20 => {loop_shift(20)}")
+}

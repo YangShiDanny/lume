@@ -224,6 +224,21 @@ pub enum UnOp {
 // 返回按签名顺序排列的槽位，None = 调用处没传（等默认值来填，
 // 没有默认值就是错误，由 checker 报）。槽位而不是紧凑 Vec，
 // 是因为命名参数允许省略中间有默认值的参数。
+/// 把「字面量整数表达式」解析成 i64。只认 `8` 和 `-8` 两种形状。
+///
+/// checker（编译期除零判定）和 codegen（常量除数强度削弱）共用一份，
+/// 保证两边对「什么算常量」的判断不会走偏。
+pub fn literal_int(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Int(v) => Some(*v),
+        Expr::Unary(UnOp::Neg, inner) => match inner.as_ref() {
+            Expr::Int(v) => v.checked_neg(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub fn reorder_named_args(
     fields: &[(String, Expr)],
     param_names: &[String],
