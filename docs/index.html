@@ -25,8 +25,12 @@
     --accent: #33aaff;
     --nav-bg: rgba(8,8,10,.62);
     --nav-border: rgba(255,255,255,.08);
+    --glass-border: rgba(255,255,255,.88);
     --star: 255,255,255;
-    --selection: rgba(200,200,200,.9);
+    --selection: #cfcfcf;
+    --caret: #ffffff;
+    --cursor-soft: rgba(255,255,255,.45);
+    --cursor-glow: rgba(255,255,255,.55);
     --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
     --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
     --font-display: 'Cal Sans', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', sans-serif;
@@ -54,11 +58,18 @@
     --hover-strong: rgba(0,0,0,.08);
     --nav-bg: rgba(255,255,255,.68);
     --nav-border: rgba(0,0,0,.10);
+    --glass-border: #ffffff;
     --star: 70,70,95;
+    --selection: #cfcfcf;
+    --caret: #0a0a0a;
+    --cursor-soft: rgba(0,0,0,.40);
+    --cursor-glow: rgba(0,0,0,.25);
   }
 
   * { box-sizing: border-box; cursor: none; }
   ::selection { background: var(--selection); color: #111; }
+  ::-moz-selection { background: var(--selection); color: #111; }
+  body, input, textarea, pre, code { caret-color: var(--caret); }
 
   html { scroll-behavior: smooth; background-color: var(--bg); }
   body {
@@ -79,15 +90,62 @@
   #cur, #ring {
     position: fixed; top: 0; left: 0; pointer-events: none; z-index: 9999;
     border-radius: 999px; transform: translate(-50%,-50%);
-    transition: width .3s cubic-bezier(.2,.8,.2,1), height .3s cubic-bezier(.2,.8,.2,1),
-                opacity .3s ease, transform .3s cubic-bezier(.2,.8,.2,1),
-                background-color .25s ease, border-color .25s ease;
+    will-change: transform, width, height, opacity, border-color, box-shadow;
   }
-  #cur { width: 8px; height: 8px; background: var(--text); }
-  #ring { width: 34px; height: 34px; border: 1px solid var(--muted); opacity: 0; transform: translate(-50%,-50%) scale(.1); }
-  #cur.link { opacity: 0; }
-  #ring.link { opacity: 1; transform: translate(-50%,-50%) scale(1); border-color: var(--accent); box-shadow: 0 0 20px var(--accent); }
-  #cur.astra { width: 10px; height: 10px; background: var(--accent); box-shadow: 0 0 12px var(--accent); }
+  #cur {
+    width: 8px; height: 8px; background: var(--text); opacity: 1;
+    box-shadow: 0 0 10px var(--cursor-glow);
+    transition: width .32s cubic-bezier(.2,.8,.2,1), height .32s cubic-bezier(.2,.8,.2,1),
+                opacity .28s ease, transform .28s cubic-bezier(.2,.8,.2,1),
+                background-color .25s ease, box-shadow .25s ease;
+  }
+  #ring {
+    width: 34px; height: 34px; border: 1px solid var(--cursor-soft);
+    background: radial-gradient(circle at center,
+      rgba(var(--star),.12) 0%, rgba(var(--star),.04) 50%, transparent 72%);
+    opacity: 0; transform: translate(-50%,-50%) scale(.1);
+    transition: opacity .28s ease, transform .32s cubic-bezier(.2,.8,.2,1),
+                border-color .25s ease, box-shadow .25s ease;
+  }
+  /* 文字上：光点收成竖条 I-beam，光环淡出 */
+  #cur.is-text {
+    width: 2px; height: 20px; border-radius: 2px;
+    background: var(--caret); box-shadow: 0 0 8px var(--cursor-glow);
+  }
+  #ring.is-text { opacity: 0; transform: translate(-50%,-50%) scale(.1); }
+  /* 链接 / 按钮上：光点缩没，光环由小变大 */
+  #cur.is-link { opacity: 0; transform: translate(-50%,-50%) scale(.1); }
+  #ring.is-link {
+    opacity: 1; transform: translate(-50%,-50%) scale(1);
+    border-color: var(--text);
+    box-shadow: 0 0 20px var(--cursor-glow), inset 0 0 12px rgba(var(--star),.2);
+  }
+  /* 复制按钮 / 强调元素：整体染成 #3af */
+  #cur.is-astra { width: 10px; height: 10px; background: var(--accent); box-shadow: 0 0 12px var(--accent); }
+  #ring.is-astra {
+    opacity: 1; transform: translate(-50%,-50%) scale(1.15);
+    border-color: var(--accent); box-shadow: 0 0 20px var(--accent);
+  }
+  /* 移出窗口时淡出 */
+  #cur.is-hidden, #ring.is-hidden { opacity: 0 !important; }
+
+  /* ---------- 入场动画（置于卡片规则之前，避免覆盖 :hover 位移） ---------- */
+  .reveal {
+    opacity: 0; transform: translateY(16px);
+    transition: opacity .7s cubic-bezier(.2,.8,.2,1) var(--d,0ms),
+                transform .7s cubic-bezier(.2,.8,.2,1) var(--d,0ms);
+  }
+  .reveal.in { opacity: 1; transform: none; }
+  @keyframes dotPulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: .4; transform: scale(.78); }
+  }
+  .dot { animation: dotPulse 2.8s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) {
+    .reveal { opacity: 1; transform: none; transition: none; }
+    .dot { animation: none; }
+    html { scroll-behavior: auto; }
+  }
 
   /* ---------- 顶部导航（居中浮动药丸） ---------- */
   header.topnav { position: fixed; top: 0; left: 0; right: 0; z-index: 100; padding: 16px 16px 0; }
@@ -96,8 +154,10 @@
     display: flex; align-items: center; gap: 2px; padding: 6px 8px;
     border-radius: 999px; background: var(--nav-bg);
     backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
-    border: 1px solid var(--nav-border);
+    border: 1px solid var(--glass-border);
+    box-shadow: 0 10px 30px -18px rgba(0,0,0,.65);
   }
+  [data-theme='light'] .pill { box-shadow: 0 10px 28px -16px rgba(0,0,0,.28); }
   .brand { display: flex; align-items: center; gap: 8px; padding: 6px 14px 6px 10px; font-family: var(--font-display); font-weight: 600; font-size: 1rem; letter-spacing: -.02em; }
   .brand svg { width: 18px; height: 18px; }
   .nlink {
@@ -507,27 +567,89 @@
     const cur = document.getElementById('cur');
     const ring = document.getElementById('ring');
     if (!cur || !ring) return;
-    let mx = innerWidth / 2, my = innerHeight / 2, rx = mx, ry = my;
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let mx = innerWidth / 2, my = innerHeight / 2, rx = mx, ry = my, mode = 'idle';
+
     addEventListener('mousemove', (e) => {
       mx = e.clientX; my = e.clientY;
       cur.style.left = mx + 'px'; cur.style.top = my + 'px';
+      cur.classList.remove('is-hidden'); ring.classList.remove('is-hidden');
     });
+
+    // 指针移出窗口就淡出，回来再淡入
+    document.addEventListener('mouseleave', () => {
+      cur.classList.add('is-hidden'); ring.classList.add('is-hidden');
+    });
+
+    // 光环跟随带缓动（比光点慢半拍）
     (function loop() {
-      rx += (mx - rx) * 0.18; ry += (my - ry) * 0.18;
+      const k = reduce ? 1 : 0.18;
+      rx += (mx - rx) * k; ry += (my - ry) * k;
       ring.style.left = rx + 'px'; ring.style.top = ry + 'px';
       requestAnimationFrame(loop);
     })();
+
+    function setMode(next) {
+      if (next === mode) return;
+      mode = next;
+      cur.className = ''; ring.className = '';
+      if (next === 'text') cur.classList.add('is-text');
+      else if (next === 'link') { cur.classList.add('is-link'); ring.classList.add('is-link'); }
+      else if (next === 'astra') { cur.classList.add('is-astra'); ring.classList.add('is-astra'); }
+    }
+
     document.addEventListener('mouseover', (e) => {
       const el = e.target;
       if (!(el instanceof Element)) return;
-      if (el.closest('.copy')) {
-        cur.className = 'astra'; ring.className = 'link';
-      } else if (el.closest('a,button')) {
-        cur.className = 'link'; ring.className = 'link';
-      } else {
-        cur.className = ''; ring.className = '';
-      }
+      if (el.closest('.copy')) setMode('astra');
+      else if (el.closest('a,button')) setMode('link');
+      else if (el.matches('p,h1,h2,h3,h4,h5,h6,span,li,pre,code,b,strong,em,i')) setMode('text');
+      else setMode('idle');
     });
+  })();
+
+  // ---------- 滚动入场 ----------
+  (function () {
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    if (!('IntersectionObserver' in window)) return;
+    const sel = '.hero .eyebrow, .hero .title, .hero .tagline, .hero .sub, .hero .cta,'
+      + '.code-window, .sec-head, .card, .stat, .cmd, .opts, .note, .foot';
+    const els = Array.from(document.querySelectorAll(sel));
+    if (!els.length) return;
+    els.forEach((el) => {
+      el.classList.add('reveal');
+      const sibs = Array.from(el.parentElement.children).filter((c) => c.classList.contains('reveal'));
+      const i = sibs.indexOf(el);
+      if (i > 0) el.style.setProperty('--d', Math.min(i * 65, 320) + 'ms');
+    });
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((en) => {
+        if (en.isIntersecting) { en.target.classList.add('in'); io.unobserve(en.target); }
+      });
+    }, { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
+    els.forEach((el) => io.observe(el));
+  })();
+
+  // ---------- 导航滚动高亮 ----------
+  (function () {
+    if (!('IntersectionObserver' in window)) return;
+    const links = Array.from(document.querySelectorAll('.nlink[href^="#"]'));
+    const map = new Map();
+    links.forEach((a) => {
+      const sec = document.querySelector(a.getAttribute('href'));
+      if (sec) map.set(sec, a);
+    });
+    if (!map.size) return;
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((en) => {
+        if (!en.isIntersecting) return;
+        const a = map.get(en.target);
+        if (!a) return;
+        links.forEach((l) => l.classList.remove('active'));
+        a.classList.add('active');
+      });
+    }, { rootMargin: '-45% 0px -45% 0px' });
+    map.forEach((_, sec) => io.observe(sec));
   })();
 </script>
 </body>
