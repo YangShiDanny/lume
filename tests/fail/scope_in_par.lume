@@ -1,0 +1,13 @@
+// expect: 不能用 scope
+// par for 的多个 worker 共享同一个 arena，回退水位会把别的 worker
+// 刚分配的字符串一起回收 —— 这是内存踩踏，只能拒绝。
+fn main() {
+    a := [0; 8]
+    par for i in 0..8 {
+        scope {
+            s := "v" + int_to_str(i)
+            a[i] = str_len(s)
+        }
+    }
+    say("{a[0]}")
+}

@@ -21,6 +21,12 @@ pub enum Ty {
     /// 可选值 T? / 错误值 T!。用户决定合并成同一种「可空」语义：
     /// 用 { has, val } 表示，T! 只是 T? 的语法别名。
     Optional(Box<Ty>),
+    /// 动态数组 `Vec[T]`。和 `Array` 的区别是长度在运行期可变：
+    /// Array 是「指针 + 编译期/伴随参数里的长度」，Vec 是自带 len 的句柄。
+    Vec(Box<Ty>),
+    /// 枚举类型名。C 侧是 `int64_t` 的 typedef，这里单独记一个
+    /// 名字是为了能做穷尽性检查（`match` 少了变体要报错）。
+    Enum(String),
 }
 
 impl Ty {
@@ -35,6 +41,8 @@ impl Ty {
             Ty::Unknown => "?".to_string(),
             Ty::Struct(s) => s.clone(),
             Ty::Array(inner) => format!("[{}]", inner.name()),
+            Ty::Vec(inner) => format!("Vec[{}]", inner.name()),
+            Ty::Enum(s) => s.clone(),
             Ty::Optional(inner) => format!("{}?", inner.name()),
         }
     }
@@ -68,6 +76,8 @@ pub struct Checker {
     pub(crate) functions: HashMap<String, FuncSig>,
     pub(crate) generic_fns: HashSet<String>,
     pub(crate) structs: HashMap<String, HashMap<String, Ty>>,
+    /// 枚举名 → 变体名列表（按声明顺序）。穷尽性检查和错误提示用。
+    pub(crate) enums: HashMap<String, Vec<String>>,
     pub(crate) methods: HashMap<String, HashMap<String, FuncSig>>,
     pub(crate) scopes: Vec<HashMap<String, Ty>>,
     pub(crate) current_ret: Ty,
@@ -92,6 +102,7 @@ impl Checker {
             functions: HashMap::new(),
             generic_fns: HashSet::new(),
             structs: HashMap::new(),
+            enums: HashMap::new(),
             methods: HashMap::new(),
             scopes: Vec::new(),
             current_ret: Ty::Void,

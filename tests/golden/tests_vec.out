@@ -1,0 +1,18 @@
+// 编译成功: tests_vec
+[1] 空 len=0 is_empty=1 len2=0
+[2] len=3 v0=10 v1=20 v2=30
+[3] v[1]=99
+[4] last=30 pop=30 len=2
+[4] pop=99 last=10
+[5] len=1000 sum=499500 first=0 last=999
+[6] clear 后 len=0 is_empty=1
+[6] reserve 后 len=0
+[7] len=3 joined=abbccc names[1]=bb
+[8] toks=3 count=3 last=number
+[8] kinds=identplusnumber line2=2
+[9] make_squares len=5 v4=16
+[9] empty_vec len=0 is_empty=1
+[10] push 到 alias 后 sq.len=6 sq[5]=999
+[11] outer.len=2 first.len=2 first[1]=2
+[12] is_empty=0 len=6
+[13] 收尾

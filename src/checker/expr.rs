@@ -13,6 +13,18 @@ impl Checker {
                         let t = self.check_expr(e);
                         if matches!(t, Ty::Void) {
                             self.error("void 表达式不能用于字符串插值（free 只能作语句）");
+                        } else if matches!(t, Ty::Optional(_)) {
+                            // T? 在 C 里是 { has, val } 结构体，插值会把它当
+                            // 指针塞进 varargs —— 输出随机内容且不报错。
+                            self.error_hint(
+                                format!("可空值（{}）不能直接插值", t.name()),
+                                "先判 .has 再用 .val，或用 ! 强制解包",
+                            );
+                        } else if let Ty::Struct(sname) = &t {
+                            // 结构体进 printf 的 varargs 同样是 UB（读到的
+                            // 是第一个字段）。有 op_str 就自动调它，没有就
+                            // 明确拒绝，而不是让它静默打个 0。
+                            self.require_op_str(sname);
                         }
                     }
                 }
@@ -89,6 +101,20 @@ impl Checker {
                 let et = self.check_expr(e);
                 match op {
                     UnOp::Neg => {
+                        // 结构体的取负走 op_neg（`-a` → `Big_op_neg(&a)`）
+                        if let Ty::Struct(sname) = &et {
+                            if self.structs.contains_key(sname) {
+                                let sname = sname.clone();
+                                if let Some(ret) = self.check_unop_overload(*op, &sname) {
+                                    return ret;
+                                }
+                                self.error_hint(
+                                    format!("结构体 '{}' 不支持取负（没有定义 op_neg）", sname),
+                                    format!("在 struct {} 里加 `fn op_neg() -> {}`", sname, sname),
+                                );
+                                return Ty::Unknown;
+                            }
+                        }
                         if !et.is_unknown() && et != Ty::Int && et != Ty::Float {
                             self.error(format!(
                                 "负号只能用于数字，但得到 {}",
@@ -160,9 +186,22 @@ impl Checker {
                     }
                 }
                 if let Expr::Ident(name) = callee.as_ref() {
-                    if name == "say" || name == "write" {
+                    if name == "say" || name == "write"
+                        || name == "eprint" || name == "ewrite"
+                    {
                         for a in args {
-                            let _ = self.check_expr(a);
+                            let t = self.check_expr(a);
+                            if matches!(t, Ty::Optional(_)) {
+                                // 同插值：{ has, val } 结构体进 varargs 是 UB
+                                self.error_hint(
+                                    format!("{}() 不能直接打印可空值（{}）", name, t.name()),
+                                    "先判 .has 再用 .val，或用 ! 强制解包",
+                                );
+                            } else if let Ty::Struct(sname) = &t {
+                                // 有 op_str 就按字符串打印，没有就拒绝 ——
+                                // 否则 printf 读到的是结构体第一个字段。
+                                self.require_op_str(sname);
+                            }
                         }
                         return Ty::Void;
                     }
@@ -209,15 +248,61 @@ impl Checker {
 
                 // 方法调用
                 if let Expr::Field(obj, method) = callee.as_ref() {
-                    let obj_ty = self.check_expr(obj);
-                    for a in args {
-                        let _ = self.check_expr(a);
+                    // 枚举静态方法 `Tag.name(v)`。必须在 check_expr(obj) 之前拦，
+                    // `Tag` 是类型名不是变量，先查变量表只会得到「未定义的变量」。
+                    if let Expr::Ident(tname) = obj.as_ref() {
+                        if self.enums.contains_key(tname) {
+                            if method != "name" {
+                                self.error_hint(
+                                    format!("枚举 '{}' 没有方法 '{}'", tname, method),
+                                    format!("枚举只支持 {}.name(值)", tname),
+                                );
+                                return Ty::Unknown;
+                            }
+                            if args.len() != 1 {
+                                self.error_hint(
+                                    format!("{}.name() 需要 1 个参数，但传了 {} 个", tname, args.len()),
+                                    format!("写成 {}.name(某个 {} 值)", tname, tname),
+                                );
+                                for a in args {
+                                    let _ = self.check_expr(a);
+                                }
+                                return Ty::Str;
+                            }
+                            let at = self.check_expr(&args[0]);
+                            let ok = match &at {
+                                Ty::Unknown | Ty::Int => true,
+                                Ty::Enum(n) => n == tname,
+                                _ => false,
+                            };
+                            if !ok {
+                                self.error_hint(
+                                    format!(
+                                        "{}.name() 的参数必须是 {}，但这里是 {}",
+                                        tname, tname, at.name()
+                                    ),
+                                    "传一个该枚举的值（或整数）",
+                                );
+                            }
+                            return Ty::Str;
+                        }
                     }
-                    // a.len() → int
+                    let obj_ty = self.check_expr(obj);
+                    // a.len() / v.len() → int
                     if method == "len" && args.is_empty() {
-                        if let Ty::Array(_) = &obj_ty {
+                        if let Ty::Array(_) | Ty::Vec(_) = &obj_ty {
                             return Ty::Int;
                         }
+                    }
+                    // Vec 的内置方法（不进 builtins 表：它们是接收者的类型
+                    // 决定的方法，不是自由函数）。放在实参检查之前，
+                    // 由它自己按参数位置检查，避免重复报告同一个错误。
+                    if let Ty::Vec(elem) = &obj_ty {
+                        let elem = elem.as_ref().clone();
+                        return self.check_vec_method(&elem, method, args);
+                    }
+                    for a in args {
+                        let _ = self.check_expr(a);
                     }
                     if let Ty::Struct(sname) = &obj_ty {
                         if let Some(methods) = self.methods.get(sname).cloned() {
@@ -237,6 +322,24 @@ impl Checker {
             }
 
             Expr::Field(obj, name) => {
+                // 枚举变体 `Tag.Number`。同样要在 check_expr(obj) 之前拦：
+                // 左边是**类型名**，不是变量。
+                if let Expr::Ident(tname) = obj.as_ref() {
+                    if let Some(variants) = self.enums.get(tname).cloned() {
+                        if !variants.iter().any(|v| v == name) {
+                            let hint = if variants.len() <= 8 {
+                                format!("可用变体：{}", variants.join(" / "))
+                            } else {
+                                "检查变体名拼写（见 enum 定义）".to_string()
+                            };
+                            self.error_hint(
+                                format!("枚举 '{}' 没有变体 '{}'", tname, name),
+                                hint,
+                            );
+                        }
+                        return Ty::Enum(tname.clone());
+                    }
+                }
                 let obj_ty = self.check_expr(obj);
                 // 可空值的 .has / .val
                 if name == "has" || name == "val" {
@@ -246,7 +349,7 @@ impl Checker {
                 }
                 // a.len → int
                 if name == "len" {
-                    if let Ty::Array(_) = &obj_ty {
+                    if let Ty::Array(_) | Ty::Vec(_) = &obj_ty {
                         return Ty::Int;
                     }
                 }
@@ -271,7 +374,7 @@ impl Checker {
                 }
                 // a[i] 的类型就是数组元素类型；不是数组就还按 int 算
                 match &obj_ty {
-                    Ty::Array(inner) => inner.as_ref().clone(),
+                    Ty::Array(inner) | Ty::Vec(inner) => inner.as_ref().clone(),
                     _ => Ty::Int,
                 }
             }
@@ -459,7 +562,128 @@ impl Checker {
         }
     }
 
+    // ── 运算符重载 ──
+    //
+    // 语义全部来自 `crate::ops`（和 codegen 共用一份解析）。这里只做
+    // 类型检查：右侧类型对不对、返回类型对不对，以及「没定义」时的提示。
+
+    /// 左操作数是结构体时，按 `op_*` 方法解析二元运算符。
+    ///
+    /// - `None` —— 左操作数不是已知结构体 / 运算符不可重载 → 交回内建规则；
+    /// - `Some(Ty::Unknown)` —— 已经报过错，别再叠一条「算术运算类型不匹配」。
+    fn check_struct_overload(&mut self, op: BinOp, lt: &Ty, rt: &Ty) -> Option<Ty> {
+        let sname = match lt {
+            Ty::Struct(n) if self.structs.contains_key(n) => n.clone(),
+            _ => return None,
+        };
+        if !crate::ops::is_overloadable(op) {
+            return None;
+        }
+        let methods = self.methods.get(&sname).cloned().unwrap_or_default();
+        let call = match crate::ops::resolve_binop(op, |m| methods.contains_key(m)) {
+            Some(c) => c,
+            None => {
+                let sym = crate::ops::symbol(op);
+                let want = crate::ops::primary_method(op).unwrap_or("op_xxx");
+                let ret = if crate::ops::is_comparison(op) {
+                    "bool".to_string()
+                } else {
+                    sname.clone()
+                };
+                self.error_hint(
+                    format!("结构体 '{}' 不支持 {} 运算（没有定义 {}）", sname, sym, want),
+                    format!(
+                        "在 struct {} 里加 `fn {}(o: {}) -> {}`",
+                        sname, want, sname, ret
+                    ),
+                );
+                return Some(Ty::Unknown);
+            }
+        };
+        let sig = match methods.get(call.method) {
+            Some(s) => s.clone(),
+            None => return Some(Ty::Unknown),
+        };
+        if sig.params.len() != 1 {
+            self.error_hint(
+                format!(
+                    "运算符方法 {}.{} 必须恰好有 1 个参数（self 是隐式的）",
+                    sname, call.method
+                ),
+                format!("写成 `fn {}(o: {})`，右操作数由调用点传入", call.method, sname),
+            );
+            return Some(Ty::Unknown);
+        }
+        let want = &sig.params[0];
+        if !rt.is_unknown() && !want.is_unknown() && rt != want {
+            self.error_hint(
+                format!(
+                    "{} 的右操作数类型不匹配：{} 期望 {}，得到 {}",
+                    crate::ops::symbol(op),
+                    call.method,
+                    want.name(),
+                    rt.name()
+                ),
+                "运算符两边必须同类型，不做隐式转换",
+            );
+        }
+        if crate::ops::is_comparison(op) {
+            if !sig.ret.is_unknown() && sig.ret != Ty::Bool {
+                self.error_hint(
+                    format!(
+                        "运算符方法 {}.{} 必须返回 bool（比较的结果是 bool）",
+                        sname, call.method
+                    ),
+                    "把返回类型改成 bool",
+                );
+            }
+            return Some(Ty::Bool);
+        }
+        Some(sig.ret)
+    }
+
+    /// 一元取负的重载。返回 None 表示这个结构体没有 op_neg（已报错）。
+    fn check_unop_overload(&mut self, op: UnOp, sname: &str) -> Option<Ty> {
+        let methods = self.methods.get(sname).cloned().unwrap_or_default();
+        let call = crate::ops::resolve_unop(op, |m| methods.contains_key(m))?;
+        let sig = methods.get(call.method)?.clone();
+        if !sig.params.is_empty() {
+            self.error_hint(
+                format!("运算符方法 {}.{} 不能有参数", sname, call.method),
+                "取负是一元的，写成 `fn op_neg() -> 同类型`",
+            );
+        }
+        Some(sig.ret)
+    }
+
+    /// 这个结构体能不能在插值 / say 里自动转字符串。
+    pub(crate) fn has_op_str(&self, sname: &str) -> bool {
+        self.methods
+            .get(sname)
+            .and_then(|ms| ms.get(crate::ops::STR_METHOD))
+            .map(|s| s.params.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// 插值 / say 里出现结构体时的统一检查。
+    fn require_op_str(&mut self, sname: &str) {
+        if self.has_op_str(sname) {
+            return;
+        }
+        self.error_hint(
+            format!("结构体 '{}' 不能直接打印或插值（没有定义 op_str）", sname),
+            format!(
+                "在 struct {} 里加 `fn op_str() -> str`，之后 \"{{x}}\" 和 say(x) 都会自动调它",
+                sname
+            ),
+        );
+    }
+
     pub(crate) fn check_binop(&mut self, op: &BinOp, lt: &Ty, rt: &Ty) -> Ty {
+        // 结构体运算符重载优先于内建数值规则。
+        if let Some(t) = self.check_struct_overload(*op, lt, rt) {
+            return t;
+        }
         use BinOp::*;
         match op {
             Add | Sub | Mul | Div | Mod => {
@@ -578,10 +802,27 @@ impl Checker {
                     && !expected.is_unknown()
                     && &arg_ty != expected
                 {
-                    self.error(format!(
+                    // 数组字面量塞给 Vec 参数是最常见的误用：两者在 C 里
+                    // 是不同的东西（栈数组 vs 带 len 的句柄），不能隐式转。
+                    let hint = match (expected, &arg_ty) {
+                        (Ty::Vec(_), Ty::Array(_)) => Some(format!(
+                            "固定数组和 Vec 是两种类型；先写 `tmp: {} = [...]` 建一个再传，\
+                             或者把参数类型改成固定数组",
+                            expected.name()
+                        )),
+                        (Ty::Array(_), Ty::Vec(_)) => {
+                            Some("Vec 是运行期长度的句柄，不能当固定数组传".to_string())
+                        }
+                        _ => None,
+                    };
+                    let msg = format!(
                         "函数 '{}' 第 {} 个参数类型不匹配：期望 {}，得到 {}",
                         fname, i + 1, expected.name(), arg_ty.name()
-                    ));
+                    );
+                    match hint {
+                        Some(h) => self.error_hint(msg, h),
+                        None => self.error(msg),
+                    }
                 }
             }
         }
@@ -791,6 +1032,62 @@ impl Checker {
         // map 的返回类型 = 元素类型或函数的返回类型
         // （只做管道融合的场景下 f(T)->U；codegen 会检查得更细）
         Some(Ty::Array(Box::new(elem)))
+    }
+}
+
+// ── Vec 的内置方法 ──
+//
+// 它们不进取 `builtins::TABLE`：那是「自由函数名 → C 函数」的映射，
+// 而 Vec 的方法由接收者的**元素类型**决定（push 要校验实参类型，
+// pop 要返回元素类型），只能按类型分派。
+impl Checker {
+    fn check_vec_method(&mut self, elem: &Ty, method: &str, args: &[Expr]) -> Ty {
+        // 会改 buffer 的方法在 par for 里是数据竞争：多个 worker 同时
+        // realloc 同一个 Vec，轻则丢元素重则踩坏堆。
+        let mutating = matches!(method, "push" | "pop" | "clear" | "free" | "reserve");
+        if mutating && self.par_depth > 0 {
+            self.error_hint(
+                format!("par for 里不能调用 Vec.{}()", method),
+                "worker 之间共享同一个 Vec 会并发 realloc；把 push 挪到 par for 外面",
+            );
+            return Ty::Unknown;
+        }
+
+        match method {
+            "len" | "length" if args.is_empty() => Ty::Int,
+            "is_empty" if args.is_empty() => Ty::Bool,
+            "clear" | "free" if args.is_empty() => Ty::Void,
+            "pop" | "last" if args.is_empty() => elem.clone(),
+            "reserve" if args.len() == 1 => {
+                let t = self.check_expr(&args[0]);
+                if !t.is_unknown() && t != Ty::Int {
+                    self.error(format!("Vec.reserve 的参数必须是 int，但得到 {}", t.name()));
+                }
+                Ty::Void
+            }
+            "push" if args.len() == 1 => {
+                let t = self.check_expr(&args[0]);
+                if !t.is_unknown() && !elem.is_unknown() && &t != elem {
+                    self.error_hint(
+                        format!(
+                            "Vec[{}].push 的实参类型不匹配：得到 {}",
+                            elem.name(),
+                            t.name()
+                        ),
+                        format!("往这个 Vec 里只能 push {}", elem.name()),
+                    );
+                }
+                Ty::Void
+            }
+            _ => {
+                let known = "len / is_empty / push / pop / last / clear / reserve / free";
+                self.error_hint(
+                    format!("Vec 没有方法 '{}'", method),
+                    format!("可用的方法：{}", known),
+                );
+                Ty::Unknown
+            }
+        }
     }
 }
 

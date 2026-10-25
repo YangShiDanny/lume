@@ -1,0 +1,135 @@
+// Vec[T]：长度在运行期可变的数组（自举第 5 块地基）。
+//
+// 固定数组 [T; N] 的长度编译期就定了，词法器的 token 流做不到。
+// 这里逐项断言 Vec 的对外行为，golden 逐字节比对 —— 值算错了就红。
+
+struct Tok {
+    kind: str
+    line: int
+}
+
+struct Lexer {
+    toks: Vec[Tok]
+    count: int
+
+    fn add(kind: str) {
+        toks.push(Tok(kind: kind, line: count))
+        count = count + 1
+    }
+
+    fn last_kind() -> str {
+        return toks[toks.len() - 1].kind
+    }
+
+    fn kinds() -> str {
+        s := ""
+        for t in toks {
+            s = s + t.kind
+        }
+        return s
+    }
+}
+
+// Vec 作参数：引用语义，函数里 push 外面看得见
+fn fill(v: Vec[int], n: int) {
+    i := 0
+    while i < n {
+        v.push(i * i)
+        i = i + 1
+    }
+}
+
+// Vec 作返回类型：`return v` 交句柄，`return []` 现场建空 Vec
+fn make_squares(n: int) -> Vec[int] {
+    v: Vec[int] = []
+    fill(v, n)
+    return v
+}
+
+fn empty_vec() -> Vec[int] {
+    return []
+}
+
+fn main() {
+    // [1] 空 Vec
+    v: Vec[int] = []
+    say("[1] 空 len={v.len()} is_empty={v.is_empty()} len2={v.len}")
+
+    // [2] push + 下标读
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    say("[2] len={v.len()} v0={v[0]} v1={v[1]} v2={v[2]}")
+
+    // [3] 下标写
+    v[1] = 99
+    say("[3] v[1]={v[1]}")
+
+    // [4] last / pop
+    say("[4] last={v.last()} pop={v.pop()} len={v.len()}")
+    say("[4] pop={v.pop()} last={v.last()}")
+
+    // [5] 批量 push：1000 次会跨好几轮 realloc
+    big: Vec[int] = []
+    i := 0
+    while i < 1000 {
+        big.push(i)
+        i = i + 1
+    }
+    sum := 0
+    for x in big {
+        sum = sum + x
+    }
+    say("[5] len={big.len()} sum={sum} first={big[0]} last={big[999]}")
+
+    // [6] clear / reserve
+    big.clear()
+    say("[6] clear 后 len={big.len()} is_empty={big.is_empty()}")
+    big.reserve(4096)
+    say("[6] reserve 后 len={big.len()}")
+
+    // [7] Vec[str]
+    names: Vec[str] = ["a", "bb", "ccc"]
+    joined := ""
+    for n in names {
+        joined = joined + n
+    }
+    say("[7] len={names.len()} joined={joined} names[1]={names[1]}")
+
+    // [8] Vec[Tok] + 结构体里的 Vec 字段 + 方法
+    lx := Lexer(toks: [], count: 0)
+    lx.add("ident")
+    lx.add("plus")
+    lx.add("number")
+    say("[8] toks={lx.toks.len()} count={lx.count} last={lx.last_kind()}")
+    say("[8] kinds={lx.kinds()} line2={lx.toks[2].line}")
+
+    // [9] 函数：Vec 参数 / 返回 Vec / 返回 []
+    sq := make_squares(5)
+    say("[9] make_squares len={sq.len()} v4={sq[4]}")
+    ev := empty_vec()
+    say("[9] empty_vec len={ev.len()} is_empty={ev.is_empty()}")
+
+    // [10] 别名：和固定数组一致，是引用语义
+    alias := sq
+    alias.push(999)
+    say("[10] push 到 alias 后 sq.len={sq.len()} sq[5]={sq[5]}")
+
+    // [11] 嵌套 Vec[T]（元素本身是句柄）
+    outer: Vec[Vec[int]] = []
+    a: Vec[int] = [1, 2]
+    b: Vec[int] = [3]
+    outer.push(a)
+    outer.push(b)
+    first: Vec[int] = outer[0]
+    say("[11] outer.len={outer.len()} first.len={first.len()} first[1]={first[1]}")
+
+    // [12] 插值里的 bool / int
+    say("[12] is_empty={sq.is_empty()} len={sq.len()}")
+
+    // [13] 释放。free 之后句柄不能再用，所以放在最后。
+    b.free()
+    sq.free()
+    v.free()
+    say("[13] 收尾")
+}

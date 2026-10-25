@@ -1,0 +1,8 @@
+// expect: 算术运算类型不匹配
+// str 只支持 str + str。不做 int → str 的隐式转换：
+// 拼没拼上必须一眼看得出，混类型请用插值 "{n}{s}"。
+fn main() {
+    n := 1
+    s := "count: " + n
+    say(s)
+}

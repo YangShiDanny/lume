@@ -50,6 +50,25 @@ impl Codegen {
                     return;
                 }
 
+                // ── Vec[T] 声明（必须在固定数组那两条分支之前）──
+                //
+                // 固定数组的 `gen_local_array_init` 对「没有声明 [T; N] 的
+                // 字面量」也会兜底成功，`v: Vec[int] = []` 会被它当成
+                // 长度为 0 的 C 栈数组。所以 Vec 的分支要抢在前面。
+                if let Some(vt) = ty.as_ref().and_then(vec_elem_type) {
+                    let elem = self.gen_type(vt);
+                    self.gen_vec_let(name, &elem, init, None);
+                    return;
+                }
+
+                // `let v := <已经是 Vec 的表达式>`：元素类型从来源推
+                if ty.is_none() {
+                    if let Some(elem) = self.inferred_vec_elem(init) {
+                        self.gen_vec_let(name, &elem, init, None);
+                        return;
+                    }
+                }
+
                 if let Some((elem_ty, len)) =
                     self.gen_repeat_array_init(name, ty.as_ref(), init, None)
                 {
@@ -107,7 +126,17 @@ impl Codegen {
 
             Stmt::Expr(e) => {
                 let s = self.gen_expr(e);
-                self.push_line(&format!("{};", s));
+                // 语句位置的值被丢弃。Vec 的 pop/last 会生成
+                // `(*(int64_t*)(lume_vec_pop(v)));` 这种纯取值语句，
+                // clang 报 -Wunused-value —— 而 `v.pop()` 当语句用是最
+                // 常见的写法。显式 (void) 转换把它变成「有意丢弃」。
+                // 带注释的（返回数组的调用会被替换成解释性注释）不能包，
+                // 否则生成 `(void)(/* ... */);` 这种空表达式。
+                if s.contains("/*") {
+                    self.push_line(&format!("{};", s));
+                } else {
+                    self.push_line(&format!("(void)({});", s));
+                }
             }
 
             Stmt::If { cond, then, els } => {
@@ -152,6 +181,26 @@ impl Codegen {
 
             Stmt::Return(v) => match v {
                 Some(e) => {
+                    // 返回 Vec 的函数：`return []` / `return [a, b]` 要现场
+                    // 建一个新 Vec（字面量本身不是 LumeVec*）。`return v`
+                    // 走下面的普通路径 —— 句柄直接返回，引用语义不变。
+                    if let (Some(elem), Expr::List(items)) =
+                        (self.cur_ret_vec_elem.clone(), e)
+                    {
+                        self.push_line(&format!(
+                            "LumeVec* _lume_vret = lume_vec_new((int64_t)sizeof({}));",
+                            elem
+                        ));
+                        for it in items {
+                            let val = self.gen_expr(it);
+                            self.vec_counter += 1;
+                            let tmp = format!("_lume_ve{}", self.vec_counter);
+                            self.push_line(&format!("{} {} = {};", elem, tmp, val));
+                            self.push_line(&format!("lume_vec_push(_lume_vret, &{});", tmp));
+                        }
+                        self.push_line("return _lume_vret;");
+                        return;
+                    }
                     // 返回数组：栈上的字面量不能直接返回（悬空指针），必须 malloc
                     if self.cur_ret_is_array {
                         if let Some(lines) = self.gen_array_return(e, None) {
@@ -186,6 +235,48 @@ impl Codegen {
         }
     }
 
+    /// `v: Vec[T] = <init>` 的生成。
+    ///
+    /// 字面量 `[]` / `[a, b]` → 新建句柄 + 逐个 push；
+    /// 其他表达式（别名、函数返回）→ 直接赋句柄。Vec 是**引用**语义，
+    /// 别名就是同一份数据，和固定数组一致。
+    pub(crate) fn gen_vec_let(
+        &mut self,
+        name: &str,
+        elem: &str,
+        init: &Expr,
+        fields: Option<&[String]>,
+    ) {
+        self.var_types
+            .insert(name.to_string(), "LumeVec*".to_string());
+        self.vec_elems.insert(name.to_string(), elem.to_string());
+        self.owned_arrays.remove(name);
+
+        if let Expr::List(items) = init {
+            self.push_line(&format!(
+                "LumeVec* {} = lume_vec_new((int64_t)sizeof({}));",
+                name, elem
+            ));
+            for it in items {
+                let val = match fields {
+                    Some(f) => self.gen_expr_with_self(it, f),
+                    None => self.gen_expr(it),
+                };
+                self.vec_counter += 1;
+                let tmp = format!("_lume_ve{}", self.vec_counter);
+                self.push_line(&format!("{} {} = {};", elem, tmp, val));
+                self.push_line(&format!("lume_vec_push({}, &{});", name, tmp));
+            }
+            return;
+        }
+
+        let v = match fields {
+            Some(f) => self.gen_expr_with_self(init, f),
+            None => self.gen_expr(init),
+        };
+        self.push_line(&format!("LumeVec* {} = {};", name, v));
+    }
+
     pub(crate) fn gen_stmt_with_self(&mut self, stmt: &Stmt, fields: &[String]) {
         match stmt {
             Stmt::Let { name, ty, init } => {
@@ -215,6 +306,19 @@ impl Codegen {
                     }
                     self.owned_arrays.remove(name); // 切片是借用，不能 free
                     return;
+                }
+
+                // ── Vec[T] 声明（方法体内，必须在固定数组分支之前）──
+                if let Some(vt) = ty.as_ref().and_then(vec_elem_type) {
+                    let elem = self.gen_type(vt);
+                    self.gen_vec_let(name, &elem, init, Some(fields));
+                    return;
+                }
+                if ty.is_none() {
+                    if let Some(elem) = self.inferred_vec_elem(init) {
+                        self.gen_vec_let(name, &elem, init, Some(fields));
+                        return;
+                    }
                 }
 
                 if let Some((elem_ty, len)) =
@@ -273,7 +377,11 @@ impl Codegen {
 
             Stmt::Expr(e) => {
                 let s = self.gen_expr_with_self(e, fields);
-                self.push_line(&format!("{};", s));
+                if s.contains("/*") {
+                    self.push_line(&format!("{};", s));
+                } else {
+                    self.push_line(&format!("(void)({});", s));
+                }
             }
 
             Stmt::If { cond, then, els } => {
@@ -438,6 +546,11 @@ impl Codegen {
     }
 
     pub(crate) fn gen_for(&mut self, var: &str, iter: &Expr, body: &Block) {
+        // 方法体里的循环体也要能裸写字段名（`for t in toks { count = ... }`）。
+        // gen_stmt_with_self 带 fields 参数，gen_for 没有，从 cur_field_names
+        // 兜回来 —— 不然循环体里 `toks` 会生成裸的 C 标识符（未声明）。
+        let fnames = self.cur_field_names.clone();
+        let fopt: Option<&[String]> = if fnames.is_empty() { None } else { Some(&fnames) };
         match iter {
             Expr::Range(start, end, inclusive) => {
                 let s = self.gen_expr(start);
@@ -458,7 +571,7 @@ impl Codegen {
                 ));
                 self.var_types.insert(var.to_string(), "int64_t".to_string());
 
-                self.gen_loop_body(body, None);
+                self.gen_loop_body(body, fopt);
                 self.push_line("}");
 
                 // 退出循环，恢复原来的非负状态
@@ -498,10 +611,33 @@ impl Codegen {
                 self.var_types.insert(var.to_string(), elem_ty);
             }
             Expr::Ident(arr_name) => {
-                // 局部数组字面量和数组参数都在 array_len_exprs 里：
-                // 前者长度是常量，后者是伴随参数 {name}_len。
-                // 有了隐式长度参数，for v in a 对两者都能用。
-                if let Some(len_expr) = self.array_len_exprs.get(arr_name).cloned() {
+                // Vec 的遍历：长度是运行期读的 `v->len`。
+                // 注意循环体里 push 会让 realloc 搬走 buffer，正在遍历时
+                // 追加元素等于在雷区里走 —— 需要这种用法就先拷一份。
+                let as_ident = Expr::Ident(arr_name.clone());
+                if let Some(elem_ty) = self.inferred_vec_elem(&as_ident) {
+                    // 方法体里的裸字段名要写成 `_self->f`；同名局部变量优先。
+                    let is_field = fopt
+                        .map(|f| f.iter().any(|n| n == arr_name))
+                        .unwrap_or(false);
+                    let base = if is_field && !self.var_types.contains_key(arr_name) {
+                        format!("_self->{}", arr_name)
+                    } else {
+                        arr_name.clone()
+                    };
+                    let idx = format!("_i_{}", arr_name);
+                    // 不打 vectorize 提示：Vec 可能装 str / 结构体，clang 会
+                    // 因为「要求向量化但做不到」发 -Wpass-failed 警告。
+                    self.push_line(&format!(
+                        "for (int64_t {} = 0; {} < ({})->len; {}++) {{",
+                        idx, idx, base, idx
+                    ));
+                    self.push_line(&format!(
+                        "{} {} = *(({}*)(({})->data) + {});",
+                        elem_ty, var, elem_ty, base, idx
+                    ));
+                    self.var_types.insert(var.to_string(), elem_ty);
+                } else if let Some(len_expr) = self.array_len_exprs.get(arr_name).cloned() {
                     let elem_ty = self.array_elem_types.get(arr_name)
                         .cloned().unwrap_or_else(|| "int64_t".to_string());
                     let idx = format!("_i_{}", arr_name);
@@ -524,7 +660,7 @@ impl Codegen {
             }
             _ => self.push_line("/* for: 暂不支持 */"),
         }
-        self.gen_loop_body(body, None);
+        self.gen_loop_body(body, fopt);
         self.push_line("}");
     }
 
@@ -645,6 +781,10 @@ impl Codegen {
             }
             Pattern::Ident(_) => "1".to_string(),  // 变量绑定总是匹配
             Pattern::Tuple(_) => "1".to_string(),  // 元组总是匹配（第一版）
+            // 枚举变体：直接和编译期常量比。C 侧是 #define，没有实体符号。
+            Pattern::EnumVariant(tname, vname) => {
+                format!("{} == {}_{}", mv, tname, vname)
+            }
             // 结构体模式：比较类型标签。
             // tag 在 gen_struct_decl 里加字段、StructLit 里填值，
             // 三处必须同步，否则解构会静默绑错数据。

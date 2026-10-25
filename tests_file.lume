@@ -1,0 +1,75 @@
+// tests_file.lume
+// 文件读写 / 命令行参数 / exit / stderr —— 自举所需的 OS 地基。
+//
+// 临时文件都写在 CWD（run_tests.sh 在 mktemp -d 里跑），不污染仓库。
+// 文件名统一带 _lume_t 前缀，一眼能认出是测试产物。
+
+fn main() {
+    // ── 写 → 读 回合 ──
+    ok := write_file("_lume_t1.txt", "hello\nworld\n")
+    say("[file] write={ok}  期望 true")
+
+    c := read_file("_lume_t1.txt")
+    say("[file] has={c.has}  期望 true")
+    if c.has {
+        say("[file] len={str_len(c.val)}  期望 12")
+        say("[file] slice=[{str_slice(c.val, 0, 5)}]  期望 [hello]")
+        say("[file] contains={str_contains(c.val, "world")}  期望 true")
+        // 换行必须原样保留：读的是字节不是行
+        say("[file] 换行保留={str_contains(c.val, "o\nw")}  期望 true")
+        // 内容与 arena 里的派生字符串是同类，可以直接切片拼接
+        say("[file] 拼接=[{str_slice(c.val, 0, 5) + "!"}]  期望 [hello!]")
+    }
+
+    // ── 追加 ──
+    a := append_file("_lume_t1.txt", "third\n")
+    c2 := read_file("_lume_t1.txt")
+    say("[file] append={a} len={str_len(c2!)}  期望 true 18")
+
+    // ── 空文件 ≠ 打不开 ──
+    // 这是 read_file 返回 str? 而不是 "" 的理由：空文件是合法内容。
+    write_file("_lume_t2.txt", "")
+    e := read_file("_lume_t2.txt")
+    say("[file] empty has={e.has} len={str_len(e.val)}  期望 true 0")
+
+    m := read_file("_lume_no_such_file_xyz.txt")
+    say("[file] missing has={m.has} val=[{m.val}]  期望 false []")
+
+    // ── 存在性 / 删除 ──
+    ex1 := file_exists("_lume_t1.txt")
+    say("[file] exists(有)={ex1}  期望 true")
+    ex2 := file_exists("_lume_no_such_file_xyz.txt")
+    say("[file] exists(无)={ex2}  期望 false")
+    // 目录不算文件
+    ex3 := file_exists("../")
+    say("[file] exists(目录)={ex3}  期望 false")
+
+    rm := remove_file("_lume_t1.txt")
+    ex4 := file_exists("_lume_t1.txt")
+    say("[file] remove={rm} then_exists={ex4}  期望 true false")
+    rm2 := remove_file("_lume_t1.txt")
+    say("[file] remove 不存在的={rm2}  期望 false")
+    remove_file("_lume_t2.txt")
+
+    // ── 命令行参数 ──
+    // run_tests.sh 不传额外参数，所以只有 argv[0]。
+    n := arg_count()
+    say("[arg] count={n}  期望 1")
+    say("[arg] arg0 非空={str_len(arg(0)) > 0}  期望 true")
+    say("[arg] 越界=[{arg(999)}]  期望 []")
+    say("[arg] 负数=[{arg(-1)}]  期望 []")
+
+    // ── stderr ──
+    // 下面两行进 stderr。脚本把 2>&1 合流后比对，所以顺序也要对：
+    // stdout 是异步队列，eprint 会先 flush 它。
+    say("[err] 上一行是 stdout，下面两行是 stderr")
+    eprint("[err] eprint 插值 {1 + 1}  期望 2")
+    ewrite("[err] ewrite 不换行，")
+    ewrite("这一半接在后面\n")
+
+    // ── exit ──
+    // exit(0) 之后的语句不该执行到；负向用例 exit_code.lume 验证非零退出码。
+    say("[exit] 即将 exit(0)")
+    exit(0)
+    say("[exit] 这行不该出现")
+}

@@ -1,0 +1,15 @@
+// expect: match 没有覆盖枚举
+// 漏了变体：运行期会静默什么都不做，必须在编译期就报出来。
+enum Tag {
+    A
+    B
+    C
+}
+
+fn main() {
+    t := Tag.A
+    match t {
+        Tag.A => say("a"),
+        Tag.B => say("b")
+    }
+}

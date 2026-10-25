@@ -1,0 +1,5 @@
+// 编译成功: main
+calc: [7]x
+calc 包内另一文件: aa
+跨包结构体: [5]ok w=ok n=5
+legacy 没被拉进来（否则 sa_trim_last 会歧义）

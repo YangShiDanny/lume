@@ -1,0 +1,171 @@
+// `scope { ... }`：块内派生的字符串在块尾一次性还给 arena。
+//
+// 验三件事：
+//   1. 值正确 —— scope 不影响计算结果
+//   2. 内存有界 —— 循环里套 scope 后 arena 不再无限增长
+//   3. 回收不越界 —— 内层回收不能踩坏外层字符串，return 出去的不能悬垂
+
+struct Namer {
+    prefix: str
+
+    // 方法体里的 scope（走 gen_stmt_with_self 那条路）
+    fn tag(k: int) -> str {
+        scope {
+            return prefix + int_to_str(k)
+        }
+    }
+}
+
+// 只能靠 scope 压住内存的典型场景：函数体里一轮一轮派生字符串，
+// 最后返回一个结果。
+fn count_digits(n: int) -> int {
+    total := 0
+    i := 0
+    while i < n {
+        scope {
+            s := int_to_str(i)
+            total = total + str_len(s)
+        }
+        i = i + 1
+    }
+    return total
+}
+
+fn make_tag(k: int) -> str {
+    scope {
+        return "tag:" + int_to_str(k)
+    }
+}
+
+fn main() {
+    say("===== scope 块 =====")
+
+    // ── 1. 值正确性 + 内存有界 ──
+    m0 := str_arena_bytes()
+    n := 0
+    i := 0
+    while i < 1000 {
+        scope {
+            s := "v" + int_to_str(i)
+            n = n + str_len(s)
+        }
+        i = i + 1
+    }
+    say("[1] 1000 轮 scope 后的校验和 = {n}  期望 3890")
+    say("[2] arena 增长 = {str_arena_bytes() - m0} 字节  期望 0")
+
+    // ── 2. 对照组：同一段代码去掉 scope，必然一路涨 ──
+    m1 := str_arena_bytes()
+    m := 0
+    j := 0
+    while j < 1000 {
+        s := "v" + int_to_str(j)
+        m = m + str_len(s)
+        j = j + 1
+    }
+    grew := str_arena_bytes() - m1
+    say("[3] 不加 scope 的同款循环增长 = {grew} 字节  期望 > 0")
+    say("[4] 校验和 = {m}  期望 3890")
+
+    // ── 3. break / continue 会跳过块尾，必须补释放 ──
+    m2 := str_arena_bytes()
+    q := 0
+    acc := 0
+    while q < 200 {
+        q = q + 1
+        scope {
+            u := "w" + int_to_str(q)
+            if q % 7 == 0 {
+                continue
+            }
+            if q == 150 {
+                break
+            }
+            acc = acc + str_len(u)
+        }
+    }
+    say("[5] break/continue 循环后 arena 增长 = {str_arena_bytes() - m2} 字节  期望 0")
+    say("[6] 循环在 q = {q} 处 break  期望 150")
+    say("[7] 累加到的长度 = {acc}  期望 419")
+
+    // ── 4. 嵌套：内层回收不能踩坏外层 ──
+    scope {
+        a := "outer-" + int_to_str(111)
+        scope {
+            b := str_repeat("x", 64)
+            if str_len(b) == 0 {
+                say("b 不该为空")
+            }
+        }
+        // 紧接着在刚释放的区域上重新分配 —— 如果内层回退过了头，
+        // 这一步就会把 a 覆盖掉。
+        c := str_repeat("y", 64)
+        say("[8] 内层回收后外层仍完整 = [{a}]  复用区长度 = {str_len(c)}  期望 outer-111 / 64")
+    }
+
+    // ── 5. for 的两种形态 ──
+    r0 := str_arena_bytes()
+    total := 0
+    for i in 0..100 {
+        scope {
+            s := "r" + int_to_str(i)
+            total = total + str_len(s)
+        }
+    }
+    say("[9] for range 里 scope 的 arena 增长 = {str_arena_bytes() - r0}  期望 0")
+    say("[10] 校验和 = {total}  期望 290")
+
+    xs := [1, 2, 3, 4, 5]
+    a0 := str_arena_bytes()
+    sacc := 0
+    for v in xs {
+        scope {
+            s := "e" + int_to_str(v)
+            sacc = sacc + str_len(s)
+        }
+    }
+    say("[11] for 数组里 scope 的 arena 增长 = {str_arena_bytes() - a0}  期望 0")
+    say("[12] 校验和 = {sacc}  期望 10")
+
+    // ── 6. 方法体里的 scope ──
+    nm := Namer(prefix: "id")
+    say("[13] 方法体里的 scope = [{nm.tag(7)}]  期望 [id7]")
+
+    // ── 7. return 在 scope 里：故意泄漏，但绝不能悬垂 ──
+    t := make_tag(7)
+    junk := str_repeat("Z", 512)
+    say("[14] return 出 scope 的字符串 = [{t}]  后续分配后仍完整")
+    say("[15] 为了让分配真的发生，junk 长度 = {str_len(junk)}  期望 512")
+
+    // ── 8. 函数一整轮跑完，内存不会堆到 1000 条 ──
+    m3 := str_arena_bytes()
+    say("[16] count_digits(1000) = {count_digits(1000)}  期望 2890")
+    say("[17] 该函数跑完 arena 增长 = {str_arena_bytes() - m3} 字节  期望 0")
+
+    // ── 9. 嵌套循环：内层 break 只能回收内层 scope ──
+    // 如果按「跳出循环就释放全部已打开的水位」来写，内层 break 会把外层
+    // scope 也回收掉，outer_s 变成悬垂指针 —— 后面每一轮都会读到垃圾。
+    m4 := str_arena_bytes()
+    total2 := 0
+    for i in 0..20 {
+        scope {
+            outer_s := "out" + int_to_str(i)
+            for j in 0..20 {
+                scope {
+                    inner := "in" + int_to_str(j)
+                    if j == 3 {
+                        break
+                    }
+                    if j == 1 {
+                        continue
+                    }
+                    total2 = total2 + str_len(inner)
+                }
+            }
+            // 内层 break 之后外层字符串必须还完整
+            total2 = total2 + str_len(outer_s)
+        }
+    }
+    say("[18] 嵌套循环校验和 = {total2}  期望 210")
+    say("[19] 嵌套循环 arena 增长 = {str_arena_bytes() - m4} 字节  期望 0")
+}

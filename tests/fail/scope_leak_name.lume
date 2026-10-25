@@ -1,0 +1,10 @@
+// expect: 未定义
+// scope 有块作用域：块内声明的变量在外面看不到。
+// 这里如果编译通过，说明 scope 被当成了「只是回收内存」的透明块。
+fn main() {
+    scope {
+        hidden := "只在块内"
+        say(hidden)
+    }
+    say(hidden)
+}

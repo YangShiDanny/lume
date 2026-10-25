@@ -118,6 +118,47 @@ if [ -d "$ROOT/tests/multi" ]; then
     check_positive "multi" "$ROOT/tests/multi/main.lume"
 fi
 
+# ── 库用例（LUME_PATH / 包 / 依赖） ──
+# 每个 tests/lib*/ 目录是一例：main.lume 是入口，库藏在它旁边。
+#   .lib/   散装库（库根下直接放的 .lume），测试 LUME_PATH 基本通路
+#   .pkgs/  目录包（一级子目录 = 包），测试依赖、按需加载、歧义消解
+# 这些目录都是隐藏目录，自动扫描不看，所以不加 LUME_PATH 一定编不过 ——
+# 用例能过就说明加载机制真的生效了，不是碰巧被同目录扫描捡到的。
+shopt -s nullglob
+lib_cases=("$ROOT"/tests/lib*)
+shopt -u nullglob
+
+if [ ${#lib_cases[@]} -gt 0 ]; then
+    printf '==> 库用例（LUME_PATH / 包依赖）\n'
+    for d in "${lib_cases[@]}"; do
+        [ -d "$d" ] || continue
+        if [ -d "$d/.pkgs" ]; then
+            root="$d/.pkgs"
+        elif [ -d "$d/.lib" ]; then
+            root="$d/.lib"
+        else
+            continue
+        fi
+        export LUME_PATH="$root"
+        check_positive "$(basename "$d")" "$d/main.lume"
+        unset LUME_PATH
+    done
+fi
+
+# ── 示例（examples/<名字>/main.lume）──
+# 示例也会腐坏：语言改了、库改了，examples 里那套写法可能悄悄失效。
+# 每个示例目录当一例跑，golden 存 tests/golden/example_<名字>.out。
+shopt -s nullglob
+examples=("$ROOT"/examples/*/main.lume)
+shopt -u nullglob
+
+if [ ${#examples[@]} -gt 0 ]; then
+    printf '==> 示例（examples/）\n'
+    for src in "${examples[@]}"; do
+        check_positive "example_$(basename "$(dirname "$src")")" "$src"
+    done
+fi
+
 # ── 负向用例 ──
 printf '==> 负向用例（必须报错）\n'
 shopt -s nullglob
@@ -190,6 +231,51 @@ for src in "${neg_multi[@]}"; do
         pass=$((pass + 1))
     fi
 done
+
+# ── 负向：库 ──
+# tests/fail_lib/<用例名>/main.lume 是入口，同目录的 .pkgs/ 是它专用的库根
+# （没有就按空环境跑）。期望的报错子串写入口文件第一行。
+if [ -d "$ROOT/tests/fail_lib" ]; then
+    printf '==> 负向用例（库）\n'
+    shopt -s nullglob
+    neg_lib=("$ROOT"/tests/fail_lib/*/main.lume)
+    shopt -u nullglob
+
+    for src in "${neg_lib[@]}"; do
+        d=$(dirname "$src")
+        name=$(basename "$d")
+        stem="fail_lib/$name"
+        expect=$(head -1 "$src" | sed -E 's|^// *expect: *||')
+        if [ -z "$expect" ] || [ "$expect" = "$(head -1 "$src")" ]; then
+            say_bad "$stem（第一行没有 // expect: <子串>）"
+            failed_list+=("$stem")
+            fail=$((fail + 1))
+            continue
+        fi
+
+        if [ -d "$d/.pkgs" ]; then
+            LUME_PATH="$d/.pkgs" "$BIN" run "$src" > "$WORK/neg_lib_$name.raw" 2>&1
+        else
+            env -u LUME_PATH "$BIN" run "$src" > "$WORK/neg_lib_$name.raw" 2>&1
+        fi
+        rc=$?
+        raw="$WORK/neg_lib_$name.raw"
+
+        if [ "$rc" -eq 0 ]; then
+            say_bad "$stem（本该失败，却成功退出）"
+            failed_list+=("$stem")
+            fail=$((fail + 1))
+        elif ! grep -qF -- "$expect" "$raw"; then
+            say_bad "$stem（退出码 $rc，但输出里没有「$expect」）"
+            tail -10 "$raw" | sed 's/^/       /'
+            failed_list+=("$stem")
+            fail=$((fail + 1))
+        else
+            say_ok "$stem"
+            pass=$((pass + 1))
+        fi
+    done
+fi
 
 # ── 汇总 ──
 printf '\n通过 %d，失败 %d\n' "$pass" "$fail"

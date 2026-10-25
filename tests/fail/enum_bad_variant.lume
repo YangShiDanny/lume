@@ -1,0 +1,11 @@
+// expect: 没有变体 'Nope'
+// 变体名写错：C 里会变成未定义的宏，报的错跟枚举毫无关系。
+enum Tag {
+    A
+    B
+}
+
+fn main() {
+    t := Tag.Nope
+    say("{t}")
+}

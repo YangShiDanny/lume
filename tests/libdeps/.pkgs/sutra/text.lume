@@ -1,0 +1,16 @@
+// 基础字符串库（被 calc 依赖）
+struct Word {
+    text: str
+}
+
+fn sa_word(s: str) -> Word {
+    return Word(text: s)
+}
+
+fn sa_trim_last(s: str) -> str {
+    return str_slice(s, 0, str_len(s) - 1)
+}
+
+fn sa_pad(n: int) -> str {
+    return "[{n}]"
+}

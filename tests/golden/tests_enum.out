@@ -1,0 +1,22 @@
+// 编译成功: tests_enum
+[1] 0 1 2 3
+[2] 0 10 11 100
+[3] t==Plus 1 t==Number 0 t!=Eof 1
+[4] Plus Eof Err
+[5] 加号
+[6] 其它：Eof
+[7] kind=Ident line=7 is_lit=1
+[8] next=Ident is_lit=1
+[8] next2=Plus eof=1
+[9] len=3 Number Ident Plus 
+[10] kind=Plus seen=2 done=0
+[10] kind=Eof done=1
+[11] Eof 3
+[12] Number 是字面量
+[12] Ident 是标识符
+[12] Plus 是符号
+[12] count=3
+[13] 0 Number 0
+[13] 1 Ident 1
+[13] 2 Plus 0
+[13] 收尾

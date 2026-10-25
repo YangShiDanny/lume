@@ -1,0 +1,23 @@
+// 依赖 sutra 的库：显式 import 声明，不要求在同一个库根下。
+import sutra
+
+// 字段类型来自另一个包（Word）。struct 定义必须按依赖排序发射，
+// 否则 calc 的 Report 会排在 sutra 的 Word 前面，C 侧 unknown type。
+struct Report {
+    w: Word
+    n: int
+
+    // 方法体里调 sutra 的函数 —— 引用要靠包级 refs 传出去，
+    // 否则 sutra 根本不会被加载。
+    fn desc() -> str {
+        return sa_pad(n) + w.text
+    }
+}
+
+fn ca_fmt(n: int) -> str {
+    return sa_pad(n) + sa_trim_last("xy")
+}
+
+fn ca_report(n: int, s: str) -> Report {
+    return Report(w: sa_word(s), n: n)
+}

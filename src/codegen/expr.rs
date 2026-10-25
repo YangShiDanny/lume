@@ -94,8 +94,10 @@ impl Codegen {
                 }
             }
             Expr::Str(s) => {
-                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("\"{}\"", escaped)
+                // 必须转义 \n \t \r \0：源码里的 `"a\nb"` 到这一步已经是
+                // 真实的换行字节，原样写进 C 字面量会把一行切成两行
+                // （clang 报 missing terminating '"'）。
+                c_str_lit(s)
             }
             // 带插值的字符串出现在非 say 位置时，退化成纯文本拼接
             Expr::FmtStr(parts) => {
@@ -117,6 +119,13 @@ impl Codegen {
             Expr::Binary(l, op, r) => {
                 let ls = self.gen_expr(l);
                 let rs = self.gen_expr(r);
+
+                // 结构体运算符重载：`a + b` → `Big_op_add(&a, b)`。
+                // 必须排在最前面 —— 下面的整数除零检查/字符串特化都假设
+                // 操作数是标量，对结构体全部不成立。
+                if let Some(c) = self.gen_op_overload(l, *op, r, &ls, &rs) {
+                    return c;
+                }
 
                 // 整数除法/取模：常量除数安全化 + 强度削弱（见 gen_divmod）
                 if matches!(op, BinOp::Div | BinOp::Mod) {
@@ -183,6 +192,10 @@ impl Codegen {
 
             Expr::Unary(op, e) => {
                 let es = self.gen_expr(e);
+                // 结构体取负：`-a` → `Big_op_neg(&a)`
+                if let Some(c) = self.gen_unop_overload(*op, e, &es) {
+                    return c;
+                }
                 let op_str = match op {
                     UnOp::Neg => "-",
                     UnOp::Not => "!",
@@ -254,6 +267,12 @@ impl Codegen {
                     if name == "write" {
                         return self.gen_write(args);
                     }
+                    if name == "eprint" {
+                        return self.gen_eprint(args);
+                    }
+                    if name == "ewrite" {
+                        return self.gen_ewrite(args);
+                    }
                     if name == "flush" {
                         return "lume_log_flush()".to_string();
                     }
@@ -268,6 +287,13 @@ impl Codegen {
                             .map(|a| self.gen_expr(a))
                             .collect();
                         return format!("{}({})", c_name, args_str.join(", "));
+                    }
+                }
+
+                // Vec 的方法（push / pop / len / is_empty / clear / reserve / free）
+                if let Expr::Field(obj, method) = callee.as_ref() {
+                    if let Some(c) = self.gen_vec_method(obj, method, args, None) {
+                        return c;
                     }
                 }
 
@@ -288,35 +314,46 @@ impl Codegen {
                     }
                 }
 
+                // 枚举静态方法 `Tag.name(v)`（checker 只放行 name）
+                if let Expr::Field(obj, _) = callee.as_ref() {
+                    if let Expr::Ident(tname) = obj.as_ref() {
+                        if self.enums.contains_key(tname) {
+                            let a = match args.first() {
+                                Some(e) => self.gen_expr(e),
+                                None => "0LL".to_string(),
+                            };
+                            return format!("lume_enum_name_{}({})", tname, a);
+                        }
+                    }
+                }
+
                 // 方法调用 p.len()
                 if let Expr::Field(obj, method_name) = callee.as_ref() {
-                    if let Expr::Ident(obj_name) = obj.as_ref() {
-                        if let Some(struct_name) = self.var_types.get(obj_name).cloned() {
-                            let key = (struct_name.clone(), method_name.clone());
-                            if self.methods.contains_key(&key) {
-                                let arr_flags = self
-                                    .method_array_params
-                                    .get(&key)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let mut all_args = vec![format!("&{}", obj_name)];
-                                for (i, a) in args.iter().enumerate() {
-                                    all_args.push(self.gen_arg(a));
-                                    if arr_flags.get(i).copied().unwrap_or(false) {
-                                        match self.array_len_of(a) {
-                                            Some(len) => all_args.push(len),
-                                            None => all_args.push(format!(
-                                                "/* 无法确定第 {} 个实参的数组长度 */0LL",
-                                                i + 1
-                                            )),
-                                        }
+                    if let Some((struct_name, recv)) = self.method_receiver(obj, None) {
+                        let key = (struct_name.clone(), method_name.clone());
+                        if self.methods.contains_key(&key) {
+                            let arr_flags = self
+                                .method_array_params
+                                .get(&key)
+                                .cloned()
+                                .unwrap_or_default();
+                            let mut all_args = vec![recv];
+                            for (i, a) in args.iter().enumerate() {
+                                all_args.push(self.gen_arg(a));
+                                if arr_flags.get(i).copied().unwrap_or(false) {
+                                    match self.array_len_of(a) {
+                                        Some(len) => all_args.push(len),
+                                        None => all_args.push(format!(
+                                            "/* 无法确定第 {} 个实参的数组长度 */0LL",
+                                            i + 1
+                                        )),
                                     }
                                 }
-                                return format!(
-                                    "{}_{}({})",
-                                    struct_name, method_name, all_args.join(", ")
-                                );
                             }
+                            return format!(
+                                "{}_{}({})",
+                                struct_name, method_name, all_args.join(", ")
+                            );
                         }
                     }
                 }
@@ -337,6 +374,13 @@ impl Codegen {
             }
 
             Expr::Field(obj, name) => {
+                // 枚举变体 `Tag.Number`。左边是**类型名**不是变量，
+                // 必须在任何 var/struct 字段查表之前认出来。
+                if let Expr::Ident(tname) = obj.as_ref() {
+                    if self.enums.contains_key(tname) {
+                        return format!("{}_{}", tname, name);
+                    }
+                }
                 // a.len —— 数组长度（局部字面量和数组参数都支持）
                 if name == "len" {
                     if let Some(len) = self.array_len_of(obj) {
@@ -344,10 +388,17 @@ impl Codegen {
                     }
                 }
                 let o = self.gen_expr(obj);
+                // Vec 的长度是句柄里的字段（c->len），不是 C 的 .len
+                if name == "len" && self.infer_type(obj) == "LumeVec*" {
+                    return format!("(({})->len)", o);
+                }
                 format!("{}.{}", o, name)
             }
 
             Expr::Index(obj, idx) => {
+                if let Some(c) = self.gen_vec_index(obj, idx, None) {
+                    return c;
+                }
                 let o = self.gen_expr(obj);
                 let i = match gen_index(idx) {
                     Some(s) => s,
@@ -366,7 +417,7 @@ impl Codegen {
                 }
                 let field_strs: Vec<String> = fields.iter()
                     .map(|(fname, fval)| {
-                        let v = self.gen_expr(fval);
+                        let v = self.gen_field_value(name, fname, fval, None);
                         format!(".{} = {}", fname, v)
                     })
                     .collect();
@@ -385,6 +436,54 @@ impl Codegen {
             }
 
             _ => "/* TODO */".to_string(),
+        }
+    }
+
+    /// 方法调用的接收者 → (结构体名, 传给 C 的第一个实参)。
+    ///
+    /// 三种形态：
+    /// - `v.m()`      → `("S", "&v")`
+    /// - `self.m()`   → `("S", "_self")`，方法体里 self 本来就是 `S*`
+    /// - `expr.m()`   → 先求值再取址：复合字面量/成员/下标能直接取址，
+    ///                  函数返回值之类没有地址，落一个临时变量
+    ///
+    /// 前两条以前只有第一条，导致方法之间没法互调（`self.gcd(..)` 生成 C 的
+    /// `self.gcd(...)`，clang 报 undeclared）；第三条让 `big(-5).sign()`
+    /// 这种链式写法能用。
+    pub(crate) fn method_receiver(
+        &mut self,
+        obj: &Expr,
+        fields: Option<&[String]>,
+    ) -> Option<(String, String)> {
+        match obj {
+            Expr::Ident(n) if n == "self" => {
+                self.cur_self_struct.clone().map(|s| (s, "_self".to_string()))
+            }
+            Expr::Ident(n) => self
+                .var_types
+                .get(n)
+                .cloned()
+                .map(|s| (s, format!("&{}", n))),
+            _ => {
+                let cty = self.infer_type(obj);
+                if !self.structs.contains_key(&cty) {
+                    return None;
+                }
+                let code = match fields {
+                    Some(f) => self.gen_expr_with_self(obj, f),
+                    None => self.gen_expr(obj),
+                };
+                // 复合字面量 `(S){...}`、成员访问、下标都是左值
+                if matches!(obj, Expr::StructLit(..)) || Self::is_addressable(obj) {
+                    return Some((cty, format!("&{}", code)));
+                }
+                // 没有地址（函数返回值）：先落临时变量。
+                // push_line 把声明插到当前语句之前，输出是线性拼接的。
+                self.vec_counter += 1;
+                let tmp = format!("_lume_mrecv{}", self.vec_counter);
+                self.push_line(&format!("{} {} = {};", cty, tmp, code));
+                Some((cty, format!("&{}", tmp)))
+            }
         }
     }
 
@@ -467,6 +566,12 @@ impl Codegen {
                         None => self.gen_expr(e),
                     };
                     let ty = self.infer_type(e);
+                    // 带 op_str 的结构体：插值里也走它（"a{x}" 拼成字符串）
+                    if let Some(sname) = self.op_str_struct(e) {
+                        let s = self.gen_op_str_call(e, &code, &sname);
+                        pieces.push(s);
+                        continue;
+                    }
                     pieces.push(match ty.as_str() {
                         "const char*" | "char*" => code,
                         "double" | "float" => {
@@ -658,6 +763,148 @@ impl Codegen {
     ///   - 长度和下标都是编译期常量 → 越界直接报编译错误，界内裸写 `a[k]`
     ///   - 长度已知（局部数组 / 数组参数 / 切片）→ `a[lume_idx_check(i, len)]`
     ///   - 长度未知（函数返回值、struct 字段数组）→ 原样 `a[i]`
+    // ── Vec[T] 的方法与下标 ──
+    //
+    // 和数组的 `a.len()` 不同，Vec 的这些操作不是自由函数（builtins 表里
+    // 没有它们）：push 要按元素类型取地址、pop 要按元素类型强转、下标要
+    // 按元素类型解引用，全都依赖**接收者**的类型。所以只能按表达式分派。
+    //
+    // 下面两个函数是唯一入口，gen_expr / gen_expr_with_self / par 都调它们
+    // —— 上次字符串拼接就是只改了两处、漏了 par，生成 C 的指针加法到
+    // clang 才炸。
+
+    /// 统一「表达式 + 当前方法字段表」的生成入口。
+    fn gen_in(&mut self, e: &Expr, fields: Option<&[String]>) -> String {
+        match fields {
+            Some(f) => self.gen_expr_with_self(e, f),
+            None => self.gen_expr(e),
+        }
+    }
+
+    /// `v.push(x)` / `v.len()` / `v.pop()` ……
+    /// 返回 None = 接收者不是 Vec（调用点继续按普通函数/方法处理）。
+    pub(crate) fn gen_vec_method(
+        &mut self,
+        obj: &Expr,
+        method: &str,
+        args: &[Expr],
+        fields: Option<&[String]>,
+    ) -> Option<String> {
+        if self.infer_type(obj) != "LumeVec*" {
+            return None;
+        }
+        let elem = match self.inferred_vec_elem(obj) {
+            Some(e) => e,
+            None => {
+                self.codegen_errors.push(format!(
+                    "无法推断 Vec 的元素类型（.{}(...)）。Vec 只能来自带 Vec 类型\
+                     的变量、结构体字段，或返回 Vec 的函数/方法",
+                    method
+                ));
+                return None;
+            }
+        };
+        let v = self.gen_in(obj, fields);
+        match method {
+            "len" | "length" if args.is_empty() => Some(format!("(({})->len)", v)),
+            "is_empty" if args.is_empty() => Some(format!("(({})->len == 0LL)", v)),
+            "clear" if args.is_empty() => Some(format!("lume_vec_clear({})", v)),
+            "free" if args.is_empty() => Some(format!("lume_vec_free({})", v)),
+            "reserve" if args.len() == 1 => {
+                let n = self.gen_in(&args[0], fields);
+                Some(format!("lume_vec_reserve({}, {})", v, n))
+            }
+            "pop" if args.is_empty() => {
+                Some(format!("(*({}*)(lume_vec_pop({})))", elem, v))
+            }
+            "last" if args.is_empty() => {
+                Some(format!("(*({}*)(lume_vec_last({})))", elem, v))
+            }
+            "push" if args.len() == 1 => {
+                let val = self.gen_in(&args[0], fields);
+                // push 收的是元素地址，而实参常常是字面量/表达式（没有地址）。
+                // 先落进临时变量再取址。这行会被插到当前语句之前 —— 输出是
+                // 线性拼接的，gen_expr 期间 push_line 的内容天然排在前面。
+                self.vec_counter += 1;
+                let tmp = format!("_lume_ve{}", self.vec_counter);
+                self.push_line(&format!("{} {} = {};", elem, tmp, val));
+                Some(format!("lume_vec_push({}, &{})", v, tmp))
+            }
+            _ => None,
+        }
+    }
+
+    /// 结构体字面量里某个字段的初值。
+    ///
+    /// Vec 字段的 `[]` / `[a, b]` 必须现场建一个句柄 —— `LumeVec*` 是指针，
+    /// C 的 `{1, 2}` 初始化器给不出来。建句柄和 push 的语句被插到当前
+    /// 语句之前（输出是线性拼接的），字段最后赋的是那个临时句柄。
+    fn gen_field_value(
+        &mut self,
+        struct_name: &str,
+        fname: &str,
+        fval: &Expr,
+        self_fields: Option<&[String]>,
+    ) -> String {
+        let elem = self
+            .vec_field_elems
+            .get(&(struct_name.to_string(), fname.to_string()))
+            .cloned();
+        if let (Some(elem), Expr::List(items)) = (elem, fval) {
+            self.vec_counter += 1;
+            let tmp = format!("_lume_vlit{}", self.vec_counter);
+            self.push_line(&format!(
+                "LumeVec* {} = lume_vec_new((int64_t)sizeof({}));",
+                tmp, elem
+            ));
+            for it in items {
+                let v = self.gen_in(it, self_fields);
+                self.vec_counter += 1;
+                let vt = format!("_lume_ve{}", self.vec_counter);
+                self.push_line(&format!("{} {} = {};", elem, vt, v));
+                self.push_line(&format!("lume_vec_push({}, &{});", tmp, vt));
+            }
+            return tmp;
+        }
+        self.gen_in(fval, self_fields)
+    }
+
+    /// `v[i]`：`(*(T*)(lume_vec_at(v, i, "v")))`。
+    /// 返回的是**左值**，所以 `v[i] = x` 和 `x := v[i]` 共用一份生成。
+    pub(crate) fn gen_vec_index(
+        &mut self,
+        obj: &Expr,
+        idx: &Expr,
+        fields: Option<&[String]>,
+    ) -> Option<String> {
+        if self.infer_type(obj) != "LumeVec*" {
+            return None;
+        }
+        let elem = match self.inferred_vec_elem(obj) {
+            Some(e) => e,
+            None => {
+                self.codegen_errors.push(
+                    "无法推断 Vec 的元素类型（v[i]）：Vec 只能来自带 Vec 类型的\
+                     变量、结构体字段，或返回 Vec 的函数/方法"
+                        .to_string(),
+                );
+                return None;
+            }
+        };
+        let v = self.gen_in(obj, fields);
+        let i = self.gen_in(idx, fields);
+        let label = match obj {
+            Expr::Ident(n) => format!("\"{}\"", n),
+            _ => "\"\"".to_string(),
+        };
+        let ptr = if self.bounds_check {
+            format!("lume_vec_at({}, {}, {})", v, i, label)
+        } else {
+            format!("lume_vec_at_raw({}, {})", v, i)
+        };
+        Some(format!("(*({}*)({}))", elem, ptr))
+    }
+
     pub(crate) fn checked_index(&mut self, obj: &Expr, idx: &Expr, i: String) -> String {
         let len = match self.array_len_of(obj) {
             Some(l) => l,
@@ -1188,6 +1435,12 @@ impl Codegen {
                     if name == "write" {
                         return self.gen_write_with(args, Some(fields));
                     }
+                    if name == "eprint" {
+                        return self.gen_eprint_with(args, Some(fields));
+                    }
+                    if name == "ewrite" {
+                        return self.gen_ewrite_with(args, Some(fields));
+                    }
                     if name == "flush" {
                         return "lume_log_flush()".to_string();
                     }
@@ -1214,6 +1467,13 @@ impl Codegen {
                     }
                 }
 
+                // Vec 的方法（方法体里的字段也可能装 Vec）
+                if let Expr::Field(obj, method) = callee.as_ref() {
+                    if let Some(c) = self.gen_vec_method(obj, method, args, Some(fields)) {
+                        return c;
+                    }
+                }
+
                 // a.len() —— 数组长度。
                 // 局部字面量是常量，数组参数是伴随参数 {name}_len
                 if let Expr::Field(obj, method) = callee.as_ref() {
@@ -1231,35 +1491,46 @@ impl Codegen {
                     }
                 }
 
+                // 枚举静态方法 `Tag.name(v)`（见 gen_expr 的同名分支）
+                if let Expr::Field(obj, _) = callee.as_ref() {
+                    if let Expr::Ident(tname) = obj.as_ref() {
+                        if self.enums.contains_key(tname) {
+                            let a = match args.first() {
+                                Some(e) => self.gen_expr_with_self(e, fields),
+                                None => "0LL".to_string(),
+                            };
+                            return format!("lume_enum_name_{}({})", tname, a);
+                        }
+                    }
+                }
+
                 // 方法调用
                 if let Expr::Field(obj, method_name) = callee.as_ref() {
-                    if let Expr::Ident(obj_name) = obj.as_ref() {
-                        if let Some(struct_name) = self.var_types.get(obj_name).cloned() {
-                            let key = (struct_name.clone(), method_name.clone());
-                            if self.methods.contains_key(&key) {
-                                let arr_flags = self
-                                    .method_array_params
-                                    .get(&key)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let mut all_args = vec![format!("&{}", obj_name)];
-                                for (i, a) in args.iter().enumerate() {
-                                    all_args.push(self.gen_arg_with_self(a, fields));
-                                    if arr_flags.get(i).copied().unwrap_or(false) {
-                                        match self.array_len_of(a) {
-                                            Some(len) => all_args.push(len),
-                                            None => all_args.push(format!(
-                                                "/* 无法确定第 {} 个实参的数组长度 */0LL",
-                                                i + 1
-                                            )),
-                                        }
+                    if let Some((struct_name, recv)) = self.method_receiver(obj, Some(fields)) {
+                        let key = (struct_name.clone(), method_name.clone());
+                        if self.methods.contains_key(&key) {
+                            let arr_flags = self
+                                .method_array_params
+                                .get(&key)
+                                .cloned()
+                                .unwrap_or_default();
+                            let mut all_args = vec![recv];
+                            for (i, a) in args.iter().enumerate() {
+                                all_args.push(self.gen_arg_with_self(a, fields));
+                                if arr_flags.get(i).copied().unwrap_or(false) {
+                                    match self.array_len_of(a) {
+                                        Some(len) => all_args.push(len),
+                                        None => all_args.push(format!(
+                                            "/* 无法确定第 {} 个实参的数组长度 */0LL",
+                                            i + 1
+                                        )),
                                     }
                                 }
-                                return format!(
-                                    "{}_{}({})",
-                                    struct_name, method_name, all_args.join(", ")
-                                );
                             }
+                            return format!(
+                                "{}_{}({})",
+                                struct_name, method_name, all_args.join(", ")
+                            );
                         }
                     }
                 }
@@ -1280,6 +1551,12 @@ impl Codegen {
             Expr::Binary(l, op, r) => {
                 let ls = self.gen_expr_with_self(l, fields);
                 let rs = self.gen_expr_with_self(r, fields);
+
+                // 结构体运算符重载（见 gen_op_overload）。方法体里写
+                // `self + o` / `d + o.d` 都走这里。
+                if let Some(c) = self.gen_op_overload(l, *op, r, &ls, &rs) {
+                    return c;
+                }
 
                 // 整数除法/取模：常量除数安全化 + 强度削弱（见 gen_divmod）
                 if matches!(op, BinOp::Div | BinOp::Mod) {
@@ -1333,6 +1610,10 @@ impl Codegen {
 
             Expr::Unary(op, e) => {
                 let es = self.gen_expr_with_self(e, fields);
+                // 结构体取负（见 gen_op_overload 的说明）
+                if let Some(c) = self.gen_unop_overload(*op, e, &es) {
+                    return c;
+                }
                 let op_str = match op {
                     UnOp::Neg => "-", UnOp::Not => "!",
                 };
@@ -1341,6 +1622,12 @@ impl Codegen {
 
             // self.x → _self->x（裸字段名由上面的 Ident 分支处理）
             Expr::Field(obj, name) => {
+                // 枚举变体 `Tag.Number`（见上面 gen_expr 的同名分支）
+                if let Expr::Ident(tname) = obj.as_ref() {
+                    if self.enums.contains_key(tname) {
+                        return format!("{}_{}", tname, name);
+                    }
+                }
                 if name == "len" {
                     if let Some(len) = self.array_len_of(obj) {
                         return len;
@@ -1352,10 +1639,16 @@ impl Codegen {
                     }
                 }
                 let o = self.gen_expr_with_self(obj, fields);
+                if name == "len" && self.infer_type(obj) == "LumeVec*" {
+                    return format!("(({})->len)", o);
+                }
                 format!("{}.{}", o, name)
             }
 
             Expr::Index(obj, idx) => {
+                if let Some(c) = self.gen_vec_index(obj, idx, Some(fields)) {
+                    return c;
+                }
                 let o = self.gen_expr_with_self(obj, fields);
                 let i = match gen_index(idx) {
                     Some(s) => s,
@@ -1373,7 +1666,7 @@ impl Codegen {
                 }
                 let field_strs: Vec<String> = fields_list.iter()
                     .map(|(fname, fval)| {
-                        let v = self.gen_expr_with_self(fval, fields);
+                        let v = self.gen_field_value(name, fname, fval, Some(fields));
                         format!(".{} = {}", fname, v)
                     })
                     .collect();

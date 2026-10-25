@@ -1,0 +1,88 @@
+// 方法体里裸写字段名时，codegen 必须知道字段的类型。
+//
+// 以前字段没登记进 var_types，infer_type 一律返回 int64_t：
+//   - `tag + suffix`（两个 str）→ 生成 C 的指针加法，读出来是垃圾
+//   - `tag == "x"`             → 生成指针比较，永远不等
+//   - `w / h`（两个 float）    → 生成整数除法检查，clang 直接报类型错
+// 三处都不报编译错误（除了最后一条恰好被 clang 拦下），属于典型的静默算错。
+
+struct Box {
+    w: float
+    h: float
+    tag: str
+    n: int
+
+    fn ratio() -> float {
+        return w / h
+    }
+
+    fn label() -> str {
+        return tag + ":" + float_to_str(w / h)
+    }
+
+    fn is_tag(t: str) -> bool {
+        return tag == t
+    }
+
+    // int 字段的除法仍然要是整数除法（不能被浮点分支带跑）
+    fn half() -> int {
+        return n / 2
+    }
+
+    fn mod7() -> int {
+        return n % 7
+    }
+
+    // 字段进比较、进拼接、再进 str_len
+    fn tag_len() -> int {
+        return str_len(tag + "!")
+    }
+
+    // 局部变量遮蔽同名字段：局部必须优先。
+    // 这里 tag 是 int，`tag / 2` 要走整数除法的检查路径；
+    // 如果 self_fields 抢在 var_types 前面，就会当成 str/2 直接报错。
+    fn shadow() -> int {
+        tag := 5
+        return tag / 2
+    }
+}
+
+// 嵌套字段：`o.inner.s` / `inner.s`（方法里的字段链）
+//
+// 以前 infer_type 的 Field 分支只认「基表达式是局部变量 Ident」，
+// 于是 `o.inner.s`（基是 Field）和 `inner.s`（基是裸字段名）都退化成
+// int64_t —— 拼接变 C 指针加法，插值打成指针值。现在统一用
+// infer_type(基) 得到的类型去 structs 表里查。
+struct Inner {
+    s: str
+    n: int
+}
+
+struct Outer {
+    inner: Inner
+    x: int
+
+    fn label() -> str {
+        return inner.s + "/" + int_to_str(inner.n)
+    }
+}
+
+fn main() {
+    say("===== 方法体里的字段类型 =====")
+    b := Box(w: 3.0, h: 8.0, tag: "box", n: 17)
+    say("[1] float 字段除法 w/h = {b.ratio()}  期望 0.375000")
+    say("[2] str 字段拼接 = [{b.label()}]  期望 [box:0.375]")
+    say("[3] str 字段比较 = {b.is_tag(\"box\")} / {b.is_tag(\"nope\")}  期望 1 / 0")
+    say("[4] int 字段整除 n/2 = {b.half()}  期望 8")
+    say("[5] int 字段取模 n%7 = {b.mod7()}  期望 3")
+    say("[6] 字段拼完再取长度 = {b.tag_len()}  期望 4")
+
+    // 局部变量同名遮蔽字段：局部优先，不能把字段类型套到局部上
+    c := Box(w: 1.0, h: 4.0, tag: "x", n: 9)
+    say("[7] 另一个实例 = {c.ratio()} / [{c.label()}]  期望 0.250000 / [x:0.25]")
+    say("[8] 局部遮蔽同名字段 = {c.shadow()}  期望 2")
+
+    o := Outer(inner: Inner(s: "hi", n: 3), x: 9)
+    say("[9] 嵌套字段取值 = {o.inner.s} / {o.inner.n} / len={str_len(o.inner.s)}  期望 hi / 3 / 2")
+    say("[10] 嵌套字段拼接 = {o.inner.s + "!"} / 方法里字段链 = {o.label()}  期望 hi! / hi/3")
+}

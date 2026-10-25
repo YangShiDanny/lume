@@ -36,10 +36,54 @@ impl Codegen {
         self.output.push('\n');
     }
 
+    /// 枚举定义。
+    ///
+    /// **不用 C 的 `enum`**：C enum 的底层类型是 `int`（32 位），
+    /// 而 Lume 的整数全是 `int64_t` —— 直接塞进 `say()` 的 varargs
+    /// （按 `%lld` 读）就是 UB，赋值/返回也要到处补强转。
+    /// 所以发一个 `typedef int64_t Tag;`，变体发成 `#define`。
+    /// `#define` 而不是 `static const`：`case` 标签要求整数常量表达式，
+    /// 而 `static const` 变量不是。
+    pub(crate) fn gen_enum_decl(&mut self, e: &EnumDecl) {
+        let pairs = e.resolved();
+        self.push_line(&format!("/* ---- enum {} ---- */", e.name));
+        self.push_line(&format!("typedef int64_t {};", e.name));
+        for (name, val) in &pairs {
+            self.push_line(&format!(
+                "#define {}_{} ((int64_t){}LL)",
+                e.name, name, val
+            ));
+        }
+        // 调试 / 报错信息用：值 → 变体名。
+        // `static inline` 是为了没人调用时也不产生「未使用的函数」警告。
+        self.push_line(&format!(
+            "static inline const char* lume_enum_name_{}({} v) {{",
+            e.name, e.name
+        ));
+        self.indent += 1;
+        self.push_line("switch (v) {");
+        self.indent += 1;
+        let mut seen: Vec<i64> = Vec::new();
+        for (name, val) in &pairs {
+            // 值重复时只保留第一个（checker 已经报过错，这里防一手
+            // C 的 duplicate case value）
+            if seen.contains(val) {
+                continue;
+            }
+            seen.push(*val);
+            self.push_line(&format!("case {}LL: return \"{}\";", val, name));
+        }
+        self.indent -= 1;
+        self.push_line("}");
+        self.push_line("return \"?\";");
+        self.indent -= 1;
+        self.push_line("}");
+        self.output.push('\n');
+    }
+
     // ── 参数生成 ──
     //
-    // 数组/列表参数**不加 restrict**。
-    // 文档以前写「数组是值语义、无别名」，但实现是引用语义：
+    // 数组/列表参数**不加 restrict**。    // 文档以前写「数组是值语义、无别名」，但实现是引用语义：
     // `b := a` 直接指针赋值，函数参数也不复制。两个参数完全可能指向
     // 同一块内存（`shift(x, x)`），此时 restrict 是 UB —— 实测会让
     // clang 在错误假设下向量化并算错。要恢复 restrict，得先实现
@@ -202,6 +246,13 @@ impl Codegen {
         self.push_fastmath(m);
         self.cur_ret_is_array = is_array_ty(&m.ret);
         self.cur_ret_c = ret_type.clone();
+        // 方法体里取 Vec 字段元素要知道是哪个 struct 的同名字段
+        self.cur_self_struct = Some(struct_name.to_string());
+        self.cur_ret_vec_elem = m
+            .ret
+            .as_ref()
+            .and_then(vec_elem_type)
+            .map(|e| self.gen_type(e));
 
         for p in &m.params {
             let ty = match &p.ty {
@@ -209,6 +260,10 @@ impl Codegen {
                 None => "int64_t".to_string(),
             };
             self.var_types.insert(p.name.clone(), ty);
+            if let Some(elem) = p.ty.as_ref().and_then(vec_elem_type) {
+                let c = self.gen_type(elem);
+                self.vec_elems.insert(p.name.clone(), c);
+            }
         }
         // 方法里的数组参数也要登记，否则 par for 认不出来
         self.register_array_params(&m.params);
@@ -222,6 +277,8 @@ impl Codegen {
         for (n, t) in self.structs.get(struct_name).cloned().unwrap_or_default() {
             self.self_fields.insert(n, t);
         }
+        // gen_for 生成循环体时要这份名单（它没有 fields 参数）
+        self.cur_field_names = field_names.clone();
 
         let saved_bounds = self.bounds_check;
         if m.decorators.iter().any(|d| d.name == "unchecked") {
@@ -292,6 +349,12 @@ impl Codegen {
         self.push_fastmath(f);
         self.cur_ret_is_array = is_array_ty(&f.ret);
         self.cur_ret_c = ret_type.clone();
+        // 返回 Vec 时记下元素类型：`return []` 要现场建一个空 Vec
+        self.cur_ret_vec_elem = f
+            .ret
+            .as_ref()
+            .and_then(vec_elem_type)
+            .map(|e| self.gen_type(e));
 
         for p in &f.params {
             let ty = match &p.ty {
@@ -299,6 +362,12 @@ impl Codegen {
                 None => "int64_t".to_string(),
             };
             self.var_types.insert(p.name.clone(), ty);
+            // Vec 参数：元素类型要登记，否则函数体里 v[i] / v.push 不知道
+            // 该按什么类型强转。
+            if let Some(elem) = p.ty.as_ref().and_then(vec_elem_type) {
+                let c = self.gen_type(elem);
+                self.vec_elems.insert(p.name.clone(), c);
+            }
         }
 
         if is_main {

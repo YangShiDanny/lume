@@ -572,6 +572,119 @@ static inline int64_t lume_slice_off(
     return start;
 }
 
+/* ── 动态数组 Vec[T] ──
+
+   固定长度数组（`[T; N]`）在编译期就知道长度，直接生成 C 的栈数组。
+   词法器和语法树要的是「长度运行期才知道」的容器，所以另立一个类型：
+
+       v: Vec[Tok] = []
+       v.push(t)
+       n := v.len()
+
+   C 里没有泛型，所以这里用和 qsort 一样的套路：句柄里记下元素大小 esz，
+   push 时 memcpy 一块 esz 字节，取元素时由调用点按元素类型强转指针。
+   整个实现只有一份，不随元素类型膨胀。
+
+   和 str 不同，Vec 的底层 buffer 是 malloc/realloc 的堆内存，不进 arena：
+   arena 只增不减，反复 push 一个长数组会把内存吃满。所以 Vec 需要显式
+   `v.free()`；进程退出时交给 OS 也不算错。
+
+   Vec 是**引用**语义：`w := v` 只复制句柄，push 到 w 就是 push 到 v，
+   和固定数组一致。 */
+typedef struct {
+    char* data;
+    int64_t len;
+    int64_t cap;
+    int64_t esz;   /* 单个元素的字节数：push / 取元素都靠它 */
+} LumeVec;
+
+static inline LumeVec* lume_vec_new(int64_t esz) {
+    LumeVec* v = (LumeVec*)malloc(sizeof(LumeVec));
+    if (!v) {
+        fprintf(stderr, "lume: runtime error: out of memory (Vec)\n");
+        abort();
+    }
+    v->data = NULL;
+    v->len = 0;
+    v->cap = 0;
+    v->esz = esz;
+    return v;
+}
+
+/* 保证容量 >= want。从 8 起按 2 倍增长 —— 和主流 vector 一致：
+   均摊 O(1)，又不会一上来就 malloc 一大块。 */
+static inline void lume_vec_reserve(LumeVec* v, int64_t want) {
+    if (want <= v->cap) return;
+    int64_t cap = v->cap ? v->cap : 8;
+    while (cap < want) {
+        if (cap > (INT64_MAX / 2)) { cap = want; break; }
+        cap *= 2;
+    }
+    char* p = (char*)realloc(v->data, (size_t)(cap * v->esz));
+    if (!p) {
+        fprintf(stderr, "lume: runtime error: out of memory (Vec grow to %lld)\n",
+                (long long)cap);
+        abort();
+    }
+    v->data = p;
+    v->cap = cap;
+}
+
+static inline void lume_vec_push(LumeVec* v, const void* elem) {
+    if (v->len >= v->cap) lume_vec_reserve(v, v->len + 1);
+    memcpy(v->data + v->len * v->esz, elem, (size_t)v->esz);
+    v->len++;
+}
+
+/* 取元素地址。越界直接 abort —— 和 a[i] 的检查同一个思路。
+   返回 char*，调用点按元素类型强转后解引用，**读和写走同一份**，
+   所以 v[i] = x 也自动带上检查。 */
+static inline char* lume_vec_at(LumeVec* v, int64_t i, const char* what) {
+    if ((uint64_t)i >= (uint64_t)v->len) {
+        fprintf(stderr,
+                "lume: runtime error: %s[%lld] out of range (len=%lld)\n",
+                (what && what[0]) ? what : "Vec",
+                (long long)i, (long long)v->len);
+        abort();
+    }
+    return v->data + i * v->esz;
+}
+
+/* 跳过边界检查的取址，给 --unchecked / @unchecked 用。 */
+static inline char* lume_vec_at_raw(LumeVec* v, int64_t i) {
+    return v->data + i * v->esz;
+}
+
+/* pop / last 返回元素**地址**（元素本身还在 buffer 里），调用点立刻
+   按元素类型解引用，所以安全。之后任何 push 都可能 realloc 搬走这块
+   内存 —— 别把这个指针存下来。 */
+static inline char* lume_vec_pop(LumeVec* v) {
+    if (v->len == 0) {
+        fprintf(stderr, "lume: runtime error: pop from empty Vec\n");
+        abort();
+    }
+    v->len--;
+    return v->data + v->len * v->esz;
+}
+
+static inline char* lume_vec_last(LumeVec* v) {
+    if (v->len == 0) {
+        fprintf(stderr, "lume: runtime error: last on empty Vec\n");
+        abort();
+    }
+    return v->data + (v->len - 1) * v->esz;
+}
+
+static inline void lume_vec_clear(LumeVec* v) { v->len = 0; }
+
+/* 释放 buffer 和句柄本身。之后这个句柄不能再用（包括 len）——
+   和 C 的 free 一样，用之前想清楚。 */
+static inline void lume_vec_free(LumeVec* v) {
+    if (!v) return;
+    free(v->data);
+    free(v);
+}
+
 /* ── 字符串 arena ──
    Lume 的 str 就是 const char*：零开销，能直接交给 printf / libc。
 
@@ -1088,14 +1201,18 @@ static inline bool lume_file_append(const char* path, const char* text) {
 }
 
 /* 存在性用 stat 而不是 fopen：fopen 对目录也返回非 NULL，
-   会把「目录」误判成「文件」。 */
+   会把「目录」误判成「文件」。
+   只认普通文件 —— 名字叫 file_exists，对目录返回 false 才不会
+   让人以为可以直接 read_file 它。 */
 static inline bool lume_file_exists(const char* path) {
 #ifdef _WIN32
     struct _stat st;
-    return _stat(path, &st) == 0;
+    if (_stat(path, &st) != 0) return false;
+    return (st.st_mode & _S_IFMT) == _S_IFREG;
 #else
     struct stat st;
-    return stat(path, &st) == 0;
+    if (stat(path, &st) != 0) return false;
+    return S_ISREG(st.st_mode);
 #endif
 }
 

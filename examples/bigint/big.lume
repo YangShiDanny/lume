@@ -1,0 +1,562 @@
+// big.lume —— 任意精度整数（Lume 库样板）
+//
+// 这个文件**没有 fn main**，同目录的程序自动并进来，不需要 import。
+//
+// ── 怎么用 ──
+//
+//   a := big(123)
+//   b := big_str("98765432109876543210")
+//   say("{a + b}")        // 运算符重载：a + b 落到 Big.op_add
+//   say("{a * b}")
+//   say("{b / a} 余 {b % a}")
+//   say("{b.pow(3)}")
+//
+// ── 表示 ──
+//
+//   struct Big { neg: bool, d: Vec[int] }
+//
+//   d 是 **1e9 进制**的位表，**高位在前**：
+//       "123456789012"  →  [123, 456789012]
+//   - 无前导零；零是 `[0]`；零的 neg 恒为 false（不会出现 -0）
+//   - 一支 9 位十进制，保证支内乘法 a*b < 1e18，int64 装得下
+//   - 高位在前是刻意的：from_str 从左往右 push、除法里 `rem = rem*base + 位`
+//     也是 push、to_str 正序拼接。低位在前的话处处要 reverse。
+//
+// ── 运算符 ──
+//
+//   + - * / %   一元 -    == != < > <= >=    "{a}" / say(a)
+//
+//   只定义了 op_eq / op_lt，其余比较由编译器组合（`a > b` → `b < a`，
+//   `a <= b` → `!(b < a)`）。见 src/ops.rs。
+//
+// ── 注意 ──
+//
+//   Big 是**值语义**（拷贝是复制 neg + 指针），但底层 d 是共享的 Vec 句柄。
+//   所有运算都不原地改入参，所以共享是安全的。Vec 没有自动回收：
+//   在一个大循环里反复做运算会累积内存，真要长跑就周期性
+//   `str_arena_reset()` + 手动 `b.free()`。
+
+const BIG_BASE = 1000000000
+const BIG_DIGITS = 9
+const BIG_INT_MAX = 9223372036854775807
+
+// ─────────────────────────────────────────────────────────────
+// 位表辅助：都是「大端、无前导零」的约定，只有这个文件内部用
+// ─────────────────────────────────────────────────────────────
+
+/// 去掉高位多余的 0，至少留一支。
+/// Vec 没有 remove(0)，所以整体左移再 pop 尾巴。
+fn big_trim_vec(d: Vec[int]) -> Vec[int] {
+    n := d.len()
+    k := 0
+    while k < n - 1 and d[k] == 0 {
+        k = k + 1
+    }
+    if k > 0 {
+        i := 0
+        while i + k < n {
+            d[i] = d[i + k]
+            i = i + 1
+        }
+        i = 0
+        while i < k {
+            d.pop()
+            i = i + 1
+        }
+    }
+    return d
+}
+
+/// 原地反转（大端 ↔ 小端）。加减乘内部都先按小端攒、再翻过来。
+fn big_rev_in(v: Vec[int]) -> Vec[int] {
+    n := v.len()
+    i := 0
+    while i < n / 2 {
+        t := v[i]
+        v[i] = v[n - 1 - i]
+        v[n - 1 - i] = t
+        i = i + 1
+    }
+    return v
+}
+
+fn big_dup(d: Vec[int]) -> Vec[int] {
+    r: Vec[int] = []
+    for x in d {
+        r.push(x)
+    }
+    return r
+}
+
+fn big_zero_vec() -> Vec[int] {
+    r: Vec[int] = []
+    r.push(0)
+    return r
+}
+
+/// 比较两个已规范化的位表的**绝对值**：-1 / 0 / 1
+fn big_cmp_abs(a: Vec[int], b: Vec[int]) -> int {
+    if a.len() != b.len() {
+        if a.len() < b.len() {
+            return -1
+        }
+        return 1
+    }
+    i := 0
+    while i < a.len() {
+        if a[i] != b[i] {
+            if a[i] < b[i] {
+                return -1
+            }
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+/// |a| + |b|
+fn big_add_abs(a: Vec[int], b: Vec[int]) -> Vec[int] {
+    r: Vec[int] = []
+    ia := a.len() - 1
+    ib := b.len() - 1
+    carry := 0
+    while ia >= 0 or ib >= 0 or carry > 0 {
+        t := carry
+        if ia >= 0 {
+            t = t + a[ia]
+            ia = ia - 1
+        }
+        if ib >= 0 {
+            t = t + b[ib]
+            ib = ib - 1
+        }
+        r.push(t % BIG_BASE)
+        carry = t / BIG_BASE
+    }
+    return big_rev_in(r)
+}
+
+/// |a| - |b|，要求 |a| >= |b|
+fn big_sub_abs(a: Vec[int], b: Vec[int]) -> Vec[int] {
+    r: Vec[int] = []
+    ia := a.len() - 1
+    ib := b.len() - 1
+    borrow := 0
+    while ia >= 0 {
+        t := a[ia] - borrow
+        if ib >= 0 {
+            t = t - b[ib]
+            ib = ib - 1
+        }
+        if t < 0 {
+            t = t + BIG_BASE
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        r.push(t)
+        ia = ia - 1
+    }
+    return big_trim_vec(big_rev_in(r))
+}
+
+/// |a| * |k|，k 取值 0 .. 1e9（除法估商时用）
+fn big_mul_small(a: Vec[int], k: int) -> Vec[int] {
+    r: Vec[int] = []
+    if k == 0 {
+        r.push(0)
+        return r
+    }
+    carry := 0
+    i := a.len() - 1
+    while i >= 0 {
+        t := a[i] * k + carry
+        r.push(t % BIG_BASE)
+        carry = t / BIG_BASE
+        i = i - 1
+    }
+    while carry > 0 {
+        r.push(carry % BIG_BASE)
+        carry = carry / BIG_BASE
+    }
+    return big_trim_vec(big_rev_in(r))
+}
+
+/// |a| * |b|，O(n²)
+fn big_mul_abs(a: Vec[int], b: Vec[int]) -> Vec[int] {
+    n := a.len()
+    m := b.len()
+    // n + m 支够装下乘积，多留一支给进位
+    r: Vec[int] = []
+    i := 0
+    while i < n + m + 1 {
+        r.push(0)
+        i = i + 1
+    }
+    // r 先按小端填（下标 0 = 最低位），最后整体翻转
+    ia := n - 1
+    while ia >= 0 {
+        ib := m - 1
+        carry := 0
+        while ib >= 0 {
+            p := (n - 1 - ia) + (m - 1 - ib)
+            t := r[p] + a[ia] * b[ib] + carry
+            r[p] = t % BIG_BASE
+            carry = t / BIG_BASE
+            ib = ib - 1
+        }
+        p := (n - 1 - ia) + m
+        while carry > 0 {
+            t := r[p] + carry
+            r[p] = t % BIG_BASE
+            carry = t / BIG_BASE
+            p = p + 1
+        }
+        ia = ia - 1
+    }
+    return big_trim_vec(big_rev_in(r))
+}
+
+/// |a| ÷ |b| 的商和余数（都是绝对值）。b 必须非零。
+///
+/// 算法：教科书竖式，每一支用**二分**试商（0..1e9，30 次比较）。
+/// 不写 Knuth D 的归一化估商 —— 那个快，但错一步就是静默算错；
+/// 二分慢一点（30 倍常数），但显然是正确的。
+fn big_divmod_abs(a: Vec[int], b: Vec[int]) -> BigDiv {
+    q: Vec[int] = []
+    i := 0
+    while i < a.len() {
+        q.push(0)
+        i = i + 1
+    }
+    rem := big_zero_vec()
+    i = 0
+    while i < a.len() {
+        // rem = rem * base + a[i]。大端存储下这就是 push 一支。
+        rem.push(a[i])
+        rem = big_trim_vec(rem)
+        // 最大的 qd 使 b * qd <= rem
+        lo := 0
+        hi := BIG_BASE - 1
+        while lo < hi {
+            mid := (lo + hi + 1) / 2
+            t := big_mul_small(b, mid)
+            if big_cmp_abs(t, rem) <= 0 {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
+            t.free()
+        }
+        q[i] = lo
+        if lo > 0 {
+            t := big_mul_small(b, lo)
+            rem = big_sub_abs(rem, t)
+            t.free()
+        }
+        i = i + 1
+    }
+    return BigDiv(q: big_norm(false, q), r: big_norm(false, rem))
+}
+
+/// 规范化：去前导零 + 消灭 -0。
+fn big_norm(neg: bool, d: Vec[int]) -> Big {
+    dd := big_trim_vec(d)
+    z := dd.len() == 1 and dd[0] == 0
+    return Big(neg: neg and not z, d: dd)
+}
+
+/// 给一个已经规范化的值换符号（不碰位表内容，只改 neg）。
+fn big_with_sign(b: Big, neg: bool) -> Big {
+    return Big(neg: neg and not b.is_zero(), d: b.d)
+}
+
+// ─────────────────────────────────────────────────────────────
+// 运算符函数 —— 运算符重载的落点
+// ─────────────────────────────────────────────────────────────
+
+struct BigDiv {
+    q: Big
+    r: Big
+}
+
+struct Big {
+    neg: bool
+    d: Vec[int]
+
+    // ── 观察 ──
+
+    fn is_zero() -> bool {
+        return d.len() == 1 and d[0] == 0
+    }
+
+    fn sign() -> int {
+        if d.len() == 1 and d[0] == 0 {
+            return 0
+        }
+        if neg {
+            return -1
+        }
+        return 1
+    }
+
+    fn abs() -> Big {
+        return Big(neg: false, d: big_dup(d))
+    }
+
+    /// 三路比较：-1 / 0 / 1
+    fn cmp(o: Big) -> int {
+        if self == o {
+            return 0
+        }
+        if self < o {
+            return -1
+        }
+        return 1
+    }
+
+    /// 十进制字符串。负数带前导 '-'，其余支补零到 9 位。
+    fn op_str() -> str {
+        if d.len() == 1 and d[0] == 0 {
+            return "0"
+        }
+        s := ""
+        if neg {
+            s = "-"
+        }
+        s = s + int_to_str(d[0])
+        i := 1
+        while i < d.len() {
+            part := int_to_str(d[i])
+            k := str_len(part)
+            while k < BIG_DIGITS {
+                s = s + "0"
+                k = k + 1
+            }
+            s = s + part
+            i = i + 1
+        }
+        return s
+    }
+
+    /// 截到 int64，超出范围就饱和（不静默回绕）。
+    fn to_int() -> int {
+        r := 0
+        i := 0
+        while i < d.len() {
+            if r > (BIG_INT_MAX - d[i]) / BIG_BASE {
+                if neg {
+                    return 0 - BIG_INT_MAX - 1
+                }
+                return BIG_INT_MAX
+            }
+            r = r * BIG_BASE + d[i]
+            i = i + 1
+        }
+        if neg {
+            return 0 - r
+        }
+        return r
+    }
+
+    // ── 算术 ──
+
+    fn op_neg() -> Big {
+        return big_norm(not neg, big_dup(d))
+    }
+
+    fn op_add(o: Big) -> Big {
+        if neg == o.neg {
+            return big_norm(neg, big_add_abs(d, o.d))
+        }
+        // 符号相反 → 大绝对值减小绝对值
+        c := big_cmp_abs(d, o.d)
+        if c == 0 {
+            return big_norm(false, big_zero_vec())
+        }
+        if c > 0 {
+            return big_norm(neg, big_sub_abs(d, o.d))
+        }
+        return big_norm(o.neg, big_sub_abs(o.d, d))
+    }
+
+    fn op_sub(o: Big) -> Big {
+        return self + (-o)
+    }
+
+    fn op_mul(o: Big) -> Big {
+        return big_norm(neg != o.neg, big_mul_abs(d, o.d))
+    }
+
+    /// 商和余数一起给。余数和被除数同号（向零截断，和 C 的整数除法一致）。
+    fn divmod(o: Big) -> BigDiv {
+        if o.is_zero() {
+            eprint("big: 除以零")
+            exit(1)
+        }
+        qr := big_divmod_abs(d, o.d)
+        return BigDiv(q: big_with_sign(qr.q, neg != o.neg), r: big_with_sign(qr.r, neg))
+    }
+
+    fn op_div(o: Big) -> Big {
+        return self.divmod(o).q
+    }
+
+    fn op_mod(o: Big) -> Big {
+        return self.divmod(o).r
+    }
+
+    /// 整数幂，快速幂。指数必须非负。
+    fn pow(e: int) -> Big {
+        if e < 0 {
+            eprint("big.pow: 指数必须非负")
+            exit(1)
+        }
+        r := big(1)
+        base := self
+        k := e
+        while k > 0 {
+            if k % 2 == 1 {
+                r = r * base
+            }
+            k = k / 2
+            if k > 0 {
+                base = base * base
+            }
+        }
+        return r
+    }
+
+    // ── 比较（只写两个，其余靠编译器组合）──
+
+    fn op_eq(o: Big) -> bool {
+        if neg != o.neg {
+            return false
+        }
+        return big_cmp_abs(d, o.d) == 0
+    }
+
+    fn op_lt(o: Big) -> bool {
+        if neg != o.neg {
+            return neg
+        }
+        c := big_cmp_abs(d, o.d)
+        if neg {
+            return c > 0
+        }
+        return c < 0
+    }
+
+    /// 手动还内存。Vec 没有自动回收，长循环里自己掌握节奏。
+    fn free() {
+        d.free()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 构造 / 便捷函数
+// ─────────────────────────────────────────────────────────────
+
+fn big_zero() -> Big {
+    return Big(neg: false, d: big_zero_vec())
+}
+
+fn big(n: int) -> Big {
+    if n == 0 {
+        return big_zero()
+    }
+    neg := false
+    x := n
+    if x < 0 {
+        // INT64_MIN 的 -x 是 UB（也是 int64 里唯一取不出绝对值的值）
+        if x == 0 - BIG_INT_MAX - 1 {
+            b := big(BIG_INT_MAX)
+            return -(b + big(1))
+        }
+        neg = true
+        x = 0 - x
+    }
+    d: Vec[int] = []
+    while x > 0 {
+        d.push(x % BIG_BASE)
+        x = x / BIG_BASE
+    }
+    return big_norm(neg, big_rev_in(d))
+}
+
+/// 十进制字符串 → Big。支持前导 '+' / '-'。
+/// 不校验字符：遇到非数字，`str_to_int` 会停在那一处（和 atoll 一样）。
+fn big_str(s: str) -> Big {
+    n := str_len(s)
+    if n == 0 {
+        return big_zero()
+    }
+    i := 0
+    neg := false
+    head := str_slice(s, 0, 1)
+    if head == "-" {
+        neg = true
+        i = 1
+    } else if head == "+" {
+        i = 1
+    }
+    total := n - i
+    if total <= 0 {
+        return big_zero()
+    }
+    // 第一组取 total % 9 位（整除时取 9），之后每组 9 位
+    group := total % BIG_DIGITS
+    if group == 0 {
+        group = BIG_DIGITS
+    }
+    d: Vec[int] = []
+    while i < n {
+        e := i + group
+        if e > n {
+            e = n
+        }
+        d.push(str_to_int(str_slice(s, i, e)))
+        i = e
+        group = BIG_DIGITS
+    }
+    return big_norm(neg, d)
+}
+
+fn big_pow(a: Big, e: int) -> Big {
+    return a.pow(e)
+}
+
+fn big_gcd(a: Big, b: Big) -> Big {
+    x := a.abs()
+    y := b.abs()
+    while not y.is_zero() {
+        qr := x.divmod(y)
+        x = y
+        y = qr.r
+    }
+    return x
+}
+
+fn big_fact(n: int) -> Big {
+    r := big(1)
+    i := 2
+    while i <= n {
+        r = r * big(i)
+        i = i + 1
+    }
+    return r
+}
+
+fn big_fib(n: int) -> Big {
+    a := big(0)
+    b := big(1)
+    i := 0
+    while i < n {
+        t := a + b
+        a = b
+        b = t
+        i = i + 1
+    }
+    return a
+}

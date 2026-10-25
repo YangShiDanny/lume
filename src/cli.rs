@@ -1,9 +1,7 @@
 use crate::checker::Checker;
 use crate::codegen::Codegen;
-use crate::lexer::Lexer;
-use crate::parser::Parser;
 use crate::ast::{Expr, Item};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -44,7 +42,7 @@ pub fn build(file: &str, opts: &Opts) {
     println!("// 编译成功: {}", out.display());
 }
 
-pub fn run(file: &str, opts: &Opts) {
+pub fn run(file: &str, opts: &Opts, prog_args: &[String]) {
     build(file, opts);
     let out = output_bin_path(file);
     let out_str = out.to_string_lossy();
@@ -55,6 +53,7 @@ pub fn run(file: &str, opts: &Opts) {
         format!("./{}", out_str)
     };
     let status = Command::new(&cmd_path)
+        .args(prog_args)
         .status()
         .expect("运行失败");
     if !status.success() {
@@ -93,55 +92,20 @@ fn output_bin_path(file: &str) -> PathBuf {
 //   3. 隐藏目录（.git / .workbuddy）、target、node_modules 一律不扫。
 //
 // 合并顺序按路径排序，保证同一份源码每次生成的 C 完全一致。
+//
+// 库（`$LUME_PATH` / `~/.lume/lib`）不在这里处理 —— 见 `src/libpkg.rs`。
+// 那边是**包 + 按符号需求自动加载**：库根下的一级子目录是一个包，包内
+// 可以 `import 别的包` 声明依赖，只有被用到的包才进来。项目侧仍然是零 import。
 // ─────────────────────────────────────────────────────────────
 
-const SKIP_DIRS: &[&str] = &["target", "node_modules"];
-
-fn skip_dir(name: &str) -> bool {
-    name.starts_with('.') || SKIP_DIRS.contains(&name)
-}
-
-fn collect_lume_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if p.is_dir() {
-            if !skip_dir(&name) {
-                collect_lume_files(&p, out);
-            }
-        } else if name.ends_with(".lume") {
-            out.push(p);
-        }
-    }
-}
-
-fn parse_source(path: &Path, src: &str) -> Result<Vec<Item>, String> {
-    let mut lexer = Lexer::new(src);
-    let tokens = lexer
-        .tokenize()
-        .map_err(|e| format!("{}: {}", path.display(), e))?;
-    let mut parser = Parser::new(tokens);
-    let program = parser
-        .parse_program()
-        .map_err(|e| format!("{}: {}", path.display(), e))?;
-    Ok(program.items)
-}
-
-fn has_main(items: &[Item]) -> bool {
-    items
-        .iter()
-        .any(|i| matches!(i, Item::Fn(f) if f.name == "main"))
-}
+use crate::libpkg::{self, collect_lume_files, has_main, parse_file as parse_source};
 
 /// 顶层名字的种类，只用于重复定义的报错措辞。
 #[derive(Clone, Copy, PartialEq)]
 enum SymKind {
     Fn,
     Struct,
+    Enum,
     Const,
 }
 
@@ -150,12 +114,27 @@ impl SymKind {
         match self {
             SymKind::Fn => "函数",
             SymKind::Struct => "结构体",
+            SymKind::Enum => "枚举",
             SymKind::Const => "常量",
         }
     }
 }
 
-pub fn compile_to_program(file: &str) -> crate::ast::Program {
+pub(crate) struct Parsed {
+    pub path: PathBuf,
+    pub items: Vec<Item>,
+}
+
+/// 一个项目：入口 + 自动合并进来的同目录模块（**不含库**）。
+/// `compile_to_program` 和 `lume libs` 共用这段扫描。
+pub(crate) struct Project {
+    pub entry_display: String,
+    pub entry_abs: PathBuf,
+    pub entry_items: Vec<Item>,
+    pub modules: Vec<Parsed>,
+}
+
+pub(crate) fn scan_project(file: &str) -> Project {
     let entry = PathBuf::from(file);
     let entry_abs = std::fs::canonicalize(&entry).unwrap_or_else(|e| {
         eprintln!("error: 读文件失败 {}: {}", file, e);
@@ -189,10 +168,6 @@ pub fn compile_to_program(file: &str) -> crate::ast::Program {
 
     // 2. 逐个解析。非入口文件解析失败只警告并跳过 ——
     //    自动扫描会把整棵树都看一遍，一个写到一半的文件不该炸掉整个构建。
-    struct Parsed {
-        path: PathBuf,
-        items: Vec<Item>,
-    }
     let mut parsed: Vec<Parsed> = Vec::new();
     for p in &cands {
         let abs = match std::fs::canonicalize(p) {
@@ -247,6 +222,145 @@ pub fn compile_to_program(file: &str) -> crate::ast::Program {
         modules.push(f);
     }
 
+    Project {
+        entry_display: file.to_string(),
+        entry_abs,
+        entry_items,
+        modules,
+    }
+}
+
+/// `lume libs <file.lume>`：打印库搜索根、所有库包、依赖关系，
+/// 以及本次构建**会真正加载**哪些包。排查「库调库」问题的入口。
+pub fn list_libs(file: &str) {
+    let p = scan_project(file);
+    println!("项目: {}", p.entry_display);
+    if !p.modules.is_empty() {
+        println!("  同目录模块 {} 个:", p.modules.len());
+        for m in &p.modules {
+            println!("    {}", m.path.display());
+        }
+    }
+
+    let roots = libpkg::lib_roots();
+    println!("库搜索根:");
+    if roots.is_empty() {
+        println!("  （无）—— 设 $LUME_PATH 或建 ~/.lume/lib");
+    } else {
+        for r in &roots {
+            println!("  {}", r.display());
+        }
+    }
+
+    let mut sets: Vec<&[Item]> = Vec::with_capacity(p.modules.len() + 1);
+    sets.push(&p.entry_items);
+    for m in &p.modules {
+        sets.push(&m.items);
+    }
+    let sum = libpkg::summarize(&sets);
+
+    let sel = match libpkg::select(&sum) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("error: {}", msg);
+            std::process::exit(1);
+        }
+    };
+    let chosen: std::collections::HashSet<&str> =
+        sel.loaded.iter().map(|(n, _, _)| n.as_str()).collect();
+
+    let pkgs = libpkg::discover();
+    println!("\n库包（共 {} 个）:", pkgs.len());
+    if pkgs.is_empty() {
+        println!("  （无）");
+    }
+    for pkg in &pkgs {
+        let mark = if chosen.contains(pkg.name.as_str()) {
+            "✔ 加载"
+        } else {
+            "  未用"
+        };
+        let kind = if pkg.loose { "散装" } else { "目录" };
+        let deps = if pkg.deps.is_empty() {
+            String::new()
+        } else {
+            format!("  依赖: {}", pkg.deps.join(", "))
+        };
+        println!(
+            "  {} [{}] {}  {}{}",
+            mark,
+            kind,
+            pkg.name,
+            pkg.dir.display(),
+            deps
+        );
+        let mut syms: Vec<&String> = pkg.provides.iter().collect();
+        syms.sort();
+        if !syms.is_empty() {
+            let shown: Vec<&str> = syms.iter().take(8).map(|s| s.as_str()).collect();
+            let more = if syms.len() > shown.len() {
+                format!(" …（共 {} 个）", syms.len())
+            } else {
+                String::new()
+            };
+            println!("        提供: {}{}", shown.join(", "), more);
+        }
+    }
+}
+
+pub fn compile_to_program(file: &str) -> crate::ast::Program {
+    let proj = scan_project(file);
+    let entry_abs = proj.entry_abs;
+    let entry_items = proj.entry_items;
+    let mut modules = proj.modules;
+
+    // 3.5 库：按符号需求自动加载（详见 libpkg.rs 文件头）。
+    //
+    // 项目里零 import 也能调库 —— 引用到的顶层名字会被拿去匹配库包，
+    // 命中的包连同依赖闭包一起进来，没命中的库完全不参与本次构建。
+    // 所以「库调库」不需要写 import：bigint 内部引用了 strutil 的符号，
+    // strutil 就会被自动拉进来。
+    // 借引用而不是克隆：AST 深拷贝在几十个模块时是明显开销。
+    let mut project_sets: Vec<&[Item]> = Vec::with_capacity(modules.len() + 1);
+    project_sets.push(&entry_items);
+    for m in &modules {
+        project_sets.push(&m.items);
+    }
+    let summary = libpkg::summarize(&project_sets);
+    let sel = match libpkg::select(&summary) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("error: {}", msg);
+            std::process::exit(1);
+        }
+    };
+
+    if std::env::var("LUME_LIB_TRACE").is_ok() {
+        for (name, dir, deps) in &sel.loaded {
+            let d = if deps.is_empty() {
+                String::new()
+            } else {
+                format!("  (依赖 {})", deps.join(", "))
+            };
+            eprintln!("// 库 {}  {}{}", name, dir.display(), d);
+        }
+    }
+
+    let mut known: HashSet<PathBuf> = HashSet::new();
+    for m in &modules {
+        known.insert(m.path.clone());
+    }
+    for f in sel.files {
+        let abs = std::fs::canonicalize(&f.path).unwrap_or_else(|_| f.path.clone());
+        if !known.insert(abs.clone()) {
+            continue; // 同一个文件从项目和库两条路走进来只算一次
+        }
+        modules.push(Parsed {
+            path: abs,
+            items: f.items,
+        });
+    }
+
     // 4. 合并 + 重复定义检测
     let mut items: Vec<Item> = Vec::new();
     let mut seen: HashMap<String, (SymKind, PathBuf)> = HashMap::new();
@@ -258,6 +372,7 @@ pub fn compile_to_program(file: &str) -> crate::ast::Program {
             let (kind, name) = match &item {
                 Item::Fn(f) => (SymKind::Fn, f.name.clone()),
                 Item::Struct(s) => (SymKind::Struct, s.name.clone()),
+                Item::Enum(e) => (SymKind::Enum, e.name.clone()),
                 Item::Const(c) => (SymKind::Const, c.name.clone()),
                 _ => {
                     items.push(item);
@@ -371,6 +486,13 @@ fn compile_c(src: &Path, out: &Path, opts: &Opts) {
     // 数学函数不再写 errno。这样 sqrt/pow 之类才是真正的纯函数，
     // 编译器证明过的 LUME_PURE 标注才站得住
     cmd.arg("-fno-math-errno");
+
+    // 我们按「AST 看起来纯」发 `#pragma clang loop vectorize(enable)`，
+    // 但代码生成会插入 lume_vec_at（边界检查）、lume_vec_push 这类
+    // 运行时调用，clang 到那一步才发现没法向量化，于是每条都回一句
+    // 「loop not vectorized」。这些提示对使用者没有可操作性（pragma 只是
+    // 建议，clang 自己仍会尝试），关掉这一类诊断。
+    cmd.arg("-Wno-pass-failed");
 
     if opts.fastmath {
         cmd.arg("-ffast-math");

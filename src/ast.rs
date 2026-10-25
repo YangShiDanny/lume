@@ -22,6 +22,7 @@ pub struct Program {
 pub enum Item {
     Fn(FnDecl),
     Struct(StructDecl),
+    Enum(EnumDecl),
     #[allow(dead_code)]
     App(AppDecl),
     Const(ConstDecl),
@@ -74,6 +75,39 @@ pub struct Field {
     /// 待办：可见性，见文件头说明
     #[allow(dead_code)]
     pub is_pub: bool,
+}
+
+/// 枚举：`enum Color { Red Green Blue }`。
+///
+/// 有意做成 C 风格的**无载荷**枚举（每个变体就是一个整数），不走
+/// 「带数据的 tagged union」那条路。理由：语言现在还没有泛型载荷、
+/// 没有解构绑定，先让「几十种 token 类型」这类场景能写。
+/// 带载荷的版本等 `match` 能绑定载荷时再说，见 todo.md。
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: String,
+    pub variants: Vec<EnumVariant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name: String,
+    /// 显式值：`Red = 10`。None 表示「上一个 + 1」，第一个从 0 起。
+    pub value: Option<i64>,
+}
+
+impl EnumDecl {
+    /// 变体名 → 整数值。显式值之后没写的继续 +1。
+    pub fn resolved(&self) -> Vec<(String, i64)> {
+        let mut out = Vec::new();
+        let mut next = 0i64;
+        for v in &self.variants {
+            let val = v.value.unwrap_or(next);
+            out.push((v.name.clone(), val));
+            next = val + 1;
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +191,9 @@ pub enum Pattern {
     Ident(String),
     Literal(Expr),
     Tuple(Vec<Pattern>),
+    /// 枚举变体模式 `Color.Red`：`(枚举名, 变体名)`。
+    /// 必须带枚举名限定 —— 裸写一个 `Red` 是变量绑定，不是模式匹配。
+    EnumVariant(String, String),
     /// 待办：结构体模式 `Point { x, y }`。字段名目前被丢弃（`define_pattern` 只绑定值）。
     #[allow(dead_code)]
     Struct(String, Vec<(String, Pattern)>),
@@ -227,6 +264,22 @@ pub enum UnOp {
 // 返回按签名顺序排列的槽位，None = 调用处没传（等默认值来填，
 // 没有默认值就是错误，由 checker 报）。槽位而不是紧凑 Vec，
 // 是因为命名参数允许省略中间有默认值的参数。
+/// 识别 `Vec[T]`，返回元素类型。
+///
+/// 语法上不需要为 Vec 加任何新分支：`Vec[T]` 落在 `parse_type` 的
+/// 后缀方括号里，产出 `Type::Generic(Named("Vec"), [T])`。
+/// checker 和 codegen 都从这里取元素类型，避免两边各写一份模式匹配
+/// 而漏掉某一种形状。
+pub fn vec_elem_type(t: &Type) -> Option<&Type> {
+    match t {
+        Type::Generic(base, args) if args.len() == 1 => match base.as_ref() {
+            Type::Named(n) if n == "Vec" => Some(&args[0]),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// 把「字面量整数表达式」解析成 i64。只认 `8` 和 `-8` 两种形状。
 ///
 /// checker（编译期除零判定）和 codegen（常量除数强度削弱）共用一份，

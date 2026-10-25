@@ -104,18 +104,26 @@ impl Codegen {
             literal_text.push('\n');
         }
 
+        // stdout 走异步日志队列，stderr 同步直写（错误信息不能等）
+        let (literal_fn, printf_fn) = if to_err {
+            ("lume_eprint_literal", "lume_eprintf")
+        } else {
+            ("lume_log_write_literal", "lume_logf")
+        };
+
         if literal_only {
             return format!(
-                "lume_log_write_literal(\"{}\", {}U)",
+                "{}(\"{}\", {}U)",
+                literal_fn,
                 escape_c_string(&literal_text),
                 literal_text.len()
             );
         }
 
         if format_args.is_empty() {
-            format!("lume_logf(\"{}\")", format_str)
+            format!("{}(\"{}\")", printf_fn, format_str)
         } else {
-            format!("lume_logf(\"{}\", {})", format_str, format_args.join(", "))
+            format!("{}(\"{}\", {})", printf_fn, format_str, format_args.join(", "))
         }
     }
 
@@ -125,6 +133,11 @@ impl Codegen {
             Some(f) => self.gen_expr_with_self(e, f),
             None => self.gen_expr(e),
         };
+        // 带 op_str 的结构体：按字符串打印，格式串由 format_for_expr 给 %s。
+        // 这里必须在类型分支之前拦 —— 结构体进 varargs 读的是第一个字段。
+        if let Some(sname) = self.op_str_struct(e) {
+            return self.gen_op_str_call(e, &code, &sname);
+        }
         // i128/u128 没有 printf 格式符，转成字符串再 %s
         let cty = self.infer_type(e);
         if cty == "__int128" {
@@ -133,7 +146,10 @@ impl Codegen {
         if cty == "unsigned __int128" {
             return format!("lume_u128_str({})", code);
         }
-        if code.starts_with("lume_logf(") || code.contains("/* ") {
+        if code.starts_with("lume_logf(")
+            || code.starts_with("lume_eprintf(")
+            || code.contains("/* ")
+        {
             return code;
         }
         match fmt {
@@ -150,6 +166,11 @@ impl Codegen {
     // ── 格式串推断（走 AST，不再对源码文本做启发式匹配）──
 
     fn format_for_expr(&self, expr: &Expr) -> &'static str {
+        // 带 op_str 的结构体先判 —— 否则会落到 fmt_for_c_ty 的 %lld 兜底，
+        // 把结构体当整数塞进 varargs。
+        if self.op_str_struct(expr).is_some() {
+            return "%s";
+        }
         match expr {
             Expr::Str(_) | Expr::FmtStr(_) | Expr::Nothing => "%s",
             Expr::Int(_) => "%lld",

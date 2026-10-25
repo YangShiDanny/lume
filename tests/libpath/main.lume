@@ -1,0 +1,7 @@
+// 库路径用例的入口：库文件在 ./.lib/ 里，不在自动扫描范围内，
+// 只有 LUME_PATH 指过去才并得进来（依然没有 import）。
+
+fn main() {
+    say("[lib] add={bigx_add(20, 22)} label={bigx_label(Unit.Word)}")
+    say("[lib] byte={bigx_label(Unit.Byte)} same={Unit.Byte == Unit.Byte}")
+}

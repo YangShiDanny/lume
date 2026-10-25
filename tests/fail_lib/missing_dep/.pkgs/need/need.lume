@@ -1,0 +1,5 @@
+import nothere
+
+fn need_thing() -> str {
+    return "不会跑到这里"
+}

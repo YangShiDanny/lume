@@ -1,0 +1,12 @@
+// expect: 没有定义 op_str
+// 结构体进 printf 的 varargs 是 UB（读到的其实是第一个字段）。
+// 没有 op_str 就明确拒绝，而不是静默打个整数出来。
+struct P {
+    x: int
+    y: int
+}
+
+fn main() {
+    a := P(x: 1, y: 2)
+    say("p = {a}")
+}

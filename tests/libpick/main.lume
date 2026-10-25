@@ -1,0 +1,7 @@
+// 两个包都提供 pick()，直接调会报歧义（见 tests/fail_lib/ambiguous）。
+// 用 import 指定用哪个 —— 这是 import 在项目侧唯一有实际作用的地方。
+import alpha
+
+fn main() {
+    say("指定的库: {pick()}")
+}

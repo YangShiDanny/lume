@@ -1,0 +1,10 @@
+// expect: par for 里不能调用 Vec.push
+// push 会 realloc buffer；多个 worker 同时改同一个 Vec 是数据竞争
+// （轻则丢元素，重则踩坏堆），只能拒绝。
+fn main() {
+    v: Vec[int] = []
+    par for i in 0..8 {
+        v.push(i)
+    }
+    say("{v.len()}")
+}

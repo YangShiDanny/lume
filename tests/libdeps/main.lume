@@ -1,0 +1,18 @@
+// 库调库（正向）：项目 → calc → sutra，三层。
+//
+// 项目里没有任何 import：调 ca_fmt 就自动把 calc 拉进来，
+// calc 包里的 import sutra 又把 sutra 拉进来。
+//
+// 同一批库里还放了一个 legacy 包，它也提供 sa_trim_last（和 sutra 撞名）。
+// 它没有被任何人用到，所以**不该被加载**、也不该报歧义 —— 这是
+// 「按需加载」和旧的「全量合并」的核心区别。
+fn main() {
+    say("calc: {ca_fmt(7)}")
+    say("calc 包内另一文件: {ca_twice("ab")}")
+
+    // 跨包的 struct：Report 的字段是 sutra 的 Word，方法体调 sutra 的函数
+    r := ca_report(5, "ok")
+    say("跨包结构体: {r.desc()} w={r.w.text} n={r.n}")
+
+    say("legacy 没被拉进来（否则 sa_trim_last 会歧义）")
+}

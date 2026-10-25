@@ -131,6 +131,11 @@ impl Codegen {
         self.push_line("int64_t start;");
         self.push_line("int64_t end;");
         for arr in &used_arrays {
+            // Vec 自带 len，不需要伴生长度参数
+            if self.vec_elems.contains_key(arr) {
+                self.push_line(&format!("LumeVec* {};", arr));
+                continue;
+            }
             let elem_ty = self.array_elem_types.get(arr)
                 .cloned().unwrap_or_else(|| "int64_t".to_string());
             self.push_line(&format!("{}* {};", elem_ty, arr));
@@ -161,6 +166,10 @@ impl Codegen {
         // 不能加 restrict：调用方完全可能把同一个数组传进多个参数，
         // 或者传的是切片。clang 在需要时会自己做运行时别名检查。
         for arr in &used_arrays {
+            if self.vec_elems.contains_key(arr) {
+                self.push_line(&format!("LumeVec* {} = _p->{};", arr, arr));
+                continue;
+            }
             let elem_ty = self.array_elem_types.get(arr)
                 .cloned().unwrap_or_else(|| "int64_t".to_string());
             self.push_line(&format!(
@@ -301,6 +310,9 @@ impl Codegen {
         self.push_line("_a.end = _total_stop;");
         for arr in &used_arrays {
             self.push_line(&format!("_a.{} = {};", arr, arr));
+            if self.vec_elems.contains_key(arr) {
+                continue; // Vec 自带 len
+            }
             let len_expr = self.array_len_exprs.get(arr).cloned()
                 .unwrap_or_else(|| "0LL".to_string());
             self.push_line(&format!("_a.{}_len = {};", arr, len_expr));
@@ -340,6 +352,9 @@ impl Codegen {
         self.push_line("if (_args[_t].end > _total_stop) _args[_t].end = _total_stop;");
         for arr in &used_arrays {
             self.push_line(&format!("_args[_t].{} = {};", arr, arr));
+            if self.vec_elems.contains_key(arr) {
+                continue; // Vec 自带 len
+            }
             let len_expr = self.array_len_exprs.get(arr).cloned()
                 .unwrap_or_else(|| "0LL".to_string());
             self.push_line(&format!("_args[_t].{}_len = {};", arr, len_expr));
@@ -693,6 +708,10 @@ impl Codegen {
             Expr::Binary(l, op, r) => {
                 let ls = self.gen_par_expr(l, arrays);
                 let rs = self.gen_par_expr(r, arrays);
+                // 结构体运算符重载（和 gen_expr 共用 gen_op_overload）
+                if let Some(c) = self.gen_op_overload(l, *op, r, &ls, &rs) {
+                    return c;
+                }
                 // 字符串拼接近 arena、比较走 strcmp —— 和 gen_expr 共用
                 // 同一份判断（以前这里没有，par for 里的 "v" + int_to_str(i)
                 // 会生成 C 的指针加法，clang 报错才发现）。
@@ -727,12 +746,33 @@ impl Codegen {
                 format!("({} {} {})", ls, op_str, rs)
             }
             Expr::Index(o, i) => {
+                // Vec 的下标：和 gen_vec_index 同一套语义，只是接收者要走
+                // par 的表达式生成（外层变量可能被收集进 _p 结构体）。
+                if self.infer_type(o) == "LumeVec*" {
+                    if let Some(elem) = self.inferred_vec_elem(o) {
+                        let os = self.gen_par_expr(o, arrays);
+                        let is = self.gen_par_expr(i, arrays);
+                        let ptr = if self.bounds_check {
+                            let label = match o.as_ref() {
+                                Expr::Ident(n) => format!("\"{}\"", n),
+                                _ => "\"\"".to_string(),
+                            };
+                            format!("lume_vec_at({}, {}, {})", os, is, label)
+                        } else {
+                            format!("lume_vec_at_raw({}, {})", os, is)
+                        };
+                        return format!("(*({}*)({}))", elem, ptr);
+                    }
+                }
                 let os = self.gen_par_expr(o, arrays);
                 let is = self.gen_par_expr(i, arrays);
                 format!("{}[{}]", os, is)
             }
             Expr::Unary(op, e) => {
                 let es = self.gen_par_expr(e, arrays);
+                if let Some(c) = self.gen_unop_overload(*op, e, &es) {
+                    return c;
+                }
                 let op_str = match op { UnOp::Neg => "-", UnOp::Not => "!" };
                 format!("({}{})", op_str, es)
             }
@@ -750,6 +790,33 @@ impl Codegen {
                 if let Expr::Ident(arr) = o.as_ref() {
                     if arrays.contains(arr) {
                         return format!("_p->{}_len", arr);
+                    }
+                }
+                self.gen_expr(expr)
+            }
+            // Vec 的只读方法。push 之类会改 buffer 的在 checker 就被拒了
+            // （多 worker 并发 realloc 是数据竞争），这里只处理读操作。
+            Expr::Call(c, args) if matches!(c.as_ref(), Expr::Field(..)) => {
+                if let Expr::Field(obj, m) = c.as_ref() {
+                    if self.infer_type(obj) == "LumeVec*" {
+                        if let Some(elem) = self.inferred_vec_elem(obj) {
+                            let v = self.gen_par_expr(obj, arrays);
+                            match m.as_str() {
+                                "len" | "length" if args.is_empty() => {
+                                    return format!("(({})->len)", v)
+                                }
+                                "is_empty" if args.is_empty() => {
+                                    return format!("(({})->len == 0LL)", v)
+                                }
+                                "pop" | "last" if args.is_empty() => {
+                                    return format!(
+                                        "(*({}*)(lume_vec_{}({})))",
+                                        elem, m, v
+                                    )
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 self.gen_expr(expr)
@@ -813,10 +880,13 @@ impl Codegen {
     fn collect_arrays_in_expr(&self, expr: &Expr, out: &mut Vec<String>) {
         match expr {
             Expr::Ident(name) => {
-                // 字面量数组（编译期知道长度）和数组参数都算
+                // 字面量数组（编译期知道长度）和数组参数都算；
+                // Vec 是句柄，按「引用」传进 worker 就够了（只读；
+                // 会改 buffer 的方法 checker 已经拒了）。
                 if !out.contains(name)
                     && (self.array_len_exprs.contains_key(name)
-                        || self.array_params.contains(name))
+                        || self.array_params.contains(name)
+                        || self.vec_elems.contains_key(name))
                 {
                     out.push(name.clone());
                 }
@@ -833,6 +903,16 @@ impl Codegen {
                 }
             }
             Expr::Field(o, _) => self.collect_arrays_in_expr(o, out),
+            // 插值里的表达式也算「用到了」。漏了这一支的话，
+            // `par for { say("{a.len()}") }` 不会把 a 带进 worker，
+            // 生成 C 引用未声明符号。
+            Expr::FmtStr(parts) => {
+                for p in parts {
+                    if let StrPart::Expr(e) = p {
+                        self.collect_arrays_in_expr(e, out);
+                    }
+                }
+            }
             Expr::Index(o, i) => {
                 self.collect_arrays_in_expr(o, out);
                 self.collect_arrays_in_expr(i, out);
@@ -902,6 +982,15 @@ impl Codegen {
                 }
             }
             Expr::Field(o, _) => Self::collect_idents_in_expr(o, out),
+            // 插值里的标识符也要收集（否则 `say("{outer}")` 里的 outer
+            // 不会被当成外层变量传进 worker）
+            Expr::FmtStr(parts) => {
+                for p in parts {
+                    if let StrPart::Expr(e) = p {
+                        Self::collect_idents_in_expr(e, out);
+                    }
+                }
+            }
             Expr::If(cond, then, els) => {
                 Self::collect_idents_in_expr(cond, out);
                 Self::collect_idents_in_block(then, out);

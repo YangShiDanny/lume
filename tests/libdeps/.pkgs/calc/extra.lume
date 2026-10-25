@@ -1,0 +1,6 @@
+// 同一个包里的第二个文件。它没写 import sutra ——
+// 依赖是**包级**的：calc.lume 声明过一次，整个 calc 包都能用 sutra。
+fn ca_twice(s: str) -> str {
+    t := sa_trim_last(s)
+    return t + t
+}

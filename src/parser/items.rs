@@ -20,10 +20,68 @@ impl Parser {
                 self.parse_struct(is_pub).map(Item::Struct)
             }
             TokenKind::App => self.parse_app().map(Item::App),
+            TokenKind::Enum => {
+                if !decorators.is_empty() {
+                    return Err(self.error("enum 暂不支持装饰器"));
+                }
+                self.parse_enum(is_pub).map(Item::Enum)
+            }
             TokenKind::Const => self.parse_const(is_pub).map(Item::Const),
             TokenKind::Import => self.parse_import().map(Item::Import),
-            _ => Err(self.error("期待 fn / struct / app / const / import")),
+            _ => Err(self.error("期待 fn / struct / enum / app / const / import")),
         }
+    }
+
+    /// `enum Name { A  B  C = 10 }`
+    ///
+    /// 变体之间用换行或逗号分隔，都没写也行（`{ A B }` 合法）。
+    /// 变体不带载荷。
+    pub(crate) fn parse_enum(&mut self, _is_pub: bool) -> Result<EnumDecl, ParseError> {
+        self.expect(&TokenKind::Enum, "期待 enum")?;
+
+        let name = match self.advance().clone() {
+            TokenKind::Ident(s) => s,
+            _ => return Err(self.error("期待枚举名")),
+        };
+
+        self.expect(&TokenKind::LBrace, "期待 {")?;
+        self.skip_newlines();
+
+        let mut variants: Vec<EnumVariant> = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !matches!(self.peek(), TokenKind::Eof) {
+            let vname = match self.advance().clone() {
+                TokenKind::Ident(s) => s,
+                _ => return Err(self.error("期待枚举变体名")),
+            };
+
+            // 显式值：`Red = 10` / `Red = -1`
+            let mut value = None;
+            if self.eat(&TokenKind::Assign) {
+                let neg = self.eat(&TokenKind::Minus);
+                let n = match self.advance().clone() {
+                    TokenKind::Int(n) => n,
+                    _ => return Err(self.error("枚举变体的显式值必须是整数常量")),
+                };
+                value = Some(if neg { -n } else { n });
+            }
+
+            if variants.iter().any(|v| v.name == vname) {
+                return Err(self.error(&format!("枚举 {} 里变体名 '{}' 重复", name, vname)));
+            }
+            variants.push(EnumVariant { name: vname, value });
+
+            self.skip_newlines();
+            self.eat(&TokenKind::Comma);
+            self.skip_newlines();
+        }
+
+        self.expect(&TokenKind::RBrace, "期待 }")?;
+
+        if variants.is_empty() {
+            return Err(self.error(&format!("枚举 {} 至少要有一个变体", name)));
+        }
+
+        Ok(EnumDecl { name, variants })
     }
 
     pub(crate) fn parse_decorators(&mut self) -> Result<Vec<Decorator>, ParseError> {

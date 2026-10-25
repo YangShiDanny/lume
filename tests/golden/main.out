@@ -43,6 +43,12 @@
 [21b] split("a,bb,ccc",",") 段数=3 内容=a|bb|ccc  期望 3 / a|bb|ccc
 [21c] "hello"=="hello": 1   "hello"=="world": 0  期望 1 / 0
 [21d] "abc" < "abd": 1   "b" > "a": 1  期望 1 / 1
+[21e] 拼接=hello world  链式=hello!?  len=11  期望 hello world / hello!? / 11
+[21e] += 累加=abc  期望 abc
+[21f] 10 个 str_upper 同时存活=ABCDEFGHIJ  期望 ABCDEFGHIJ
+[21g] 插值赋给变量=n=7  len=3  期望 n=7 / 3
+[21h] slice=bc  index_of=2  repeat=ababab  期望 bc / 2 / ababab
+[21h] int_to_str=-42  float_to_str=1.5  期望 -42 / 1.5
 [22] 100/4=25 100%7=2 17/5=3     期望 25 / 2 / 3
 [22b] 泛型浮点除零=inf     期望 inf
 [23] zero=0 len=4 nonzero=7/7 float=1.500000/1.500000 struct=42/6 byte=7/7 ones=1/1 flags=1/1 +continued sum=28 return=3/9

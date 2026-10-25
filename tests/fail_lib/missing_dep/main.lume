@@ -1,0 +1,6 @@
+// expect: 找不到那个库
+// 库包 need 声明依赖 nothere，但库根里没有这个包。
+// 报错要指出是哪个库依赖了谁 —— 而不是等到 checker 说「未定义的函数」。
+fn main() {
+    say("{need_thing()}")
+}

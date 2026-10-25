@@ -1,0 +1,7 @@
+// expect: 可空值
+// T? 在 C 里是 { has, val } 结构体，直接插值会被当成指针塞进 varargs，
+// 输出随机内容且不报错。必须在编译期拦下来。
+fn main() {
+    c := read_file("no_such.txt")
+    say("内容 = {c}")
+}

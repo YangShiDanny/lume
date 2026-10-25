@@ -5,8 +5,7 @@ use std::collections::HashMap;
 
 use super::expr::single_expr;
 
-/// 字符串可空值的 C 类型名。
-///
+/// 字符串可空值的 C 类型名。///
 /// 其余元素走 `lume_opt_N` 的惰性编号，字符串是唯一的例外：runtime 里的
 /// `lume_file_read()` 必须**直接**返回它，而 runtime header 出现在生成的
 /// C 最前面，那时编译器还没分配过任何 tag。所以给它一个固定名字，写在
@@ -82,6 +81,9 @@ impl Codegen {
             Type::Named(s) => s.clone(),
             Type::List(inner) => format!("{}*", self.gen_type(inner)),
             Type::Array(inner, _) => format!("{}*", self.gen_type(inner)),
+            // Vec[T] → 统一是 `LumeVec*`。元素类型不进 C 类型：
+            // C 没有泛型，元素大小存在句柄的 esz 里（见 runtime 的 LumeVec）。
+            Type::Generic(..) if vec_elem_type(t).is_some() => "LumeVec*".to_string(),
             // T? / T! 合并成同一种可空类型（见 checker Ty::Optional）
             Type::Optional(inner) | Type::Error(inner) => {
                 let elem = self.gen_type(inner);
@@ -148,6 +150,14 @@ impl Codegen {
             },
             // 结构体字段访问：按字段声明类型
             Expr::Field(obj, name) => {
+                // 枚举变体 `Tag.Number`：C 侧是 int64_t 的 #define。
+                // 左边是类型名，不是变量 —— 和 gen_expr 的 Field 分支
+                // 保持同一套判断顺序（枚举名优先）。
+                if let Expr::Ident(tname) = obj.as_ref() {
+                    if self.enums.contains_key(tname) {
+                        return "int64_t".to_string();
+                    }
+                }
                 // 可空值的 .has / .val
                 let oc = self.infer_type(obj);
                 if self.is_opt_tag(&oc) {
@@ -158,9 +168,20 @@ impl Codegen {
                         return self.opt_elem_of(&oc);
                     }
                 }
-                if let Expr::Ident(oid) = obj.as_ref() {
-                    if let Some(sname) = self.var_types.get(oid) {
-                        if let Some(fields) = self.structs.get(sname) {
+                // 字段访问：拿基表达式的 C 类型，是已知 struct 就按声明查。
+                // 用 infer_type(obj) 而不是「只认 Ident」，字段链才走得通：
+                // `w.text`（w 是方法里的裸字段）、`r.w.text`（两级）。
+                // 以前只认 Ident + var_types，`w.text` 与 `r.w.text` 都退化成
+                // int64_t —— 拼接变成 C 指针加法，插值打成指针值。
+                if let Some(fields) = self.structs.get(&oc) {
+                    if let Some((_, fty)) = fields.iter().find(|(n, _)| n == name) {
+                        return fty.clone();
+                    }
+                }
+                // v[i].field：元素是结构体时，按结构体字段声明类型
+                if let Expr::Index(base, _) = obj.as_ref() {
+                    if let Some(elem) = self.inferred_vec_elem(base) {
+                        if let Some(fields) = self.structs.get(&elem) {
                             if let Some((_, fty)) =
                                 fields.iter().find(|(n, _)| n == name)
                             {
@@ -173,6 +194,9 @@ impl Codegen {
             }
             // 数组元素：按数组元素类型
             Expr::Index(obj, _) => {
+                if let Some(e) = self.inferred_vec_elem(obj) {
+                    return e;
+                }
                 if let Expr::Ident(oid) = obj.as_ref() {
                     if let Some(t) = self.array_elem_types.get(oid) {
                         return t.clone();
@@ -183,6 +207,14 @@ impl Codegen {
             Expr::Ident(name) => {
                 if name == "None" {
                     return self.opt_tag("int64_t");
+                }
+                // 方法体里的 `self`：C 侧生成 `(*_self)`，类型是所属结构体。
+                // 不认这一条，`self + o` 和 `-self` 的运算符重载判定就会
+                // 看到 "int64_t" 而直接失效。
+                if name == "self" {
+                    if let Some(s) = &self.cur_self_struct {
+                        return s.clone();
+                    }
                 }
                 self.var_types.get(name).cloned()
                     .or_else(|| self.self_fields.get(name).cloned())
@@ -220,6 +252,35 @@ impl Codegen {
                     }
                 }
 
+                // 枚举静态方法 `Tag.name(v)` → str。不在这里登记的话，
+                // `"x" + Tag.name(t)` 会被当成 str + int 生成指针加法。
+                if let Expr::Field(obj, method) = callee.as_ref() {
+                    if method == "name" {
+                        if let Expr::Ident(tname) = obj.as_ref() {
+                            if self.enums.contains_key(tname) {
+                                return "const char*".to_string();
+                            }
+                        }
+                    }
+                }
+
+                // Vec 的方法：len → int，is_empty → bool，pop/last → 元素类型。
+                // 插值 `say("{v.pop()}")` 靠这个选对 printf 格式。
+                if let Expr::Field(obj, method) = callee.as_ref() {
+                    if self.infer_type(obj) == "LumeVec*" {
+                        match method.as_str() {
+                            "len" | "length" | "reserve" => return "int64_t".to_string(),
+                            "is_empty" => return "bool".to_string(),
+                            "pop" | "last" | "push" | "clear" | "free" => {
+                                if let Some(e) = self.inferred_vec_elem(obj) {
+                                    return e;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 // 泛型调用：按返回类型推断
                 if let Expr::Ident(fname) = callee.as_ref() {
                     if let Some(gf) = self.generic_fns.get(fname) {
@@ -252,16 +313,16 @@ impl Codegen {
                     }
                 }
 
-                // 方法调用
+                // 方法调用。用 infer_type(基) 而不是「基必须是局部变量 Ident」——
+                // 否则 `self.divmod(o).q` 里 obj 是 `self`，`x.divmod(y).q` 里
+                // obj 是 Call，都会退化成 int64_t（声明成 int 再赋结构体，C 报错）。
                 if let Expr::Field(obj, method_name) = callee.as_ref() {
-                    if let Expr::Ident(obj_name) = obj.as_ref() {
-                        if let Some(struct_name) = self.var_types.get(obj_name) {
-                            if let Some(ret) = self.methods.get(
-                                &(struct_name.clone(), method_name.clone())
-                            ) {
-                                return ret.clone();
-                            }
-                        }
+                    let sname = self.infer_type(obj);
+                    if let Some(ret) = self
+                        .methods
+                        .get(&(sname, method_name.clone()))
+                    {
+                        return ret.clone();
                     }
                 }
 
@@ -279,6 +340,41 @@ impl Codegen {
             Expr::Force(e) => self.infer_opt_elem(e),
             Expr::Try(e) => self.infer_opt_elem(e),
             _ => "int64_t".to_string(),
+        }
+    }
+
+    /// 表达式如果是 Vec[T]（的句柄），返回元素 C 类型 T。
+    ///
+    /// Vec 的 C 类型统一是 `LumeVec*`，元素类型只记在编译器的几张表里：
+    /// 变量（vec_elems）、结构体字段（vec_field_elems）、函数/方法的返回
+    /// （fn_vec_elems / method_vec_elems）。取元素、push、pop 都要靠它
+    /// 决定强转类型。
+    pub(crate) fn inferred_vec_elem(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Ident(n) => self.vec_elems.get(n).cloned().or_else(|| {
+                // 方法体里的裸字段名（toks[i]）
+                let sname = self.cur_self_struct.as_ref()?;
+                self.vec_field_elems
+                    .get(&(sname.clone(), n.clone()))
+                    .cloned()
+            }),
+            Expr::Field(base, fname) => {
+                let sname = match base.as_ref() {
+                    Expr::Ident(b) if b == "self" => self.cur_self_struct.clone(),
+                    Expr::Ident(b) => self.var_types.get(b).cloned(),
+                    _ => None,
+                }?;
+                self.vec_field_elems.get(&(sname, fname.clone())).cloned()
+            }
+            Expr::Call(callee, _) => match callee.as_ref() {
+                Expr::Ident(fname) => self.fn_vec_elems.get(fname).cloned(),
+                Expr::Field(obj, m) => {
+                    let sname = self.infer_type(obj);
+                    self.method_vec_elems.get(&(sname, m.clone())).cloned()
+                }
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -310,5 +406,33 @@ impl Codegen {
             }
             _ => self.opt_elem_of(&self.infer_type(e)),
         }
+    }
+}
+/// 从字段类型里收出「可能指向别的 struct」的名字。
+///
+/// 为什么要递归：`Dim?` / `Vec[Dim]` / `[Dim; 3]` 的 C 类型都含 `Dim`，
+/// 只要前者需要 Dim 先定义（`Vec` 除外 —— 它是 `LumeVec*`，但多收一个
+/// 名字只会让排序更保守，不会出错）。
+pub(crate) fn collect_struct_deps(t: &Type, out: &mut Vec<String>) {
+    match t {
+        Type::Named(n) => out.push(n.clone()),
+        Type::List(i) | Type::Optional(i) | Type::Error(i) => collect_struct_deps(i, out),
+        Type::Array(i, _) => collect_struct_deps(i, out),
+        Type::Map(k, v) => {
+            collect_struct_deps(k, out);
+            collect_struct_deps(v, out);
+        }
+        Type::Tuple(v) => {
+            for x in v {
+                collect_struct_deps(x, out);
+            }
+        }
+        Type::Generic(base, args) => {
+            collect_struct_deps(base, out);
+            for a in args {
+                collect_struct_deps(a, out);
+            }
+        }
+        _ => {}
     }
 }

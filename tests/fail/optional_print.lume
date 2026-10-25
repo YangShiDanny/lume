@@ -1,0 +1,6 @@
+// expect: 不能直接打印可空值
+// say(x) 走的是同一套 varargs，所以也要拦。
+fn main() {
+    c := read_file("no_such.txt")
+    say(c)
+}

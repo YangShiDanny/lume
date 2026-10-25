@@ -1,0 +1,10 @@
+// expect: 没有方法 'count'
+// 枚举只支持 name()。别的写法会生成不存在的 C 函数。
+enum Tag {
+    A
+    B
+}
+
+fn main() {
+    say("{Tag.count(Tag.A)}")
+}

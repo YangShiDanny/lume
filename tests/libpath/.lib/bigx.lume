@@ -1,0 +1,18 @@
+// 库文件：**没有 fn main**，只往外提供函数 / 枚举。
+//
+// 它放在隐藏目录（`.lib`）里是故意的：自动扫描会跳过隐藏目录，
+// 所以这个文件只有通过 LUME_PATH 才找得到 —— 正好用来验证
+// 「共享库目录」这条路真的通（见 scripts/run_tests.sh 的库路径用例）。
+
+enum Unit {
+    Byte
+    Word
+}
+
+fn bigx_add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn bigx_label(u: Unit) -> str {
+    return Unit.name(u)
+}

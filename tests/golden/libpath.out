@@ -1,0 +1,3 @@
+// 编译成功: main
+[lib] add=42 label=Word
+[lib] byte=Byte same=1

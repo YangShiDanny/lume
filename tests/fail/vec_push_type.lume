@@ -1,0 +1,8 @@
+// expect: push 的实参类型不匹配
+// Vec[int] 里只能 push int。混进字符串会在 C 里按元素大小 memcpy，
+// 读出来是错位的内存 —— 必须编译期拦住。
+fn main() {
+    v: Vec[int] = []
+    v.push("oops")
+    say("{v.len()}")
+}

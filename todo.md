@@ -358,56 +358,190 @@
 |---|---|---|
 | 1 | 字符串拼接 + arena 派生 | ✅ 已完成（2026-10-25） |
 | 2 | 字符串生命周期管理（`scope` 块） | ✅ 已完成（2026-10-25） |
-| 3 | 文件读写（`fopen` / `fread` 在 runtime 里出现 **0 次**） | ⬜ |
-| 4 | 命令行参数 + `exit` | ⬜ |
-| 5 | 动态数组 `Vec`（token 流长度不可预知） | ⬜ |
-| 6 | 枚举（`TokenKind` 几十种，现在只能用 int 常量硬凑） | ⬜ |
+| 3 | 文件读写 | ✅ 已完成（2026-10-25） |
+| 4 | 命令行参数 + `exit` | ✅ 已完成（2026-10-25） |
+| 5 | 动态数组 `Vec`（token 流长度不可预知） | ✅ 已完成（2026-10-25） |
+| 6 | 枚举（`TokenKind` 几十种，现在只能用 int 常量硬凑） | ✅ 已完成（2026-10-25） |
 | 7 | map / 集合（符号表要哈希表） | ⬜ |
 | 8 | `extern` FFI（真正去调 clang） | ⬜ |
 
 **为什么第 2 条排在 IO 前面**：字符串现在没有所有权语义，
 `read_file` 返回的指针可能在后续 `str_trim` 之后失效。先做 IO 必然返工。
 
+**库包与依赖**（2026-10-25，为自举铺路）：真正开写编译器时要把
+lexer / parser / checker / codegen 拆成几个库，而这些库互相依赖。原来的
+「LUME_PATH 下所有 .lume 无条件合并」撑不住：不用的库也参与编译、两个库
+同名就炸、跨库根的依赖没法表达。现在改成：
+
+- 库根下的**一级子目录 = 一个包**（包名 = 目录名），根下散放的 `.lume`
+  也算一个包（包名 = 文件名）。包内文件递归收，带 `fn main` 的当示例跳过。
+- 包内可写 `import 另一个包名` 声明依赖，整个包共享，不要求同一个库根。
+- **按符号需求自动加载**：项目引用到的顶层名字 → 唯一提供它的包 → 该包的
+  引用 → … 迭代到不动点。项目里仍然零 import。
+- 没用到的库完全不参与构建，所以两个库都有 `parse()` 也不会冲突；真用到
+  两个才报歧义，用 `import` 指定。
+
+查验入口：`lume libs main.lume`（依赖图 + 谁会被加载）、
+`LUME_LIB_TRACE=1`（只打加载列表）。
+验收：`tests/libdeps`（三层：项目 → calc → sutra，含跨包 struct 字段和
+方法体跨库调用；legacy 包故意撞名以证明未用库不参与）、
+`tests/fail_lib/ambiguous`、`tests/fail_lib/missing_dep`。
+
 `scope` 的落地形态（2026-10-25）：记 arena 水位 → 出块回退。
 `break` / `continue` 自动补回收，`return` 故意不回收（返回值可能就是块内
 派生的字符串），`par for` 里禁止使用（多 worker 共享 arena）。
 验收入口：`tests_scope.lume`（17 项，含 `str_arena_bytes()` 的字节数断言）。
 
+第 3、4 条的落地形态（2026-10-25）：
+
+- `read_file(path) -> str?`，失败 `None`，内容进 arena（不用 free）。
+  空文件是合法内容 → 所以不能用 `""` 表示失败。
+  只读普通文件（`fseek`/`ftell` 取值），管道/终端返回 `None`。
+- `write_file` / `append_file` / `remove_file` 返回 `bool`；
+  `file_exists` 只认普通文件（`S_ISREG`），目录返回 `false`。
+- `str?` 的 C 类型是**固定名字** `LumeOptStr`（`typedef struct { int8_t has;
+  const char* val; }`），不走 `lume_opt_N` 惰性编号 —— runtime 里的
+  `lume_file_read()` 必须能直接返回它，而那时编译器还没分配过 tag。
+  `opt_tag("const char*")` 永远返回这个名字，所以和 `Some("x")` / `None`
+  / `!` / `?` / struct 字段完全互通。
+- `arg_count()` / `arg(i)`：main 签名统一成
+  `int main(int _lume_argc, char** _lume_argv)`，开头一行 `lume_set_args(...)`。
+  用户给 `main` 写了参数时按用户的来（那种写法拿不到 C 的 argv）。
+- `exit(n)` 先 `lume_log_flush()` 再退 —— 异步日志不排空会丢最后几行。
+- `eprint` / `ewrite`：同一套格式串逻辑，出口换 stderr 并同步写；
+  写之前先 flush stdout 队列，保证和 `say` 的相对顺序正确。
+- checker 新增两条拒绝：可空值不能直接插值、不能直接进 `say`/`write`/
+  `eprint`/`ewrite`（`{ has, val }` 结构体进 varargs 是 UB）。
+- 顺手修掉一个老 bug：**`Expr::Str` 生成 C 字面量时只转义了 `\` 和 `"`**，
+  源码里的 `"a\nb"` 到 codegen 已是真实换行字节，原样写进 C 会把一行切成
+  两行（clang 报 missing terminating `"`）。现在统一走 `c_str_lit`。
+- 验收入口：`tests_file.lume`（22 项，含 2 MB 跨 chunk 读取、
+  `par for` 里读文件、argv、stderr 顺序、`exit(0)` 不执行后续语句）
+
+第 5 条的落地形态（2026-10-25）：
+
+- 类型拼写 `Vec[T]`，语法上不加新分支 —— 后缀方括号已经产出
+  `Type::Generic(Named("Vec"), [T])`，`ast::vec_elem_type` 是唯一识别入口。
+- **C 侧只有一个** `LumeVec { char* data; int64_t len; int64_t cap; int64_t esz; }`，
+  元素类型不进 C 类型：push 时 `memcpy(esz)`，取元素时调用点按元素类型
+  强转 —— 和 `qsort` 同一个套路，代码量不随元素类型膨胀。
+  所以 `Vec[T]` 的 C 类型恒为 `LumeVec*`，元素类型只能记在编译器一侧：
+  `vec_elems`（变量）/ `vec_field_elems`（结构体字段）/ `fn_vec_elems`
+  / `method_vec_elems`。这四张表由 `inferred_vec_elem` 统一查询。
+- 方法不进 `builtins::TABLE`：push 要按元素类型取地址、pop 要按元素类型
+  强转，全依赖接收者类型，只能分派。入口是 `gen_vec_method` /
+  `gen_vec_index`，`gen_expr` / `gen_expr_with_self` / `par` 三处共用
+  （上次字符串拼接只改两处、漏了 par）。
+- `push` 收元素**地址**，实参常常是字面量（没地址）→ 先落进临时变量。
+  临时变量在表达式生成期间 `push_line`，输出是线性拼接的，所以天然排在
+  当前语句之前（`v.push(f(x))` 也能用）。
+- 底层 buffer 是 `malloc/realloc`，**不进 arena**（arena 只增不减，
+  反复 push 长数组会吃满）。需要回收时 `v.free()`。
+- `par for` 里只能读：`push/pop/clear/reserve/free` 在 checker 直接拒
+  （多 worker 并发 realloc 是数据竞争）。读 `len()` / `v[i]` 支持 ——
+  worker 的 args 结构体里存 `LumeVec*`（Vec 自带 len，没有 `_len` 伴生字段）。
+- 顺手修两个老 bug：
+  ① `collect_arrays_in_expr` / `collect_idents_in_expr` **都不处理 `FmtStr`**，
+  于是 `par for { say("{a.len()}") }` 不会把 a 带进 worker，生成未声明符号；
+  ② `gen_for` 生成循环体时丢了方法字段表，循环体里裸写字段名会生成裸 C 标识符
+  （现在从 `cur_field_names` 兜回来）。
+- 验收：`tests_vec.lume`（13 组，含 1000 次 push 跨多轮扩容、嵌套
+  `Vec[Vec[int]]`、结构体里的 Vec 字段 + 方法、函数收/返 Vec、别名语义、
+  `for x in v`）；负向 `fail/vec_par_push`、`fail/vec_push_type`、
+  `fail/vec_bad_method`。
+  + `tests/fail/exit_code.lume`（非零退出码且日志不丢）
+  + `tests/fail/optional_interp.lume` / `optional_print.lume`。
+
 **第 5~8 条的顺序有弹性**，但都必须在「写第一行编译器代码」之前就位 ——
 否则写一半发现 token 存不下，得回头重构整个前端。
 
+第 6 条的落地形态（2026-10-25）：
+
+- 语法 `enum Name { A  B = 10  C }`：变体之间换行或逗号都行，显式值之后
+  没写的继续 +1。**无载荷**（`A(int)` 那种 tagged union 没做）。
+- C 侧**不用 `enum`**：C enum 底层是 32 位 `int`，塞进 `printf` 的 varargs
+  （按 `%lld` 读）是 UB，赋值/返回也到处要强转。生成的是
+  `typedef int64_t Tag;` + 每个变体一条 `#define Tag_A ((int64_t)0LL)`
+  + `static inline const char* lume_enum_name_Tag(Tag)`（`Tag.name(v)` 用）。
+  `#define` 而不是 `static const`：`case` 标签要求整数常量表达式。
+- `Tag.A` 走 `Expr::Field(Ident("Tag"), "A")`。三处生成器（`gen_expr` /
+  `gen_expr_with_self` / `par`->兜底）都要**在查变量表之前**认出
+  「左边是类型名而不是变量」，否则会得到 `Tag.A` 这种 C 里不存在的东西。
+  `infer_type` 的 Field / Call 分支同理（`Tag.name(t)` 必须是 `const char*`，
+  不然 `"x" + Tag.name(t)` 会生成指针加法）。
+- **match 穷尽性检查**（checker `check_enum_match`）：值静态类型是枚举且
+  没有 `_` 兜底时，漏变体 = 编译期报错；另外查「变体名不存在」、
+  「写的是别的枚举的变体」、「同一个变体匹配两次」。
+- 变体值重复在 checker 拒（C 的 `switch` 会 duplicate case）。
+- 验收：`tests_enum.lume`（13 组，含显式值续号、`Tag.name()`、结构体字段、
+  函数收/返、`Vec[Tag]`、方法体里改字段、循环里 match、`par for` 里读枚举）；
+  负向 `fail/enum_match_missing`、`fail/enum_bad_variant`、
+  `fail/enum_dup_value`、`fail/enum_bad_method`。
+
+### 库机制（2026-10-25，为「自己写库」铺路）
+
+自举要能把编译器拆成多个库文件；一开始只有「同目录自动合并」，库无法复用。
+
+- `$LUME_PATH`（`:` / `;` 分隔）+ 默认 `~/.lume/lib`（存在才算）作为
+  **共享库目录**。里面的 `.lume` 一样零 import 直接可用。
+- 库目录里**带 `fn main` 的文件跳过** —— 库目录放示例程序是常态，不能因为
+  一个示例就把整个目录判成独立项目连带排掉别的库。
+- canonicalize 去重：同一个文件从「项目扫描」和「库路径」两条路走进来只算一次。
+- 验收入口：`tests/libpath/`（入口 `main.lume` + 藏在 `.lib/` 隐藏目录里的
+  `bigx.lume`；隐藏目录自动扫描不看，所以这条用例只有 `LUME_PATH` 生效才过）。
+- 顺手修的两个坑：
+  ① `Stmt::Expr` 生成 `(*(int64_t*)(...));` 这种纯取值语句时 clang 报
+  `-Wunused-value` —— 而 `v.pop()` 当语句用是最常见的写法。现在统一
+  `(void)(...)`。
+  ② 按「AST 看起来纯」发的 `#pragma clang loop vectorize` 常被 clang 拒
+  （代码生成会插入 `lume_vec_at` 等调用），每条回一句 `loop not vectorized`。
+  加 `-Wno-pass-failed` 关掉这类诊断（pragma 只是建议）。
+- `examples/bigint/`：可运行的库样板（`big.lume` + `main.lume`，30! / 2^100
+  / 21 位乘法都对）。
+
 ---
 
-## 🎯 BigInt（第一个用 Lume 写的程序）
+## 🎯 BigInt（第一个用 Lume 写的库）
 
-### 前置补丁
+实现位置：`examples/bigint/`（`big.lume` + `main.lume`）。它跟着测试脚本一起跑
+（用例名 `example_bigint`），所以文档里说的能力和示例不会分家。
 
-- [x] **struct 支持定长数组字段**（`gen_struct_decl` 生成 `T name[N]`）
-- [x] **`[0; N]` 重复初始化**（AST 加 `Expr::Repeat`）
-- [x] **`write` 内置（不换行）**
+### 已完成
 
-### 单线程版本
-
-- [ ] `big_from_int` / `big_zero`
-- [ ] `big_cmp_abs` / `big_cmp`
-- [ ] `big_add_abs` / `big_sub_abs` / `big_add` / `big_sub`
-- [ ] `big_mul`
-- [ ] `big_print`
-- [ ] 测试：`2^100` 正确输出 `1267650600228229401496703205376`
-
-### 并行版本（等两堵墙修完）
-
-- [ ] `par for` 支持嵌套 `for`
-- [ ] `par for` 支持 struct 字段数组
-- [ ] `big_mul_par`（按输出位置 k 分块）
-- [ ] 仅对 > 4096 limb 有收益
+- [x] 表示：`struct Big { neg: bool, d: Vec[int] }` —— 1e9 进制、**高位在前**、
+      无前导零、`-0` 归一成 `0`
+- [x] 构造：`big(int)` / `big_str("...")`（支持 `+` / `-` 前缀）
+- [x] 加 / 减 / 乘（O(n²) 竖式），带符号，进位链正确
+- [x] 除 / 取模：教科书竖式 + **每支二分试商**。不写 Knuth D 的归一化估商——
+      那个快，但估错一次就是静默算错；二分慢 30 倍常数，但显然正确。
+      商余向零截断，和 C 的整数除法一致
+- [x] 比较：只写 `op_eq` / `op_lt`，`!=` `>` `<=` `>=` 由运算符重载自动组合
+- [x] `op_str`：插值 `"{a}"` 和 `say(a)` 直接可用
+- [x] 快速幂 `pow`、`divmod`、`gcd`、`fib`、`fact`、`sign` / `abs` / `cmp`
+- [x] `to_int()` 超出范围**饱和**，不回绕
+- [x] 与 node `BigInt` 逐位对齐：30! / 2^100 / fib(100) / 21 位乘法 /
+      `p = q*d + r` / `7 / -2 = -3 余 1`
 
 ### 已知限制
 
-- 值传递慢（2064 字节 struct 每次复制）→ 后续改成指针传
-- 没有除法（长除法工作量大）
-- 没有字符串解析（`big_from_str`）
-- 1024 位上限（256 limb × 4 位）
+- `big_str` 不校验非法字符（`atoll` 语义：遇到非数字就停在那）
+- Vec 没有自动回收：长循环里反复运算会累积内存，长跑要手动 `b.free()`
+- 除法常数大：每位 30 次二分，约 O(30·n·m)，明显慢于加乘
+- 没有并行版本（`Vec` 在 `par for` 里不能 push）
+
+---
+
+## 🎯 运算符重载（2026-10-25）
+
+- [x] `src/ops.rs`：运算符 → 方法名的唯一真相（checker / codegen 共用一份解析）
+- [x] `+ - * / %` → `op_add` … 一元 `-` → `op_neg`
+- [x] `== != < > <= >=` → `op_eq` / `op_lt`（缺的自动换位 / 取反组合）
+- [x] `op_str`：插值与 `say` 自动转字符串；没定义就编译期拒绝
+      （结构体进 printf varargs 是 UB）
+- [x] 左操作数没有地址时（`(a+b)+c`、`f(x)*y`）自动落临时变量
+- [x] 方法体内 `self + o`、`self.other()`；接收者可以是任意左值/返回值
+- [x] 签名在**定义处**校验（参数个数、`op_str` 返回类型），错误指向写错的 fn
+- [x] 验收：`tests_opover.lume`（18 项）+ `fail/op_missing` + `fail/op_str_missing`
 
 ---
 

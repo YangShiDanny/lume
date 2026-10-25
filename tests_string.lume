@@ -1,0 +1,131 @@
+// 字符串：拼接与 arena 派生（tests_string.lume）
+//
+// str 在 C 里就是 const char*，派生字符串（拼接、upper、trim、slice……）
+// 全部落进 arena。老实现是「8 个静态槽轮转 + 4095 字节截断」，
+// 连续调 9 次就开始互相覆盖 —— 这个文件专门压这两条老限制，
+// 顺带覆盖这轮新增的几个 str 函数。
+
+fn join3(a: str, b: str, c: str) -> str {
+    return a + b + c
+}
+
+fn greet(name: str) -> str {
+    return "hello, " + name + "!"
+}
+
+fn main() {
+    // ── 1. 基本拼接 ──
+    a := "hello"
+    b := " world"
+    say("[1] 变量+变量   = {a + b}")
+    say("[1] 变量+字面量 = {a + \"!\"}")
+    say("[1] 链式        = {a + b + \" again\"}")
+    say("[1] 函数返回    = {join3(a, \"-\", b)}")
+    say("[1] 函数内拼接  = {greet(\"lume\")}")
+    say("[1] 空串        = [{a + \"\"}][{\"\" + b}][{\"\" + \"\"}]")
+
+    // ── 2. += 累加（parser 展开成 s = s + x）──
+    acc := ""
+    acc += "x"
+    acc += "y"
+    acc += "z"
+    say("[2] += 累加 = {acc}  len={str_len(acc)}")
+
+    // ── 3. 拼接结果参与后续运算 ──
+    s := a + b
+    say("[3] len={str_len(s)}  ==\"hello world\": {s == \"hello world\"}")
+    say("[3] slice(0,5)={str_slice(s, 0, 5)}  slice(6,11)={str_slice(s, 6, 11)}")
+    say("[3] index_of(\"world\")={str_index_of(s, \"world\")}  index_of(\"zzz\")={str_index_of(s, \"zzz\")}")
+    say("[3] 拼接后再拼 = {s + \" / \" + int_to_str(str_len(s))}")
+
+    // ── 4. 回归：老实现只有 8 个静态槽，第 9 个开始互相覆盖 ──
+    // 这里连续取 10 个，全部必须保活到拼接那一刻。
+    k0 := str_upper("a0")
+    k1 := str_upper("a1")
+    k2 := str_upper("a2")
+    k3 := str_upper("a3")
+    k4 := str_upper("a4")
+    k5 := str_upper("a5")
+    k6 := str_upper("a6")
+    k7 := str_upper("a7")
+    k8 := str_upper("a8")
+    k9 := str_upper("a9")
+    say("[4] 10 个 str_upper 同时存活 = {k0 + k1 + k2 + k3 + k4 + k5 + k6 + k7 + k8 + k9}")
+
+    // ── 5. 回归：老实现 4095 字节截断 ──
+    big := str_repeat("x", 5000)
+    say("[5] str_repeat(\"x\",5000) 长度 = {str_len(big)}  期望 5000")
+    say("[5] 长串拼接后长度 = {str_len(big + big)}  期望 10000")
+
+    // ── 6. str_slice 越界自动夹边，不 abort ──
+    say("[6] slice(\"abc\", 1, 99) = {str_slice(\"abc\", 1, 99)}  期望 bc")
+    say("[6] slice(\"abc\", -5, 2) = {str_slice(\"abc\", -5, 2)}  期望 ab")
+    say("[6] slice(\"abc\", 2, 1)  = [{str_slice(\"abc\", 2, 1)}]  期望空")
+
+    // ── 7. str_repeat ──
+    say("[7] repeat(\"ab\",0) = [{str_repeat(\"ab\", 0)}]  repeat(\"ab\",1) = [{str_repeat(\"ab\", 1)}]  repeat(\"ab\",3) = [{str_repeat(\"ab\", 3)}]")
+
+    // ── 8. int_to_str：正 / 负 / 零 / INT64_MIN ──
+    say("[8] {int_to_str(12345)} {int_to_str(-7)} {int_to_str(0)}")
+    say("[8] INT64_MIN = {int_to_str(-9223372036854775807 - 1)}")
+
+    // ── 9. float_to_str（%g，6 位有效数字）──
+    say("[9] {float_to_str(1.5)} {float_to_str(-0.25)} {float_to_str(0.0)}")
+
+    // ── 10. str_split：正常 / 空串 / 连续分隔符 ──
+    p1 := str_split("a,bb,ccc", ",")
+    say("[10] \"a,bb,ccc\" 段数={p1.len} 内容={p1[0]}|{p1[1]}|{p1[2]}")
+    p2 := str_split("", ",")
+    say("[10] \"\" 段数={p2.len} 内容=[{p2[0]}]")
+    p3 := str_split("a,,b", ",")
+    say("[10] \"a,,b\" 段数={p3.len} 内容={p3[0]}|{p3[1]}|{p3[2]}")
+    p4 := str_split("a|b|c|d", "|")
+    say("[10] 多段 段数={p4.len} 末段={p4[3]}")
+
+    // ── 11. str_replace：新串比旧串长（老实现会被 4095 卡住）──
+    say("[11] {str_replace(\"a-b-c\", \"-\", \"__\")}")
+
+    // ── 12. arena 整体释放后仍能正常分配 ──
+    // 注意：reset 之前拿到的 str 全部变悬垂，所以这个调用只放在
+    // 「一批临时字符串确实用完了」的位置。
+    str_arena_reset()
+    fresh := "p" + "q"
+    say("[12] arena reset 后重新分配 = {fresh}")
+
+    // ── 13. 拼接和比较混用：不能退化成指针比较 ──
+    x := "ab"
+    y := "a" + "b"
+    say("[13] \"ab\" == (\"a\"+\"b\") : {x == y}  期望 1")
+    say("[13] (\"a\"+\"b\") == (\"ab\") : {\"a\" + \"b\" == \"ab\"}  期望 1")
+
+    // ── 14. 插值当字符串用 ──
+    // 以前非 say 位置的插值只保留 Text 部分，`{n}` 被静默丢掉，
+    // `s := "n={n}"` 得到的是 "n="。现在会真的拼出来。
+    n := 42
+    f := 2.5
+    name := "lume"
+    line := "[{name}] n={n} f={f}"
+    say("[14] 赋值给变量 = {line}")
+    say("[14] 长度 = {str_len(line)}  期望 17")
+    say("[14] 参与拼接 = {line + \" | len=\" + int_to_str(str_len(line))}")
+    plain := "no braces here"
+    say("[14] 纯文本照旧 = {plain}")
+
+    // ── 15. par for 里的字符串 ──
+    // worker 是提到文件顶层的独立函数，走 parallel.rs 里另一套表达式生成器。
+    // 那套曾经缺字符串判断：`"v" + int_to_str(i)` 会生成 C 的指针加法。
+    par_len := [0; 200]
+    par for i in 0..200 {
+        t := "v" + int_to_str(i % 10)
+        if t == "v0" {
+            par_len[i] = 1
+        } else {
+            par_len[i] = 0
+        }
+    }
+    hits := 0
+    for i in 0..200 {
+        hits = hits + par_len[i]
+    }
+    say("[15] par for 内拼接+比较，命中 v0 次数={hits}  期望 20")
+}

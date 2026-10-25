@@ -1,0 +1,7 @@
+// expect: [exit] code=7
+// exit(n) 必须真的改变退出码，而且退出前要排空异步日志队列 ——
+// 不排空的话这一行根本不会出现（stdout 由 writer 线程刷）。
+fn main() {
+    say("[exit] code=7")
+    exit(7)
+}

@@ -68,6 +68,11 @@ impl Checker {
                     for m in &s.methods {
                         let label = format!("{}.{}", s.name, m.name);
                         self.check_defaults_trailing(m, &label);
+                        // 运算符方法的签名在**定义处**校验一次。留到使用处
+                        // 再报的话，错误指向 `a + b`，而不是写错的那个 fn。
+                        if crate::ops::is_op_method(&m.name) {
+                            self.check_op_method_signature(s, m);
+                        }
                         let sig = FuncSig {
                             params: m.params.iter()
                                 .map(|p| self.ty_from_ast(p.ty.as_ref()))
@@ -80,6 +85,32 @@ impl Checker {
                         methods.insert(m.name.clone(), sig);
                     }
                     self.methods.insert(s.name.clone(), methods);
+                }
+                Item::Enum(e) => {
+                    if self.enums.contains_key(&e.name) {
+                        self.error(format!("枚举 '{}' 重复定义", e.name));
+                        continue;
+                    }
+                    let names: Vec<String> =
+                        e.variants.iter().map(|v| v.name.clone()).collect();
+                    self.enums.insert(e.name.clone(), names);
+
+                    // 值重复会让 C 里的 switch 出现 duplicate case，
+                    // 而且 match 上根本分不开这两个变体，直接在编译期拒掉。
+                    let mut seen_vals: Vec<i64> = Vec::new();
+                    for (vname, val) in e.resolved() {
+                        if seen_vals.contains(&val) {
+                            self.error_hint(
+                                format!(
+                                    "枚举 '{}' 的变体 '{}' 的值 {} 和前面的变体重复",
+                                    e.name, vname, val
+                                ),
+                                "每个变体的值必须唯一，显式值之后没写的会依次 +1",
+                            );
+                        } else {
+                            seen_vals.push(val);
+                        }
+                    }
                 }
                 // 顶层常量：先登记名字 → 类型，函数体里的引用才不会报
                 // 「未定义的变量」。类型声明优先，没写就按字面量推断。
@@ -103,6 +134,37 @@ impl Checker {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// 运算符方法的签名约束。名字表在 `crate::ops`，规则很窄：
+    ///
+    /// - `op_str` / `op_neg` 是零元（self 隐式，不算参数）；
+    /// - 其余都是二元（右操作数一个参数）；
+    /// - `op_str` 必须返回 str —— 它要直接进 printf 的 `%s`。
+    fn check_op_method_signature(&mut self, s: &StructDecl, m: &FnDecl) {
+        let unary = m.name == crate::ops::STR_METHOD || m.name == "op_neg";
+        let want = if unary { 0 } else { 1 };
+        if m.params.len() != want {
+            self.error_hint(
+                format!(
+                    "运算符方法 {}.{} 必须有 {} 个参数（self 是隐式的，不算参数）",
+                    s.name, m.name, want
+                ),
+                format!(
+                    "运算符方法一共这些：{}",
+                    crate::ops::method_names().join(" / ")
+                ),
+            );
+        }
+        if m.name == crate::ops::STR_METHOD {
+            let ret = self.ty_from_ast(m.ret.as_ref());
+            if !ret.is_unknown() && ret != Ty::Str {
+                self.error_hint(
+                    format!("{}.{} 必须返回 str", s.name, m.name),
+                    "插值 / say 会把它当 %s 直接打印",
+                );
             }
         }
     }
@@ -141,10 +203,22 @@ impl Checker {
                 Type::Bool => Ty::Bool,
                 Type::Str => Ty::Str,
                 Type::Rune => Ty::Rune,
-                Type::Named(s) => Ty::Struct(s.clone()),
+                Type::Named(s) => {
+                    // 枚举和结构体在语法上都是「一个名字」，靠登记表区分。
+                    if self.enums.contains_key(s) {
+                        Ty::Enum(s.clone())
+                    } else {
+                        Ty::Struct(s.clone())
+                    }
+                }
                 Type::List(inner) | Type::Array(inner, _) => {
                     Ty::Array(Box::new(self.ty_from_ast(Some(inner))))
                 }
+                // Vec[T] 走 Generic 形状，见 ast::vec_elem_type
+                Type::Generic(..) => match vec_elem_type(t) {
+                    Some(inner) => Ty::Vec(Box::new(self.ty_from_ast(Some(inner)))),
+                    None => Ty::Unknown,
+                },
                 // T? / T! 合并成同一种可空类型（见 Ty::Optional 注释）
                 Type::Optional(inner) | Type::Error(inner) => {
                     Ty::Optional(Box::new(self.ty_from_ast(Some(inner))))

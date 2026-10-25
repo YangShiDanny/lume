@@ -173,7 +173,10 @@ impl Checker {
             Stmt::Break | Stmt::Continue => {}
 
             Stmt::Match { value, arms } => {
-                let _ = self.check_expr(value);
+                let vt = self.check_expr(value);
+                // 枚举的 match 做穷尽性检查：漏了变体就是运行期静默不执行。
+                // 同时校验每个 `Tag.X` 变体名真的存在、没有重复匹配。
+                self.check_enum_match(&vt, arms);
                 for arm in arms {
                     self.push_scope();
                     self.define_pattern(&arm.pattern);
@@ -210,6 +213,10 @@ impl Checker {
         match (a, b) {
             (Ty::Optional(inner_a), Ty::Optional(_)) if inner_a.is_unknown() => true,
             (Ty::Optional(_), Ty::Optional(inner_b)) if inner_b.is_unknown() => true,
+            // `v: Vec[int] = []` / `= [1, 2]`：字面量本身先被检查成
+            // Array（`[]` 的元素类型是 Unknown），赋给 Vec 声明时等价。
+            // 反过来（Vec 赋给固定数组）不成立 —— 长度语义不同，不该放行。
+            (Ty::Vec(va), Ty::Array(ab)) => va.is_unknown() || ab.is_unknown() || va == ab,
             _ => false,
         }
     }
@@ -224,7 +231,7 @@ impl Checker {
             Expr::Ident(_) => {
                 // for v in a：v 的类型是数组元素类型
                 let t = self.check_expr(iter);
-                if let Ty::Array(inner) = &t {
+                if let Ty::Array(inner) | Ty::Vec(inner) = &t {
                     return inner.as_ref().clone();
                 }
                 Ty::Unknown
@@ -236,6 +243,96 @@ impl Checker {
         }
     }
     
+    /// `match` 上枚举时的穷尽性检查。
+    ///
+    /// 规则很窄，只在「被 match 的值静态类型是已知枚举」时生效：
+    /// 少了变体且没有兜底臂 → 报错；写了别的枚举的变体 / 不存在的变体 /
+    /// 同一个变体匹配两次 → 报错。值类型不是枚举时只看变体名是否存在，
+    /// 不追穷尽性（可能是运行期从整数转过来的）。
+    fn check_enum_match(&mut self, value_ty: &Ty, arms: &[MatchArm]) {
+        let enum_name = match value_ty {
+            Ty::Enum(n) => Some(n.clone()),
+            _ => None,
+        };
+
+        let mut covered: Vec<String> = Vec::new();
+        let mut has_wildcard = false;
+
+        for arm in arms {
+            match &arm.pattern {
+                Pattern::Wildcard => has_wildcard = true,
+                // 裸标识符是变量绑定，等价于通配
+                Pattern::Ident(_) => has_wildcard = true,
+                Pattern::EnumVariant(tname, vname) => {
+                    let variants = match self.enums.get(tname).cloned() {
+                        Some(v) => v,
+                        None => {
+                            self.error_hint(
+                                format!("'{}' 不是枚举，不能写 {}.{} 这种变体模式", tname, tname, vname),
+                                format!("枚举变体模式必须写成 <枚举名>.<变体名>，且枚举要先定义"),
+                            );
+                            continue;
+                        }
+                    };
+                    if !variants.iter().any(|v| v == vname) {
+                        self.error_hint(
+                            format!("枚举 '{}' 没有变体 '{}'", tname, vname),
+                            if variants.len() <= 8 {
+                                format!("可用变体：{}", variants.join(" / "))
+                            } else {
+                                "检查变体名拼写（见 enum 定义）".to_string()
+                            },
+                        );
+                        continue;
+                    }
+                    if let Some(want) = &enum_name {
+                        if tname != want {
+                            self.error_hint(
+                                format!(
+                                    "这里写的是 {}.{}，但被 match 的值是 {}",
+                                    tname, vname, want
+                                ),
+                                format!("把变体写成 {}.{}", want, vname),
+                            );
+                            continue;
+                        }
+                    }
+                    if covered.contains(vname) {
+                        self.error_hint(
+                            format!("变体 '{}' 在这个 match 里匹配了不止一次", vname),
+                            "后面的那个臂永远不会执行，删掉或合并",
+                        );
+                        continue;
+                    }
+                    covered.push(vname.clone());
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(ename) = enum_name {
+            if has_wildcard {
+                return;
+            }
+            let all = self.enums.get(&ename).cloned().unwrap_or_default();
+            let missing: Vec<String> = all
+                .into_iter()
+                .filter(|v| !covered.contains(v))
+                .collect();
+            if !missing.is_empty() {
+                let shown = if missing.len() > 6 {
+                    format!("{} 等 {} 个", missing[..6].join(" / "), missing.len())
+                } else {
+                    missing.join(" / ")
+                };
+                self.error_hint(
+                    format!("match 没有覆盖枚举 '{}' 的全部变体，缺少：{}", ename, shown),
+                    format!("补上 {}.{}，或者加一个 `_ => ...` 兜底", ename, missing[0]),
+                );
+            }
+        }
+    }
+
     fn define_pattern(&mut self, pat: &Pattern) {
         match pat {
             Pattern::Ident(name) => {

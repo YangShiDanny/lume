@@ -1,6 +1,7 @@
 // src/codegen/mod.rs
 mod expr;
 mod items;
+mod ops;
 mod parallel;
 mod pipe;
 mod purity;
@@ -11,6 +12,7 @@ mod types;
 
 use crate::ast::*;
 use std::cell::RefCell;
+use types::collect_struct_deps;
 use std::collections::{HashMap, HashSet};
 
 /// 数组类型判定：`[T]` 解析成 List，`[T; N]` 解析成 Array。
@@ -31,6 +33,10 @@ pub struct Codegen {
     /// 生命周期由 `begin_fn_scope` 清空，不会漏进下一个函数。
     pub(crate) self_fields: HashMap<String, String>,
     pub(crate) structs: HashMap<String, Vec<(String, String)>>,
+    /// 枚举名 → [(变体名, 值)]，按声明顺序。C 侧是 `typedef int64_t <名>;`
+    /// 加每个变体一个 `#define`，所以这张表只用于：
+    /// ① 认出 `Tag.Number` 里的 `Tag` 是类型名而不是变量；② 发定义。
+    pub(crate) enums: HashMap<String, Vec<(String, i64)>>,
     // struct 名 → 类型标签编号。C 没有 RTTI，match 结构体解构靠它判断类型
     pub(crate) struct_tags: HashMap<String, i64>,
     pub(crate) methods: HashMap<(String, String), String>,
@@ -41,6 +47,29 @@ pub struct Codegen {
     // 这是「数组跨函数」的核心：长度跟着数组一起走，调用点自动补。
     pub(crate) array_len_exprs: HashMap<String, String>,
     pub(crate) array_elem_types: HashMap<String, String>,
+    // ── 动态数组 Vec[T] ──
+    // Vec 的 C 类型永远是 `LumeVec*`（元素大小存在句柄里），所以只看
+    // var_types 分不出元素类型。取元素要按元素类型强转指针，因此这几张表
+    // 把「哪个名字装的是 Vec[T] 的 T」记下来。
+    /// 变量名 → 元素 C 类型
+    pub(crate) vec_elems: HashMap<String, String>,
+    /// (结构体名, 字段名) → 元素 C 类型。`s.toks[i]` / 方法体里的 `toks[i]`
+    pub(crate) vec_field_elems: HashMap<(String, String), String>,
+    /// 函数名 → 返回的 Vec 的元素 C 类型（`let v = make()` 用）
+    pub(crate) fn_vec_elems: HashMap<String, String>,
+    /// (结构体名, 方法名) → 返回的 Vec 的元素 C 类型（`let v = obj.parse()`）
+    pub(crate) method_vec_elems: HashMap<(String, String), String>,
+    /// 当前函数的返回类型是 Vec 时的元素 C 类型。`return []` 要据此
+    /// 建一个空 Vec，`return v` 则直接返回句柄。
+    pub(crate) cur_ret_vec_elem: Option<String>,
+    /// 当前方法所属的结构体名（`gen_method` 设置）。方法体里裸写字段名
+    /// 时，取 Vec 元素类型要知道是哪个 struct 的同名字段。
+    pub(crate) cur_self_struct: Option<String>,
+    /// 当前方法的字段名表。`gen_for` 生成循环体时要靠它把裸字段名映射成
+    /// `_self->f`（gen_stmt_with_self 有 fields 参数，gen_for 没有）。
+    pub(crate) cur_field_names: Vec<String>,
+    /// push 的临时变量序号（见 gen_vec_method）
+    pub(crate) vec_counter: usize,
     // 数组/列表参数名（长度编译期未知）
     pub(crate) array_params: HashSet<String>,
     // 已证明为纯函数、可以打 __attribute__((const)) 的函数名
@@ -127,9 +156,18 @@ impl Codegen {
             self_fields: HashMap::new(),
             structs: HashMap::new(),
             struct_tags: HashMap::new(),
+            enums: HashMap::new(),
             methods: HashMap::new(),
             array_len_exprs: HashMap::new(),
             array_elem_types: HashMap::new(),
+            vec_elems: HashMap::new(),
+            vec_field_elems: HashMap::new(),
+            fn_vec_elems: HashMap::new(),
+            method_vec_elems: HashMap::new(),
+            cur_ret_vec_elem: None,
+            cur_self_struct: None,
+            cur_field_names: Vec::new(),
+            vec_counter: 0,
             array_params: HashSet::new(),
             const_fns: HashSet::new(),
             owned_arrays: HashSet::new(),
@@ -188,6 +226,15 @@ impl Codegen {
         // par_workers 一样，最后再 insert 回这个位置。
         let opt_pos = self.output.len();
 
+        // 0.9 枚举：类型名 → 变体表。必须早于 struct 收集 ——
+        //     结构体字段的类型可以直接写枚举名，而 gen_type 只把名字原样
+        //     交给 C（真正的 typedef 在第 2.8 步发）。
+        for item in &program.items {
+            if let Item::Enum(e) = item {
+                self.enums.insert(e.name.clone(), e.resolved());
+            }
+        }
+
         // 1. 收集 struct 定义和方法签名
         let mut tag_counter: i64 = 0;
         for item in &program.items {
@@ -196,6 +243,15 @@ impl Codegen {
                     .map(|f| (f.name.clone(), self.gen_type(&f.ty)))
                     .collect();
                 self.structs.insert(s.name.clone(), fields);
+                // Vec 字段的元素类型也要单独记：字段的 C 类型只有
+                // "LumeVec*"，取元素时得知道按什么类型强转。
+                for f in &s.fields {
+                    if let Some(elem) = vec_elem_type(&f.ty) {
+                        let c = self.gen_type(elem);
+                        self.vec_field_elems
+                            .insert((s.name.clone(), f.name.clone()), c);
+                    }
+                }
                 // 按出现顺序分配类型标签
                 self.struct_tags.insert(s.name.clone(), tag_counter);
                 tag_counter += 1;
@@ -206,6 +262,13 @@ impl Codegen {
                         Some(t) => self.gen_type(t),
                     };
                     self.methods.insert((s.name.clone(), m.name.clone()), ret);
+                    // 方法返回 Vec 时，调用点 `let v = obj.m()` 要能拿到
+                    // 元素类型才能取元素。
+                    if let Some(elem) = m.ret.as_ref().and_then(vec_elem_type) {
+                        let c = self.gen_type(elem);
+                        self.method_vec_elems
+                            .insert((s.name.clone(), m.name.clone()), c);
+                    }
                     self.method_array_params.insert(
                         (s.name.clone(), m.name.clone()),
                         m.params.iter().map(|p| is_array_ty(&p.ty)).collect(),
@@ -263,6 +326,12 @@ impl Codegen {
                 if is_array_ty(&f.ret) {
                     self.array_ret_fns.insert(f.name.clone());
                 }
+                // 返回 Vec 的函数：Vec 自带 len，不需要 _ret_len 伴随参数，
+                // 但调用点要能从元素类型推出怎么取元素。
+                if let Some(elem) = f.ret.as_ref().and_then(vec_elem_type) {
+                    let c = self.gen_type(elem);
+                    self.fn_vec_elems.insert(f.name.clone(), c);
+                }
             }
         }
 
@@ -287,11 +356,67 @@ impl Codegen {
         //     `let r = f()` 只有对这类函数才把 r 标记成 owned，允许 free。
         self.owned_return_fns = collect_owned_return_fns(program);
 
-        // 3. 生成 struct 定义
+        // 2.8 枚举定义。必须在 struct 定义之前：结构体字段可以是枚举类型。
         for item in &program.items {
-            if let Item::Struct(s) = item {
-                self.gen_struct_decl(s);
+            if let Item::Enum(e) = item {
+                self.gen_enum_decl(e);
             }
+        }
+
+        // 3. 生成 struct 定义
+        //
+        // **按依赖排序**：字段类型引用了别的 struct，就先发被依赖的。
+        // 多文件项目和库里，struct 的物理顺序和依赖顺序无关（按路径排序
+        // 合并），照源顺序发会出现 `typedef struct Box { Dim dim; }` 排在
+        // `typedef struct Dim` 前面 —— clang: unknown type name 'Dim'。
+        let all_structs: HashSet<&str> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Struct(s) => Some(s.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut pending: Vec<&StructDecl> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Struct(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let mut emitted: HashSet<String> = HashSet::new();
+        while !pending.is_empty() {
+            let mut deferred: Vec<&StructDecl> = Vec::new();
+            let mut progressed = false;
+            for s in pending {
+                let mut deps: Vec<String> = Vec::new();
+                for f in &s.fields {
+                    collect_struct_deps(&f.ty, &mut deps);
+                }
+                // 未定义且不是自己 → 等下一轮。自引用（`kids: Vec[Node]`）
+                // 的 C 类型是 LumeVec*，不需要前置定义。
+                let ready = deps
+                    .iter()
+                    .all(|d| !all_structs.contains(d.as_str()) || emitted.contains(d) || *d == s.name);
+                if ready {
+                    self.gen_struct_decl(s);
+                    emitted.insert(s.name.clone());
+                    progressed = true;
+                } else {
+                    deferred.push(s);
+                }
+            }
+            if !progressed {
+                // 环状按值包含（A 有字段 B，B 有字段 A）：C 的 struct 不能
+                // 互相按值嵌套，怎么排都编不过。按原顺序发出去让 clang 报，
+                // 比在这里静默丢定义好。
+                for s in deferred {
+                    self.gen_struct_decl(s);
+                }
+                break;
+            }
+            pending = deferred;
         }
 
         // 3.2 顶层常量：必须早于所有函数体。C 里的 `const T x = v;` 是**定义**，
@@ -432,7 +557,7 @@ impl Codegen {
             .iter()
             // 字符串可空值的 typedef 写在 runtime header 里（文件 IO 要用），
             // 这里再发一遍就是 redefinition。
-            .filter(|(tag, _)| tag.as_str() != super::types::OPT_STR_TAG)
+            .filter(|(tag, _)| tag.as_str() != types::OPT_STR_TAG)
             .map(|(tag, elem)| (tag.clone(), elem.clone()))
             .collect();
         if pairs.is_empty() {
@@ -530,6 +655,9 @@ impl Codegen {
         self.array_elem_types.clear();
         self.array_params.clear();
         self.owned_arrays.clear();
+        self.vec_elems.clear();
+        self.cur_self_struct = None;
+        self.cur_field_names.clear();
     }
 
     pub(crate) fn push_line(&mut self, s: &str) {

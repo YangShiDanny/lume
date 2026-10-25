@@ -250,6 +250,13 @@ impl Parser {
                             .map(|(i, p)| (i.to_string(), p))
                             .collect(),
                     ))
+                } else if self.eat(&TokenKind::Dot) {
+                    // 枚举变体模式：`Color.Red`
+                    let vname = match self.advance().clone() {
+                        TokenKind::Ident(v) => v,
+                        _ => return Err(self.error("期待枚举变体名")),
+                    };
+                    Ok(Pattern::EnumVariant(s, vname))
                 } else {
                     Ok(Pattern::Ident(s))
                 }

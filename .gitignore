@@ -9,11 +9,13 @@ main
 output.c
 output
 _precompute_*
-tests_*.c
-tests_optional
-tests_slice
-tests_pipe
-tests_bounds
+# 测试源文件（tests_*.lume）在仓库根，它们的编译产物和源文件同名（不带后缀），
+# 所以按前缀整体忽略，再用 ! 把 .lume 放回来。
+# 两条都必须带前导 `/` 锚定仓库根：不锚定的话 `tests_*` 会连
+# tests/golden/tests_file.out 这种文件一起吞掉。
+# 也别写成 `tests*` —— 那会把整个 tests/ 目录和新测试源文件一起忽略。
+/tests_*
+!/tests_*.lume
 print_1_100.c
 print_1_100
 *.exe

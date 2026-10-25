@@ -1,0 +1,133 @@
+// 枚举：C 风格无载荷枚举（自举第 6 块地基）。
+//
+// 词法器的 TokenKind 有几十种，靠 int 常量硬凑时既没有名字也做不了
+// 穷尽性检查。这里逐项断言枚举的对外行为，golden 逐字节比对。
+
+enum Tag {
+    Number
+    Ident
+    Plus
+    Eof
+}
+
+// 显式值：之后没写的继续 +1
+enum Code {
+    Ok = 0
+    Warn = 10
+    Err
+    Fatal = 100
+}
+
+// 枚举做结构体字段
+struct Tok {
+    kind: Tag
+    line: int
+}
+
+// 枚举做参数 / 返回类型
+fn is_literal(t: Tag) -> bool {
+    return t == Tag.Number or t == Tag.Ident
+}
+
+fn next_of(t: Tag) -> Tag {
+    if t == Tag.Number {
+        return Tag.Ident
+    }
+    if t == Tag.Ident {
+        return Tag.Plus
+    }
+    return Tag.Eof
+}
+
+// 方法体里用枚举（裸字段名 + 枚举常量）
+struct Lexer {
+    kind: Tag
+    seen: int
+
+    fn bump() {
+        kind = next_of(kind)
+        seen = seen + 1
+    }
+
+    fn done() -> bool {
+        return kind == Tag.Eof
+    }
+}
+
+fn main() {
+    // [1] 默认编号从 0 开始
+    say("[1] {Tag.Number} {Tag.Ident} {Tag.Plus} {Tag.Eof}")
+
+    // [2] 显式值 + 自动续号
+    say("[2] {Code.Ok} {Code.Warn} {Code.Err} {Code.Fatal}")
+
+    // [3] 比较
+    t := Tag.Plus
+    say("[3] t==Plus {t == Tag.Plus} t==Number {t == Tag.Number} t!=Eof {t != Tag.Eof}")
+
+    // [4] 变体名（调试 / 报错信息用）
+    say("[4] {Tag.name(t)} {Tag.name(Tag.Eof)} {Code.name(Code.Err)}")
+
+    // [5] match 全变体覆盖
+    match t {
+        Tag.Number => say("[5] 字面量"),
+        Tag.Ident => say("[5] 标识符"),
+        Tag.Plus => say("[5] 加号"),
+        Tag.Eof => say("[5] 结束")
+    }
+
+    // [6] match + 兜底臂
+    match Tag.Eof {
+        Tag.Number => say("[6] number"),
+        _ => say("[6] 其它：{Tag.name(Tag.Eof)}")
+    }
+
+    // [7] 枚举当结构体字段
+    tk := Tok(kind: Tag.Ident, line: 7)
+    say("[7] kind={Tag.name(tk.kind)} line={tk.line} is_lit={is_literal(tk.kind)}")
+
+    // [8] 枚举参数 / 返回
+    n := next_of(Tag.Number)
+    say("[8] next={Tag.name(n)} is_lit={is_literal(n)}")
+    say("[8] next2={Tag.name(next_of(n))} eof={next_of(Tag.Plus) == Tag.Eof}")
+
+    // [9] Vec[Tag]
+    kinds: Vec[Tag] = [Tag.Number, Tag.Ident, Tag.Plus]
+    names := ""
+    for k in kinds {
+        names = names + Tag.name(k) + " "
+    }
+    say("[9] len={kinds.len()} {names}")
+
+    // [10] 方法体里改字段
+    lx := Lexer(kind: Tag.Number, seen: 0)
+    lx.bump()
+    lx.bump()
+    say("[10] kind={Tag.name(lx.kind)} seen={lx.seen} done={lx.done()}")
+    lx.bump()
+    say("[10] kind={Tag.name(lx.kind)} done={lx.done()}")
+
+    // [11] 显式类型标注
+    x: Tag = Tag.Eof
+    say("[11] {Tag.name(x)} {x}")
+
+    // [12] 枚举存进 Vec 再在循环里 match（两层组合）
+    //      match 的臂体是**表达式**，所以这里让 say 承担副作用。
+    count := 0
+    for k in kinds {
+        match k {
+            Tag.Number => say("[12] {Tag.name(k)} 是字面量"),
+            Tag.Ident => say("[12] {Tag.name(k)} 是标识符"),
+            _ => say("[12] {Tag.name(k)} 是符号")
+        }
+        count = count + 1
+    }
+    say("[12] count={count}")
+
+    // [13] par for 里读枚举（worker 里也要能生成常量名）
+    par for i in 0..3 {
+        say("[13] {i} {Tag.name(kinds[i])} {kinds[i] == Tag.Ident}")
+    }
+
+    say("[13] 收尾")
+}
