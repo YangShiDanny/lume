@@ -1,4 +1,5 @@
 mod ast;
+mod builtins;
 mod checker;
 mod cli;
 mod codegen;

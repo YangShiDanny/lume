@@ -121,7 +121,7 @@ lume run   main.lume [选项]   # 编译并立即运行
 ### 关键字
 
 ```
-fn struct trait impl if else while for in return break continue match
+fn struct trait impl if else while for in return break continue match scope
 import use pub const extern as and or not true false nothing
 app par async await spawn it
 ```
@@ -225,6 +225,29 @@ say("literal {{brace}}")   // literal {brace}
 - `{expr}` 插值，`{{` `}}` 转义；字符串里的 `%` 自动转义成 `%%`。
 - `say(x)` 传变量也可以，格式串按类型推断。
 
+### 拼接
+
+`str + str` 拼接，结果是一块**新分配**的内存：
+
+```lume
+a := "hello"
+b := " world"
+say(a + b)               // hello world
+say(a + b + "!")         // 链式，左结合
+say("len={str_len(a + b)}")
+
+acc := ""
+acc += "x"               // += 也走拼接
+acc += "y"               // x 和 y 都在，不会互相覆盖
+```
+
+只允许 `str + str`。`"n = " + 1` 会**编译报错**，不做隐式转换 ——
+拼没拼上必须一眼看得出，要混类型就写插值 `"n = {n}"`。
+
+拼接、`str_upper`、`str_slice` 这些派生结果都放在**字符串 arena** 里，
+和 C 的 `char*` 完全兼容（可以直接交给 `printf`），细节见
+[内置函数 → 字符串内存](#字符串内存arena)。
+
 ### 插值支持什么
 
 `{...}` 里的内容在**解析期**就交给真正的 parser 变成 AST，所以任意表达式都能用，
@@ -241,7 +264,19 @@ say("{nums[0]}")      // 数组元素 → 按元素类型
 类型 → 格式：整数 `%lld`、浮点 `%f`、字符串 `%s`、bool `%d`、rune `%c`、颜色 `0x%06X`。
 实参会按格式串自动加显式转换，不会出现 varargs 类型不匹配。
 
-插值只在 `say` 里有意义。把带插值的字符串赋给变量或传给函数时，会退化成纯文本（插值部分被丢掉）。
+插值不只在 `say` 里有意义：
+
+- **在 `say` 里**，插值直接摊成 printf 格式串，零分配。
+- **在别的位置**（赋值、传参、参与拼接），插值会拼成一个新字符串，落在 arena 里：
+
+```lume
+n := 42
+s := "n = {n}"              // "n = 42"
+t := "{n} + {n} = {n * 2}"  // "42 + 42 = 84"
+say("len={str_len(t)}")     // 13
+```
+
+（早期版本会把插值部分丢掉，`s := "a{x}"` 只得到 `"a"`，而且不报错。）
 
 ---
 
@@ -273,6 +308,38 @@ for i in 0..100 {
 ```
 
 `else { }` 和 `else if` 都正常。
+
+### `scope` 块：把块内的临时字符串还回去
+
+字符串都从 arena 切（见「字符串内存：arena」），arena 默认只增不还。
+在循环里反复派生字符串就会一路涨。`scope` 给出一个局部回收点：
+
+```lume
+while i < n {
+    scope {
+        line := str_trim(str_upper(lines[i]))   // 这里有 2 次 arena 分配
+        total = total + str_len(line)
+    }                                            // 出块：这两块内存一起还回去
+    i = i + 1
+}
+```
+
+- **变量作用域**和普通块一样：块内声明的名字在外面看不到。
+- **出块时**把块内派生的字符串一次性还给 arena，块**之前**派生的不受影响。
+- 可以嵌套：内层只回收内层那一段。
+- `break` / `continue` 会跳过块尾，编译器会在跳转前自动补一次回收。
+- ⚠ `return` **不会**回收（故意泄漏一次）。返回值本身可能就是块内派生的
+  字符串，回收等于返回悬垂指针 —— 泄漏是安全的，悬垂不是。
+- ⚠ `par for` 的循环体里**不能用** `scope`，编译期直接报错：多个 worker
+  共享同一个 arena，一个 worker 回退水位会把别人刚分配的一起回收。
+
+拿不准内存有没有涨就量一下：`str_arena_bytes()` 返回当前 arena 已用字节数。
+
+```lume
+before := str_arena_bytes()
+// ... 跑一堆派生 ...
+say("这块代码用了 {str_arena_bytes() - before} 字节")
+```
 
 ⚠ **if 作为表达式**（`x := if c { 1 } else { 2 }`）还没实现，会生成非法 C 导致 clang 报错。
 需要条件取值就写成语句：
@@ -359,6 +426,9 @@ say("{p.x}")                        // 字段访问
 
 规则：
 - 方法里直接写字段名；参数名和字段冲突时可以写 `self.x`（生成 `_self->x`）。
+- **局部变量遮蔽字段**：方法体里 `w := 5` 之后再用 `w` 指的是那个局部变量，
+  不是字段。所以 `w := w + 1` 这种写法里的右侧 `w` 仍读字段（声明生效前的
+  那次引用），符合直觉。
 - 方法里也可以正常用 `say`。
 - 生成的 C：`typedef struct Point {...} Point;` + `static ... Point_len(Point* _self, ...)`。
 - ⚠ 方法调用的接收者必须是**单个变量名**（`p.len()` 可以，`a.b.len()` 不行）。
@@ -581,8 +651,17 @@ par for i in 0..1000000 {
 | `say(...)` | void | 打印，支持插值 |
 | `free(x)` | void | 释放 owned 数组（函数/`map`/`filter`/管道新建的） |
 | `now()` | int | 当前纳秒时间戳（单调时钟） |
-| `str_len(s)` `str_upper(s)` `str_lower(s)` `str_trim(s)` | int / str | 字符串处理 |
-| `str_to_int(s)` `str_to_float(s)` | int / float | 解析 |
+| `str_len(s)` `str_to_int(s)` `str_to_float(s)` | int / float | 长度、解析 |
+| `str_upper(s)` `str_lower(s)` `str_trim(s)` | str | 大小写、去首尾空白 |
+| `str_replace(s, old, new)` | str | 全部替换 |
+| `str_slice(s, start, end)` | str | 取 `[start, end)`，越界自动夹边 |
+| `str_index_of(s, sub)` | int | 子串首次位置，没有则 `-1` |
+| `str_repeat(s, n)` | str | 重复 `n` 次 |
+| `str_split(s, sep)` | [str] | 按 `sep` 切分（段数不限，`sep` 为空则按字符切） |
+| `str_contains(s, sub)` `str_starts_with` `str_ends_with` | bool | |
+| `int_to_str(x)` `float_to_str(x)` | str | 数字 → 字符串 |
+| `str_arena_reset()` | void | 释放所有派生字符串（见下） |
+| `str_arena_bytes()` | int | arena 当前已用字节数，用来量内存 |
 | `int_abs(x)` `int_min(a,b)` `int_max(a,b)` | int | |
 | `float_sqrt(x)` / `sqrt(x)` | float | 两种名字都行 |
 | `float_abs` `float_pow`/`pow` | float | |
@@ -604,9 +683,32 @@ par for i in 0..1000000 {
 
 其他 C 标准函数**没有 extern 通路**，用不了。
 
-`str_upper` / `str_lower` / `str_trim` 返回内部缓冲区，内部有 8 个轮转槽位，
-所以 `say("{str_upper(a)} {str_upper(b)}")` 不会互相覆盖。
-单个表达式里超过 8 个结果时才会开始复用（缓冲区上限 4095 字符）。
+### 字符串内存：arena
+
+`str` 就是 C 的 `const char*`。派生字符串（拼接、`str_upper`、`str_slice`……）
+全部从一块**只增不还**的 arena 里切，`str_arena_reset()` 一次性释放全部。
+
+- **任意多个字符串可以同时存活**。过去是 8 个静态槽轮转，连续调 9 次就开始
+  互相覆盖 —— `str_upper(a)` 的结果可能被 `str_upper(b)` 冲掉，而且不报错。
+  现在没有这个限制。
+- **没有 4095 字符上限**。过去超了静默截断。
+- **每次派生都是新内存**，`s + t` 不和任何已有字符串别名，改不了别人。
+
+代价是内存只增不减：循环里反复拼接会持续占用，直到有人回收。
+两种回收方式：
+
+1. **`scope { ... }` 块**（首选，局部回收）：出块时把块内派生的字符串一次还回去，
+   块之前的字符串不受影响。可以嵌套，`break` / `continue` 会在跳转前补回收。
+   详见「控制流 → `scope` 块」。
+2. **`str_arena_reset()`**（全局回收）：清空整个 arena。之后**所有** `str` 都变成
+   悬垂指针（包括变量里存着的那些），所以只在一批临时字符串确实用完时调 ——
+   比如解析完一个源文件之后。
+
+`str_arena_bytes()` 返回当前已用字节数，用来确认某段代码到底吃了多少内存。
+
+字面量（`"abc"`）是静态数据，不进 arena，`reset` 碰不到它们。
+`par for` 的 worker 线程共用同一个 arena，内部有锁保护（但 `scope` 在
+`par for` 里被禁止，见上文）。
 
 ---
 
@@ -645,6 +747,11 @@ par for i in 0..1000000 {
 | `E()`（空 struct） | 会被当成函数调用；struct 至少写一个字段 |
 | 泛型函数里调泛型函数 | 不会单态化，生成未定义函数 |
 | `s.arr[i]`（struct 字段数组）、`f()[i]`（函数返回的数组） | 长度拿不到，**不做**边界检查（仍然是静默越界） |
+| `str_arena_reset()` 之后继续用旧的 `str` | 全部变悬垂指针，编译器不跟踪 |
+| 循环体里反复拼接字符串却不用 `scope` | arena 只增不减，要自己划定回收范围 |
+| `scope` 里 `return 一个字符串` | 不回收（故意泄漏一次），否则返回悬垂指针 |
+| `par for` 循环体里用 `scope` | 编译期报错：多 worker 共享 arena，回退会踩坏别人的字符串 |
+| `"n=" + 1`（str 和非 str 相加） | 不做隐式转换，编译期报错；用插值 `"n={n}"` |
 
 ---
 

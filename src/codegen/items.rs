@@ -155,7 +155,14 @@ impl Codegen {
             None => if is_main { "int".to_string() } else { "void".to_string() },
             Some(t) => self.gen_type(t),
         };
-        let mut params = self.gen_params(&f.params);
+        // main 永远收 argc/argv（实际用不用由 arg()/arg_count() 决定），
+        // 这样声明和定义两处签名不会打架。用户真给 main 写了参数时
+        // 就按他的来 —— 那种写法本来也拿不到 C 的 argv。
+        let mut params = if is_main && f.params.is_empty() {
+            vec!["int _lume_argc".to_string(), "char** _lume_argv".to_string()]
+        } else {
+            self.gen_params(&f.params)
+        };
         if is_array_ty(&f.ret) {
             params.push("int64_t* _ret_len".to_string());
         }
@@ -209,6 +216,12 @@ impl Codegen {
         let field_names: Vec<String> = self.structs.get(struct_name)
             .map(|f| f.iter().map(|(n, _)| n.clone()).collect())
             .unwrap_or_default();
+        // 字段类型也登记一份：方法体里裸写 `prefix + suffix` 时，
+        // infer_type 必须知道 prefix 是 const char*，否则生成 C 的
+        // 指针加法（读出来是垃圾，clang 也不报错）。
+        for (n, t) in self.structs.get(struct_name).cloned().unwrap_or_default() {
+            self.self_fields.insert(n, t);
+        }
 
         let saved_bounds = self.bounds_check;
         if m.decorators.iter().any(|d| d.name == "unchecked") {
@@ -251,7 +264,11 @@ impl Codegen {
             Some(t) => self.gen_type(t),
         };
 
-        let mut params = self.gen_params(&f.params);
+        let mut params = if is_main && f.params.is_empty() {
+            vec!["int _lume_argc".to_string(), "char** _lume_argv".to_string()]
+        } else {
+            self.gen_params(&f.params)
+        };
         if is_array_ty(&f.ret) {
             params.push("int64_t* _ret_len".to_string());
         }
@@ -285,6 +302,10 @@ impl Codegen {
         }
 
         if is_main {
+            // arg()/arg_count() 的数据来源。必须在任何用户语句之前。
+            if f.params.is_empty() {
+                self.push_line("lume_set_args(_lume_argc, _lume_argv);");
+            }
             // 占位符：generate() 末尾确认整个程序真的有日志调用才替换成
             // lume_log_init_main()。没有 say/write/flush 的程序不该白起
             // 一个 writer 线程（进程启动实测多 ~40 µs）。

@@ -14,7 +14,7 @@ pub enum TokenKind {
 
     // ── 关键字 ──
     Fn, Struct, Trait, Impl, If, Else, While, For, In,
-    Return, Break, Continue, Match,
+    Return, Break, Continue, Match, Scope,
     Import, Use, Pub, Const, Extern, As,
     And, Or, Not, True, False,
     Nothing, App, Par, Async, Await, Spawn, It,
@@ -520,6 +520,7 @@ fn keyword(s: &str) -> Option<TokenKind> {
         "break" => TokenKind::Break,
         "continue" => TokenKind::Continue,
         "match" => TokenKind::Match,
+        "scope" => TokenKind::Scope,
         "import" => TokenKind::Import,
         "use" => TokenKind::Use,
         "pub" => TokenKind::Pub,

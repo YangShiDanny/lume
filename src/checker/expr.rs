@@ -466,6 +466,28 @@ impl Checker {
                 if lt.is_unknown() || rt.is_unknown() {
                     return Ty::Unknown;
                 }
+                // 字符串拼接：只允许 `str + str`。
+                // 不做 `int + str` 之类的隐式转换 —— 拼没拼上必须一眼看得出，
+                // 想混类型就写插值 "{n}{s}"。
+                if *op == Add && lt == &Ty::Str && rt == &Ty::Str {
+                    return Ty::Str;
+                }
+                if lt == &Ty::Str || rt == &Ty::Str {
+                    let hint = if *op == Add {
+                        Some("字符串拼接要求两边都是 str；要和数字混拼请用插值 \"{x}{s}\"")
+                    } else {
+                        Some("str 只支持 + 运算（拼接）")
+                    };
+                    let msg = format!(
+                        "算术运算类型不匹配：{} 和 {}",
+                        lt.name(), rt.name()
+                    );
+                    match hint {
+                        Some(h) => self.error_hint(msg, h.to_string()),
+                        None => self.error(msg),
+                    }
+                    return Ty::Unknown;
+                }
                 if lt == &Ty::Int && rt == &Ty::Int {
                     return Ty::Int;
                 }

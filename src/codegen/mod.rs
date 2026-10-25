@@ -23,6 +23,13 @@ pub struct Codegen {
     pub(crate) output: String,
     pub(crate) indent: usize,
     pub(crate) var_types: HashMap<String, String>,
+    /// 当前 struct 方法的字段名 → C 类型。方法体里裸写字段名（`prefix`）
+    /// 时，`infer_type` 要能查到它是 `const char*` —— 否则
+    /// `prefix + suffix` 会退化成 C 的指针加法，`prefix == "x"` 会变成
+    /// 比指针，两处都静默算错。局部变量优先级更高（`var_types` 先查），
+    /// 所以同名局部变量仍能正常遮蔽字段。
+    /// 生命周期由 `begin_fn_scope` 清空，不会漏进下一个函数。
+    pub(crate) self_fields: HashMap<String, String>,
     pub(crate) structs: HashMap<String, Vec<(String, String)>>,
     // struct 名 → 类型标签编号。C 没有 RTTI，match 结构体解构靠它判断类型
     pub(crate) struct_tags: HashMap<String, i64>,
@@ -103,6 +110,12 @@ pub struct Codegen {
     /// 只收字面量（含一元负号）—— 复杂常量表达式留给 C 编译器。
     pub(crate) const_ints: HashMap<String, i64>,
     pub(crate) repeat_counter: usize,
+    /// 当前已打开的 `scope` 块：(水位变量名, 打开时的 loop_depth)。    /// `break` / `continue` 要按 loop_depth 判断哪些 scope 必须补一次
+    /// 水位释放 —— 只释放本层循环里打开的，外层 scope 还在用。
+    pub(crate) scope_marks: Vec<(String, usize)>,
+    /// 当前嵌套的循环层数。0 = 不在任何循环体里。
+    pub(crate) loop_depth: usize,
+    pub(crate) scope_counter: usize,
 }
 
 impl Codegen {
@@ -111,6 +124,7 @@ impl Codegen {
             output: String::new(),
             indent: 0,
             var_types: HashMap::new(),
+            self_fields: HashMap::new(),
             structs: HashMap::new(),
             struct_tags: HashMap::new(),
             methods: HashMap::new(),
@@ -143,6 +157,9 @@ impl Codegen {
             non_neg_vars: std::collections::HashSet::new(),
             const_ints: HashMap::new(),
             repeat_counter: 0,
+            scope_marks: Vec::new(),
+            loop_depth: 0,
+            scope_counter: 0,
             cur_ret_is_array: false,
             cur_ret_c: String::new(),
             opt_names: RefCell::new(HashMap::new()),
@@ -408,22 +425,25 @@ impl Codegen {
 
     /// 发出本次用到的全部 lume_opt_N 定义。
     fn gen_opt_typedefs(&self) -> String {
-        if self.opt_elems.borrow().is_empty() {
-            return String::new();
-        }
-        let mut s = String::from("/* ---- 可空类型 (T? / T!) ---- */\n");
         // 按 tag 的编号排序，保证输出稳定（HashMap 迭代序随机）
         let mut pairs: Vec<(String, String)> = self
             .opt_elems
             .borrow()
             .iter()
+            // 字符串可空值的 typedef 写在 runtime header 里（文件 IO 要用），
+            // 这里再发一遍就是 redefinition。
+            .filter(|(tag, _)| tag.as_str() != super::types::OPT_STR_TAG)
             .map(|(tag, elem)| (tag.clone(), elem.clone()))
             .collect();
+        if pairs.is_empty() {
+            return String::new();
+        }
         pairs.sort_by(|a, b| {
             let na: usize = a.0.trim_start_matches("lume_opt_").parse().unwrap_or(0);
             let nb: usize = b.0.trim_start_matches("lume_opt_").parse().unwrap_or(0);
             na.cmp(&nb)
         });
+        let mut s = String::from("/* ---- 可空类型 (T? / T!) ---- */\n");
         for (tag, elem) in pairs {
             s.push_str(&format!(
                 "typedef struct {{ int8_t has; {} val; }} {};\n",
@@ -478,38 +498,20 @@ impl Codegen {
         std::mem::take(&mut self.output)
     }
 
-    /// 内置函数签名表。返回 "const char**" 的（只有 str_split）
-    /// 同时登记成数组返回函数，走 `let x = f(...)` 的三行拆开。
+    /// 内置函数签名表。数据来自 `crate::builtins`，这里只负责登记。
+    /// 返回 `const char**` 的（只有 str_split）同时登记成数组返回函数，
+    /// 走 `let x = f(...)` 的三行拆开。
     fn register_builtin_sigs(&mut self) {
-        let sigs: &[(&str, &str)] = &[
-            ("str_len", "int64_t"),
-            ("str_upper", "const char*"),
-            ("str_lower", "const char*"),
-            ("str_trim", "const char*"),
-            ("str_to_int", "int64_t"),
-            ("str_to_float", "double"),
-            ("str_contains", "bool"),
-            ("str_starts_with", "bool"),
-            ("str_ends_with", "bool"),
-            ("str_replace", "const char*"),
-            ("str_split", "const char**"),
-            ("int_abs", "int64_t"),
-            ("int_min", "int64_t"),
-            ("int_max", "int64_t"),
-            ("float_abs", "double"),
-            ("sqrt", "double"),
-            ("pow", "double"),
-            ("sin", "double"),
-            ("cos", "double"),
-            ("tan", "double"),
-            ("floor", "double"),
-            ("ceil", "double"),
-            ("round", "double"),
-        ];
-        for (name, ret) in sigs {
-            self.fn_ret_types.insert(name.to_string(), ret.to_string());
-            if *ret == "const char**" {
-                self.array_ret_fns.insert(name.to_string());
+        for b in crate::builtins::TABLE {
+            // `str?` 的 C 类型由 opt_tag 决定（固定为 LumeOptStr），
+            // 静态表里给不出来，所以这里特判。
+            let ret = match b.ret {
+                crate::builtins::Ret::OptStr => self.opt_tag("const char*"),
+                other => other.c_type().to_string(),
+            };
+            self.fn_ret_types.insert(b.name.to_string(), ret.to_string());
+            if b.ret == crate::builtins::Ret::StrArray {
+                self.array_ret_fns.insert(b.name.to_string());
             }
         }
     }
@@ -523,6 +525,7 @@ impl Codegen {
     // 处理完全不同（入参能直接 return，栈数组必须 malloc 拷贝）。
     pub(crate) fn begin_fn_scope(&mut self) {
         self.var_types.clear();
+        self.self_fields.clear();
         self.array_len_exprs.clear();
         self.array_elem_types.clear();
         self.array_params.clear();
@@ -776,6 +779,7 @@ fn collect_calls_stmt(s: &Stmt, out: &mut HashSet<String>) {
                 collect_calls_expr(&a.body, out);
             }
         }
+        Stmt::Scope { body } => collect_calls_block(body, out),
         _ => {}
     }
 }

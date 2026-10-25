@@ -247,6 +247,24 @@
 - [x] **字符串操作**（split / contains / replace / starts_with / ends_with）
   - [x] `str_split` / `str_contains` / `str_replace` / `str_starts_with` / `str_ends_with`
 
+- [x] **字符串拼接 + arena 派生**（自举咽喉，2026-10-25）
+  - [x] `str + str` → `lume_str_concat`（runtime 里 arena bump 分配）
+  - [x] `+=` 自动可用（parser 早就展开成 `s = s + x`）
+  - [x] 只允许 `str + str`；`"n=" + 1` 编译期报错 + hint 指向插值
+  - [x] 所有 `str_*` 从 8 个静态轮转槽改成 arena：**解除 8 槽限制**
+  - [x] 去掉 4095 字节截断：**解除长度上限**
+  - [x] 新函数：`str_slice` `str_index_of` `str_repeat` `int_to_str` `float_to_str` `str_arena_reset`
+  - [x] 非 `say` 位置的插值现在真拼（以前 `s := "a{x}"` 静默得到 `"a"`）
+  - [x] 内置函数表收敛到 `src/builtins.rs`（原来 checker/codegen/say 各抄一份，漏一处就生成不存在的 C 调用）
+  - [x] 修 `say("{str_contains(..)}")` 的 varargs UB（bool 用 `%lld` 读 8 字节）
+  - [x] 测试：`tests_string.lume` 14 组 + `fail/str_concat_mismatch` + `fail/internal_builtin`
+
+  **arena 已知限制**（下一步要解决）：
+  - 内存只增不减，只有 `str_arena_reset()` 整体回收 —— 循环里反复拼接会持续占用
+  - 没有 `mark` / `release` 的嵌套作用域，只能整体 reset
+  - `reset` 之后所有 `str` 变悬垂指针，**编译期无检查**
+  - 解法是语言级的 `scope` / `frame` 块，属 v0.4+ 设计任务
+
 - [x] **整数除零检查**
   - [x] 编译期常量 0 报错（checker `Expr::Binary` 字面量 `Int(0)` 直接 error_hint）
   - [x] 运行时变量 0 检查（`lume_checked_div_i64` / `lume_checked_mod_i64`，fprintf + abort）
@@ -331,7 +349,32 @@
 - [ ] **官网 / 文档站**
 - [ ] **包仓库**
 - [ ] **C 库绑定**（`extern` 真正实现 + raylib / SDL2）
-- [ ] **自举（用 Lume 写 Lume）**（长期目标）
+
+### 自举（用 Lume 写 Lume）—— 按依赖顺序
+
+目标：`lume.lume` 能编译自己。这些缺口**互相咬**，顺序不能乱。
+
+| # | 缺口 | 状态 |
+|---|---|---|
+| 1 | 字符串拼接 + arena 派生 | ✅ 已完成（2026-10-25） |
+| 2 | 字符串生命周期管理（`scope` 块） | ✅ 已完成（2026-10-25） |
+| 3 | 文件读写（`fopen` / `fread` 在 runtime 里出现 **0 次**） | ⬜ |
+| 4 | 命令行参数 + `exit` | ⬜ |
+| 5 | 动态数组 `Vec`（token 流长度不可预知） | ⬜ |
+| 6 | 枚举（`TokenKind` 几十种，现在只能用 int 常量硬凑） | ⬜ |
+| 7 | map / 集合（符号表要哈希表） | ⬜ |
+| 8 | `extern` FFI（真正去调 clang） | ⬜ |
+
+**为什么第 2 条排在 IO 前面**：字符串现在没有所有权语义，
+`read_file` 返回的指针可能在后续 `str_trim` 之后失效。先做 IO 必然返工。
+
+`scope` 的落地形态（2026-10-25）：记 arena 水位 → 出块回退。
+`break` / `continue` 自动补回收，`return` 故意不回收（返回值可能就是块内
+派生的字符串），`par for` 里禁止使用（多 worker 共享 arena）。
+验收入口：`tests_scope.lume`（17 项，含 `str_arena_bytes()` 的字节数断言）。
+
+**第 5~8 条的顺序有弹性**，但都必须在「写第一行编译器代码」之前就位 ——
+否则写一半发现 token 存不下，得回头重构整个前端。
 
 ---
 

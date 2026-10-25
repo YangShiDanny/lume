@@ -175,6 +175,14 @@ impl Codegen {
 
         // 上界统一按排他处理：0..N 和 0..=N 都化成 [start, stop)，
         // 这样切块不会在边界上重复执行元素。
+        // worker 里 `let` 声明的名字要临时登记进 var_types（类型推断要用）。
+        // 必须在下面的 body_has_unsafe_call **之前**登记好：它靠 is_str_expr
+        // 判断循环体里有没有 strcmp / lume_str_concat，看不到类型就会误发
+        // vectorize(enable)，clang 只能回一条「loop not vectorized」。
+        // 生成结束统一清掉，不污染外层函数。
+        let vars_before: Vec<String> = self.var_types.keys().cloned().collect();
+        self.predeclare_par_lets(body);
+
         // start/end 必须先拷成 const 局部变量再进循环条件：
         // _p 是指向堆上 args 的指针，clang 无法证明循环体内没有别的线程
         // 或代码改写 *_p，于是不敢把 `i < _p->end` 提出去，向量化直接报废。
@@ -218,6 +226,15 @@ impl Codegen {
 
         for stmt in &body.stmts {
             self.gen_par_body_stmt(stmt, &used_arrays, &reductions);
+        }
+
+        // 清掉 worker 内部 let 登记进 var_types 的名字。
+        // worker 是提到文件顶层的独立函数，它的局部变量不该被外层函数看见；
+        // 留着会让同名变量在别处被推断成 worker 里的类型。
+        for k in self.var_types.keys().cloned().collect::<Vec<_>>() {
+            if !vars_before.contains(&k) {
+                self.var_types.remove(&k);
+            }
         }
 
         for (a, old) in saved_lens {
@@ -536,6 +553,45 @@ impl Codegen {
 
     // ── 循环体生成 ──
 
+    /// 预扫描 worker 体里的 `let`，把「名字 → C 类型」登记进 var_types。
+    ///
+    /// 平时 var_types 是边生成边登记的，但 gen_par_for_range 要在生成
+    /// **之前**判断「循环体里有没有不可向量化的东西」，那个判断走
+    /// is_str_expr → infer_type → var_types。所以先扫一遍。
+    fn predeclare_par_lets(&mut self, body: &Block) {
+        for s in &body.stmts {
+            self.predeclare_par_let_stmt(s);
+        }
+    }
+
+    fn predeclare_par_let_stmt(&mut self, s: &Stmt) {
+        match s {
+            Stmt::Let { name, ty, init } => {
+                let c_ty = match ty {
+                    Some(t) => self.gen_type(t),
+                    None => self.infer_type(init),
+                };
+                self.var_types.insert(name.clone(), c_ty);
+            }
+            Stmt::If { then, els, .. } => {
+                self.predeclare_par_lets(then);
+                if let Some(e) = els {
+                    self.predeclare_par_let_stmt(e);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::ParFor { body, .. } => {
+                self.predeclare_par_lets(body);
+            }
+            Stmt::Expr(Expr::If(_, t, e)) => {
+                self.predeclare_par_lets(t);
+                if let Some(b) = e {
+                    self.predeclare_par_lets(b);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn gen_par_body_stmt(
         &mut self,
         stmt: &Stmt,
@@ -574,6 +630,11 @@ impl Codegen {
                 };
                 let v = self.gen_par_expr(init, arrays);
                 self.push_line(&format!("{} {} = {};", c_ty, name, v));
+                // 必须登记进 var_types，否则 worker 里后面引用这个变量时
+                // infer_type 查不到、退化成 int64_t —— `tag == "even"`
+                // 于是变成 C 的指针比较（clang 只给个 warning）。
+                // 生成结束由 gen_par_for_range 统一清掉，不污染外层函数。
+                self.var_types.insert(name.clone(), c_ty);
             }
             Stmt::If { cond, then, els } => {
                 let c = self.gen_par_expr(cond, arrays);
@@ -608,6 +669,15 @@ impl Codegen {
                     "#error \"Lume: par for 暂不支持嵌套（worker 里不能再 par for）\""
                 );
             }
+            // scope 靠「记水位 + 之后回退」归还 arena 空间，而 par for 的
+            // 多个 worker 是并发从同一个 arena 切的。worker A 回退水位会把
+            // worker B 刚分配的字符串一起回收 —— 直接踩坏别人的内存。
+            // 这个做不到「局部」，所以只能拒绝。
+            Stmt::Scope { .. } => {
+                self.push_line(
+                    "#error \"Lume: par for 的循环体里不能用 scope（多个 worker 共享 arena，回退水位会回收别人的字符串）\""
+                );
+            }
             _ => self.push_line("/* par body: 暂不支持 */"),
         }
     }
@@ -623,6 +693,28 @@ impl Codegen {
             Expr::Binary(l, op, r) => {
                 let ls = self.gen_par_expr(l, arrays);
                 let rs = self.gen_par_expr(r, arrays);
+                // 字符串拼接近 arena、比较走 strcmp —— 和 gen_expr 共用
+                // 同一份判断（以前这里没有，par for 里的 "v" + int_to_str(i)
+                // 会生成 C 的指针加法，clang 报错才发现）。
+                if let Some(c) = self.gen_str_binop(l, *op, r, &ls, &rs) {
+                    return c;
+                }
+                // 除法/取模：常量除数安全化 + 强度削弱，和 gen_expr 共用
+                // gen_divmod。以前这里是手抄的一份，只做了 % 2^n 的位与，
+                // 常量除数仍然走 lume_checked_*，par for 里白丢一截性能。
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    let lt = self.infer_type(l);
+                    if lt != "double" && lt != "float" {
+                        if let Some(c) = self.gen_divmod(&ls, l, *op, r) {
+                            return c;
+                        }
+                        let fname = match op {
+                            BinOp::Div => "lume_checked_div_i64",
+                            _ => "lume_checked_mod_i64",
+                        };
+                        return format!("{}({}, {})", fname, ls, rs);
+                    }
+                }
                 let op_str = match op {
                     BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
                     BinOp::Div => "/", BinOp::Mod => "%",
@@ -632,39 +724,6 @@ impl Codegen {
                     BinOp::And => "&&", BinOp::Or => "||",
                     BinOp::Pipe => "/* pipe */",
                 };
-                // 非负循环变量的 % 2^n → & (2^n-1)，同 gen_expr。
-                // par worker 的 i 从 _par_lo 开始，起点为 0 时 i 一定 >= 0
-                // （gen_par_for_range 已把它登记进 non_neg_vars）。
-                if let BinOp::Mod = op {
-                    if let Expr::Int(b) = r.as_ref() {
-                        if *b > 0 && (*b as u64).is_power_of_two() {
-                            let is_non_neg = match l.as_ref() {
-                                Expr::Ident(name) => {
-                                    self.non_neg_vars.contains(name)
-                                        || self.var_types.get(name)
-                                            .map(|t| t.starts_with("uint"))
-                                            .unwrap_or(false)
-                                }
-                                _ => false,
-                            };
-                            if is_non_neg {
-                                let mask = (*b as u64) - 1;
-                                return format!("({} & {}LL)", ls, mask as i64);
-                            }
-                        }
-                    }
-                }
-                // 整数除零/溢出检查，同 gen_expr 的 Binary 分支
-                if matches!(op, BinOp::Div | BinOp::Mod) {
-                    let lt = self.infer_type(l);
-                    if lt != "double" && lt != "float" {
-                        let fname = match op {
-                            BinOp::Div => "lume_checked_div_i64",
-                            _ => "lume_checked_mod_i64",
-                        };
-                        return format!("{}({}, {})", fname, ls, rs);
-                    }
-                }
                 format!("({} {} {})", ls, op_str, rs)
             }
             Expr::Index(o, i) => {

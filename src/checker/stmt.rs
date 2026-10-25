@@ -145,9 +145,11 @@ impl Checker {
                 let elem_ty = self.check_iter(iter);
                 self.push_scope();
                 self.define(var.clone(), elem_ty);
+                self.par_depth += 1;
                 for s in &body.stmts {
                     self.check_stmt(s);
                 }
+                self.par_depth -= 1;
                 self.pop_scope();
             }
 
@@ -178,6 +180,20 @@ impl Checker {
                     let _ = self.check_expr(&arm.body);
                     self.pop_scope();
                 }
+            }
+
+            // 变量作用域和普通块一致：块内声明的名字在外面看不到。
+            // 字符串层面的回收由 codegen 插入 arena 水位释放，类型检查不管。
+            Stmt::Scope { body } => {
+                if self.par_depth > 0 {
+                    self.error_hint(
+                        "par for 的循环体里不能用 scope".to_string(),
+                        "par for 的多个 worker 共享同一个 arena，回退水位会把别的 worker \
+                         刚分配的字符串一起回收。要压内存就在 par for 外面套 scope，\
+                         或者改用普通 for",
+                    );
+                }
+                self.check_block(body);
             }
         }
     }

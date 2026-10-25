@@ -78,6 +78,11 @@ pub struct Checker {
     /// 用来在**编译期**发现 `x / NAME` 这种「除数是零常量」的除零 ——
     /// 以前只认裸字面量 `x / 0`，包一层常量名就漏过去了。
     pub(crate) const_ints: HashMap<String, i64>,
+    /// 当前是否在 `par for` 的循环体里（含其中的嵌套块）。
+    /// `scope` 靠回退 arena 水位回收字符串，而 par for 的多个 worker
+    /// 是并发从同一个 arena 切的 —— 一个 worker 回退会把别人刚分配的
+    /// 字符串一起回收，所以这里只用来**拒绝** `scope`。
+    pub(crate) par_depth: usize,
 }
 
 impl Checker {
@@ -92,6 +97,7 @@ impl Checker {
             current_ret: Ty::Void,
             consts: HashMap::new(),
             const_ints: HashMap::new(),
+            par_depth: 0,
         }
     }
 
@@ -179,32 +185,17 @@ impl Checker {
     }
 }
 
+/// 用户在源码里能直接调的名字。内部函数（`__shl` 之类）不在其中。
+/// 真正的表在 `crate::builtins`。
 pub(crate) fn is_builtin(name: &str) -> bool {
-    matches!(name,
-        "str_len" | "str_upper" | "str_lower" | "str_trim"
-        | "str_to_int" | "str_to_float"
-        | "str_contains" | "str_starts_with" | "str_ends_with"
-        | "str_replace" | "str_split"
-        | "int_abs" | "int_min" | "int_max"
-        | "float_sqrt" | "sqrt" | "float_abs"
-        | "float_pow" | "pow"
-        | "float_sin" | "sin" | "float_cos" | "cos"
-        | "float_tan" | "tan"
-        | "float_floor" | "floor" | "float_ceil" | "ceil"
-        | "float_round" | "round"
-    )
+    crate::builtins::is_user_visible(name)
 }
 
+/// 内置函数的返回类型。查不到时返回 `Unknown`（调用处已经用
+/// `is_builtin` 挡过，这里的兜底只为不 panic）。
 pub(crate) fn builtin_return_type(name: &str) -> Ty {
-    match name {
-        "str_len" | "str_to_int" | "int_abs" | "int_min" | "int_max" => Ty::Int,
-        "str_upper" | "str_lower" | "str_trim" | "str_replace" => Ty::Str,
-        "str_to_float" | "float_abs" | "sqrt" | "float_sqrt" | "pow"
-        | "float_pow" | "sin" | "float_sin" | "cos" | "float_cos" | "tan"
-        | "float_tan" | "floor" | "float_floor" | "ceil" | "float_ceil"
-        | "round" | "float_round" => Ty::Float,
-        "str_contains" | "str_starts_with" | "str_ends_with" => Ty::Bool,
-        "str_split" => Ty::Array(Box::new(Ty::Str)),
-        _ => Ty::Unknown,
+    match crate::builtins::lookup(name) {
+        Some(b) => b.ret.ty(),
+        None => Ty::Unknown,
     }
 }

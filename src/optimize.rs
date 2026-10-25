@@ -80,6 +80,7 @@ fn optimize_stmt(s: &mut Stmt, level: Level) {
                 optimize_expr(&mut arm.body, level);
             }
         }
+        Stmt::Scope { body } => optimize_block(body, level),
         _ => {}
     }
 }

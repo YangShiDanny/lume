@@ -5,6 +5,17 @@ use std::collections::HashMap;
 
 use super::expr::single_expr;
 
+/// 字符串可空值的 C 类型名。
+///
+/// 其余元素走 `lume_opt_N` 的惰性编号，字符串是唯一的例外：runtime 里的
+/// `lume_file_read()` 必须**直接**返回它，而 runtime header 出现在生成的
+/// C 最前面，那时编译器还没分配过任何 tag。所以给它一个固定名字，写在
+/// runtime 里，`opt_tag("const char*")` 永远返回这个字符串。
+///
+/// 布局必须和 `gen_opt_typedefs()` 生成的完全一致：
+/// `{ int8_t has; const char* val; }`。
+pub(crate) const OPT_STR_TAG: &str = "LumeOptStr";
+
 /// 可空类型的 C 表示：`typedef struct { int8_t has; <elem> val; } lume_opt_N;`
 /// has=1 表示有值（Some），has=0 表示无值（None）。
 ///
@@ -14,6 +25,13 @@ use super::expr::single_expr;
 impl Codegen {
     /// 元素 C 类型 → 可空 typedef 名（惰性分配，顺序即首次出现顺序）。
     pub(crate) fn opt_tag(&self, elem_c: &str) -> String {
+        // 字符串有固定 tag，见 OPT_STR_TAG 的注释。
+        if elem_c == "const char*" {
+            self.opt_elems
+                .borrow_mut()
+                .insert(OPT_STR_TAG.to_string(), elem_c.to_string());
+            return OPT_STR_TAG.to_string();
+        }
         if let Some(tag) = self.opt_names.borrow().get(elem_c) {
             return tag.clone();
         }
@@ -92,6 +110,9 @@ impl Codegen {
             Expr::Int(_) => "int64_t".to_string(),
             Expr::Float(_) => "double".to_string(),
             Expr::Str(_) => "const char*".to_string(),
+            // 非 say 位置的插值会被拼成一个新字符串（见 gen_fmtstr_parts），
+            // 所以类型是 const char*，不是文本。
+            Expr::FmtStr(_) => "const char*".to_string(),
             Expr::Bool(_) => "bool".to_string(),
             Expr::Rune(_) => "uint32_t".to_string(),
             Expr::Color(_) => "uint32_t".to_string(),
@@ -164,6 +185,7 @@ impl Codegen {
                     return self.opt_tag("int64_t");
                 }
                 self.var_types.get(name).cloned()
+                    .or_else(|| self.self_fields.get(name).cloned())
                     .unwrap_or_else(|| "int64_t".to_string())
             }
             // if 表达式的类型就是 then 分支的类型（两个分支必须一致）

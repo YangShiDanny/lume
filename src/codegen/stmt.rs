@@ -143,11 +143,7 @@ impl Codegen {
                 // while 循环同样吃向量化提示（clang 会自动判断能不能向量化）
                 self.push_vectorize_hint(body);
                 self.push_line(&format!("while ({}) {{", bare_parens(&c)));
-                self.indent += 1;
-                for s in &body.stmts {
-                    self.gen_stmt(s);
-                }
-                self.indent -= 1;
+                self.gen_loop_body(body, None);
                 self.push_line("}");
             }
 
@@ -177,9 +173,16 @@ impl Codegen {
                 None => self.push_line("return;"),
             },
 
-            Stmt::Break => self.push_line("break;"),
-            Stmt::Continue => self.push_line("continue;"),
+            Stmt::Break => {
+                self.release_scope_marks_for_jump();
+                self.push_line("break;");
+            }
+            Stmt::Continue => {
+                self.release_scope_marks_for_jump();
+                self.push_line("continue;");
+            }
             Stmt::Match { value, arms } => self.gen_match(value, arms),
+            Stmt::Scope { body } => self.gen_scope_body(body, None),
         }
     }
 
@@ -303,11 +306,7 @@ impl Codegen {
                 let c = self.gen_expr_with_self(cond, fields);
                 self.push_vectorize_hint(body);
                 self.push_line(&format!("while ({}) {{", bare_parens(&c)));
-                self.indent += 1;
-                for s in &body.stmts {
-                    self.gen_stmt_with_self(s, fields);
-                }
-                self.indent -= 1;
+                self.gen_loop_body(body, Some(fields));
                 self.push_line("}");
             }
 
@@ -336,9 +335,16 @@ impl Codegen {
                 None => self.push_line("return;"),
             },
 
-            Stmt::Break => self.push_line("break;"),
-            Stmt::Continue => self.push_line("continue;"),
+            Stmt::Break => {
+                self.release_scope_marks_for_jump();
+                self.push_line("break;");
+            }
+            Stmt::Continue => {
+                self.release_scope_marks_for_jump();
+                self.push_line("continue;");
+            }
             Stmt::Match { value, arms } => self.gen_match(value, arms),
+            Stmt::Scope { body } => self.gen_scope_body(body, Some(fields)),
         }
     }
 
@@ -353,6 +359,82 @@ impl Codegen {
         self.push_line("#if defined(__clang__)");
         self.push_line("#pragma clang loop vectorize(enable) interleave(enable)");
         self.push_line("#endif");
+    }
+
+    /// 生成一个循环体，同时维护 `loop_depth`。
+    ///
+    /// `break` / `continue` 要靠 `loop_depth` 判断哪些 `scope` 水位是
+    /// 「本层循环里打开的、跳出去就该释放」的，所以凡是会生成循环体的
+    /// 地方都必须走这里，不能直接 `for s in &body.stmts { ... }`。
+    fn gen_loop_body(&mut self, body: &Block, with_self: Option<&[String]>) {
+        self.loop_depth += 1;
+        self.indent += 1;
+        for s in &body.stmts {
+            match with_self {
+                Some(f) => self.gen_stmt_with_self(s, f),
+                None => self.gen_stmt(s),
+            }
+        }
+        self.indent -= 1;
+        self.loop_depth -= 1;
+    }
+
+    /// `scope { ... }`：块尾把块内派生的字符串一次性还给 arena。
+    ///
+    /// 生成：
+    /// ```c
+    /// {
+    ///     LumeArenaMark _lume_sm1 = lume_arena_mark();
+    ///     ... 块体 ...
+    ///     lume_arena_release(_lume_sm1);
+    /// }
+    /// ```
+    /// 外层那对大括号不能省：块体里的 `int64_t x = ...` 需要自己的 C
+    /// 作用域，否则和外层同名变量冲突（Lume 的块作用域是允许重名的）。
+    fn gen_scope_body(&mut self, body: &Block, with_self: Option<&[String]>) {
+        self.scope_counter += 1;
+        let mark = format!("_lume_sm{}", self.scope_counter);
+        self.push_line("{");
+        self.indent += 1;
+        self.push_line(&format!("LumeArenaMark {} = lume_arena_mark();", mark));
+        let depth = self.loop_depth;
+        self.scope_marks.push((mark.clone(), depth));
+        match with_self {
+            Some(f) => {
+                for s in &body.stmts {
+                    self.gen_stmt_with_self(s, f);
+                }
+            }
+            None => {
+                for s in &body.stmts {
+                    self.gen_stmt(s);
+                }
+            }
+        }
+        self.scope_marks.pop();
+        self.push_line(&format!("lume_arena_release({});", mark));
+        self.indent -= 1;
+        self.push_line("}");
+    }
+
+    /// `break` / `continue` 会直接跳过 `scope` 末尾那次释放，这里补上。
+    ///
+    /// 只补「本层循环里打开的」—— 外层 scope 在循环结束后还要继续用，
+    /// 提前释放会让它已派生的字符串悬垂。`return` 故意不补：返回值本身
+    /// 可能就是块内派生的字符串，释放等于返回一个悬垂指针；泄漏一次
+    /// 是安全的，悬垂不是。
+    fn release_scope_marks_for_jump(&mut self) {
+        let depth = self.loop_depth;
+        let names: Vec<String> = self
+            .scope_marks
+            .iter()
+            .rev()
+            .take_while(|(_, d)| *d >= depth)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in names {
+            self.push_line(&format!("lume_arena_release({});", n));
+        }
     }
 
     pub(crate) fn gen_for(&mut self, var: &str, iter: &Expr, body: &Block) {
@@ -376,11 +458,7 @@ impl Codegen {
                 ));
                 self.var_types.insert(var.to_string(), "int64_t".to_string());
 
-                self.indent += 1;
-                for s in &body.stmts {
-                    self.gen_stmt(s);
-                }
-                self.indent -= 1;
+                self.gen_loop_body(body, None);
                 self.push_line("}");
 
                 // 退出循环，恢复原来的非负状态
@@ -446,14 +524,11 @@ impl Codegen {
             }
             _ => self.push_line("/* for: 暂不支持 */"),
         }
-        self.indent += 1;
-        for s in &body.stmts {
-            self.gen_stmt(s);
-        }
-        self.indent -= 1;
+        self.gen_loop_body(body, None);
         self.push_line("}");
     }
-        pub(crate) fn gen_match(
+
+    pub(crate) fn gen_match(
         &mut self,
         value: &Expr,
         arms: &[MatchArm],
@@ -673,6 +748,9 @@ impl Codegen {
                 self.expr_has_unsafe_call(value)
                     || arms.iter().any(|a| self.expr_has_unsafe_call(&a.body))
             }
+            // scope 块只是 arena 水位，本身无害；但块体里的 say / 字符串
+            // 派生同样会让外层循环向量化不了，所以要往里看。
+            Stmt::Scope { body } => self.body_has_unsafe_call(body),
             _ => false,
         }
     }
@@ -683,7 +761,24 @@ impl Codegen {
                 StrPart::Expr(x) => self.expr_has_unsafe_call(x),
                 StrPart::Text(_) => false,
             }),
-            Expr::Binary(l, _, r) => {
+            Expr::Binary(l, op, r) => {
+                // 字符串的 `+` 和六个比较会生成 lume_str_concat / strcmp
+                // 调用。循环里有它们就别再发 vectorize(enable) 了 ——
+                // clang 做不到，只会回一条「loop not vectorized」警告。
+                if matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Gt
+                        | BinOp::Le
+                        | BinOp::Ge
+                ) && self.is_str_expr(l)
+                    && self.is_str_expr(r)
+                {
+                    return true;
+                }
                 self.expr_has_unsafe_call(l) || self.expr_has_unsafe_call(r)
             }
             Expr::Unary(_, x) | Expr::Await(x) | Expr::Try(x) | Expr::Force(x) => {

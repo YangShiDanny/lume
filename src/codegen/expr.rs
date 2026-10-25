@@ -99,14 +99,7 @@ impl Codegen {
             }
             // 带插值的字符串出现在非 say 位置时，退化成纯文本拼接
             Expr::FmtStr(parts) => {
-                let mut s = String::new();
-                for p in parts {
-                    if let StrPart::Text(t) = p {
-                        s.push_str(t);
-                    }
-                }
-                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("\"{}\"", escaped)
+                return self.gen_fmtstr_parts(parts, None);
             }
             Expr::Rune(c) => format!("'{}'", c),
             Expr::Color(c) => format!("0x{:06X}", c),
@@ -166,25 +159,11 @@ impl Codegen {
                         return format!("{}({})", callee_str, arg_strs.join(", "));
                     }
                 };
-                // 字符串是值语义：六个比较运算符都要比内容，不能比指针。
-                // C 里 char* 直接 == 比的是地址，内容相同的两个字符串
-                // 会判成不等，而且是静默错。
-                if matches!(
-                    op,
-                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
-                ) && self.is_str_expr(l)
-                    && self.is_str_expr(r)
-                {
-                    let cmp_op = match op {
-                        BinOp::Eq => "==",
-                        BinOp::Ne => "!=",
-                        BinOp::Lt => "<",
-                        BinOp::Gt => ">",
-                        BinOp::Le => "<=",
-                        BinOp::Ge => ">=",
-                        _ => "==",
-                    };
-                    return format!("(strcmp({}, {}) {} 0)", ls, rs, cmp_op);
+                // 字符串特化：拼接走 arena，六个比较运算符比内容。
+                // C 里 char* 的 `+` 是指针算术、`==` 比的是地址，
+                // 两条都是静默错，必须在这里拦下来。
+                if let Some(c) = self.gen_str_binop(l, *op, r, &ls, &rs) {
+                    return c;
                 }
                 // 整数除法/取模：除零和 INT64_MIN / -1 在 C 里是 UB。
                 // 包一层运行时检查（double 是 IEEE，inf 有定义，不包）。
@@ -412,6 +391,106 @@ impl Codegen {
     /// 表达式是不是字符串。用来把 `==` 从指针比较改成内容比较。
     pub(crate) fn is_str_expr(&self, e: &Expr) -> bool {
         self.infer_type(e) == "const char*"
+    }
+
+    /// 二元运算的字符串特化。`Some(..)` 表示已经处理完，`None` 交回调用方。
+    ///
+    /// 有三处独立的二元运算生成器（`gen_expr` / `gen_expr_with_self` /
+    /// `parallel.rs::gen_par_expr`），曾经各写一份字符串判断。结果就是
+    /// `par for` 里的 `"v" + int_to_str(i)` 生成 `"v" + lume_int_str(i)` ——
+    /// C 的指针加法，clang 报错才发现。收敛成一份。
+    ///
+    /// `ls` / `rs` 是调用方已经生成好的操作数 C 代码。
+    pub(crate) fn gen_str_binop(
+        &self,
+        l: &Expr,
+        op: BinOp,
+        r: &Expr,
+        ls: &str,
+        rs: &str,
+    ) -> Option<String> {
+        if !(self.is_str_expr(l) && self.is_str_expr(r)) {
+            return None;
+        }
+        match op {
+            // 拼接。绝不能落到 C 的 `+`：那是指针算术，"ab" + "cd"
+            // 得到一个偏移后的地址，读出来是垃圾，而且静默不报错。
+            BinOp::Add => Some(format!("lume_str_concat({}, {})", ls, rs)),
+            // 比较必须比内容，C 里 char* 的 `==` 比的是地址。
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                let cmp = match op {
+                    BinOp::Eq => "==",
+                    BinOp::Ne => "!=",
+                    BinOp::Lt => "<",
+                    BinOp::Gt => ">",
+                    BinOp::Le => "<=",
+                    BinOp::Ge => ">=",
+                    _ => unreachable!(),
+                };
+                Some(format!("(strcmp({}, {}) {} 0)", ls, rs, cmp))
+            }
+            _ => None,
+        }
+    }
+
+    /// 非 `say` 位置的插值：`"a{x}b"` 拼成一个新字符串。
+    ///
+    /// `say` 里的插值走 `gen_output_with`，直接摊成 printf 格式串，
+    /// 零分配。只有「插值结果要当字符串用」（赋值、传参、再拼接）时才
+    /// 走这里，代价是每次求值分配一块 arena。
+    ///
+    /// 以前这里只把 Text 部分拼起来，插值表达式被静默丢掉 ——
+    /// `s := "a{x}"` 得到的是 `"a"`，而且不报错。现在有了
+    /// `lume_str_concat` / `lume_int_str` / `lume_float_str`，能真拼。
+    pub(crate) fn gen_fmtstr_parts(
+        &mut self,
+        parts: &[StrPart],
+        fields: Option<&[String]>,
+    ) -> String {
+        let mut pieces: Vec<String> = Vec::new();
+        for p in parts {
+            match p {
+                StrPart::Text(t) => {
+                    if !t.is_empty() {
+                        pieces.push(c_str_lit(t));
+                    }
+                }
+                StrPart::Expr(e) => {
+                    // None 的 C 表示是 {has,val} 结构体，套 int_str 会输出 0，
+                    // 这里直接给字面量 "None"。
+                    if matches!(e, Expr::Nothing) {
+                        pieces.push(c_str_lit("None"));
+                        continue;
+                    }
+                    let code = match fields {
+                        Some(f) => self.gen_expr_with_self(e, f),
+                        None => self.gen_expr(e),
+                    };
+                    let ty = self.infer_type(e);
+                    pieces.push(match ty.as_str() {
+                        "const char*" | "char*" => code,
+                        "double" | "float" => {
+                            format!("lume_float_str((double)({}))", code)
+                        }
+                        "bool" => format!("(({}) ? \"true\" : \"false\")", code),
+                        // rune（uint32_t）和整数都按十进制走。
+                        // 想把 rune 输出成字符本身，用 say 的插值（%c）。
+                        _ => format!("lume_int_str((int64_t)({}))", code),
+                    });
+                }
+            }
+        }
+        match pieces.len() {
+            0 => "\"\"".to_string(),
+            1 => pieces.pop().unwrap(),
+            _ => {
+                let mut acc = pieces.remove(0);
+                for p in pieces {
+                    acc = format!("lume_str_concat({}, {})", acc, p);
+                }
+                acc
+            }
+        }
     }
 
     /// `let s = a[i..j]`：切片要产出两个值（指针 + 长度），
@@ -1084,19 +1163,20 @@ impl Codegen {
             // _self 是 Point*，解引用成 Point 才和 `fn f(p: Point)` 对得上。
             // 注意 self.x / 裸字段名走的是别的分支，不受这里影响。
             Expr::Ident(name) if name == "self" => "(*_self)".to_string(),
-            Expr::Ident(name) if fields.contains(name) => {
+            // 裸字段名 → `_self->字段`。但**本地声明优先**：方法体里
+            // `w := ...` 之后再用 `w`，指的必须是那个局部变量，不能
+            // 还在读字段（以前这里无条件映射成字段，同名局部变量被
+            // 静默忽略，`w := 5; return w / 2` 生成 `_self->w / 2`）。
+            // 判定和 infer_type 保持一致：先查 var_types 再查 self_fields，
+            // 所以 `w := w + 1` 里的 w（声明前）仍然读字段。
+            Expr::Ident(name)
+                if fields.contains(name) && !self.var_types.contains_key(name) =>
+            {
                 format!("_self->{}", name)
             }
             // 带插值的字符串出现在非 say 位置时，退化成纯文本拼接
             Expr::FmtStr(parts) => {
-                let mut s = String::new();
-                for p in parts {
-                    if let StrPart::Text(t) = p {
-                        s.push_str(t);
-                    }
-                }
-                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("\"{}\"", escaped)
+                return self.gen_fmtstr_parts(parts, Some(fields));
             }
 
             Expr::Call(callee, args) => {
@@ -1231,23 +1311,9 @@ impl Codegen {
                         return format!("{}({})", callee_str, arg_strs.join(", "));
                     }
                 };
-                // 同上：字符串比较走 strcmp
-                if matches!(
-                    op,
-                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
-                ) && self.is_str_expr(l)
-                    && self.is_str_expr(r)
-                {
-                    let cmp_op = match op {
-                        BinOp::Eq => "==",
-                        BinOp::Ne => "!=",
-                        BinOp::Lt => "<",
-                        BinOp::Gt => ">",
-                        BinOp::Le => "<=",
-                        BinOp::Ge => ">=",
-                        _ => "==",
-                    };
-                    return format!("(strcmp({}, {}) {} 0)", ls, rs, cmp_op);
+                // 同上：字符串拼接走 arena、比较走 strcmp
+                if let Some(c) = self.gen_str_binop(l, *op, r, &ls, &rs) {
+                    return c;
                 }
                 // 整数除法/取模：除零和 INT64_MIN / -1 在 C 里是 UB。
                 // 包一层运行时检查（double 是 IEEE，inf 有定义，不包）。
@@ -1379,37 +1445,30 @@ fn describe_array(obj: &Expr) -> String {
     }
 }
 
+/// Rust 字符串 → C 字符串字面量（含引号）。
+/// 和 `say.rs` 里的 `escape_fmt` 不同：那个进的是 printf 格式串，
+/// 所以要把 `%` 转成 `%%`；这里进的是普通 C 字面量，`%` 原样保留。
+fn c_str_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn builtin_map(name: &str) -> Option<&'static str> {
-    Some(match name {
-        // str
-        "str_len" => "lume_str_len",
-        "str_upper" => "lume_str_upper",
-        "str_lower" => "lume_str_lower",
-        "str_trim" => "lume_str_trim",
-        "str_to_int" => "lume_str_to_int",
-        "str_to_float" => "lume_str_to_float",
-        "str_contains" => "lume_str_contains",
-        "str_starts_with" => "lume_str_starts_with",
-        "str_ends_with" => "lume_str_ends_with",
-        "str_replace" => "lume_str_replace",
-        "str_split" => "lume_str_split",
-        // int
-        "int_abs" => "lume_int_abs",
-        "int_min" => "lume_int_min",
-        "int_max" => "lume_int_max",
-        // float
-        "float_sqrt" | "sqrt" => "lume_float_sqrt",
-        "float_abs" => "lume_float_abs",
-        "float_pow" | "pow" => "lume_float_pow",
-        "float_sin" | "sin" => "lume_float_sin",
-        "float_cos" | "cos" => "lume_float_cos",
-        "float_tan" | "tan" => "lume_float_tan",
-        "float_floor" | "floor" => "lume_float_floor",
-        "float_ceil" | "ceil" => "lume_float_ceil",
-        "float_round" | "round" => "lume_float_round",
-        // 内部（optimize 生成，用户写不出来）
-        "__shl" => "lume_shl",
-        "__bitand" => "lume_bitand",
-        _ => return None,
-    })
+    // 表在 crate::builtins，这里只取 C 名。
+    // 以前这张表在这里和 say.rs 各抄了一份，加函数时漏一处就生成
+    // 一个不存在的 C 调用（要到 clang 那步才炸，报错还指不到源文件）。
+    crate::builtins::lookup(name).map(|b| b.c_name)
 }

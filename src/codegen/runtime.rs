@@ -10,6 +10,7 @@ pub const RUNTIME_HEADER: &str = r#"#ifndef LUME_RUNTIME_H
 #include <math.h>
 #include <time.h>
 #include <ctype.h>
+#include <sys/stat.h>   /* file_exists 用 stat：fopen 对目录也会成功 */
 
 static inline void lume_log_flush_thread(void);
 static inline void lume_log_shutdown(void);
@@ -655,6 +656,70 @@ static inline char* lume_str_buf(int64_t n) {
     return (char*)lume_arena_take((size_t)n + 1);
 }
 
+/* ── arena 水位（`scope` 块用） ──
+
+   只记「当前块 + 已用偏移」就够：chunk 是按头插的链表，
+   释放时从表头往后走，走到记下的那块为止，其余 free 掉，
+   再把那块回退到记下的 used。内层 scope 的水位一定在外层之后，
+   所以嵌套释放互不干扰。
+
+   线程安全：par for 的 worker 会并发 take，所以这里也必须加锁。
+   但**语义上**不支持「一个线程释放别的线程分配的内存」，所以
+   `scope` 在 par for 里是编译错误的（见 parallel.rs）。 */
+
+typedef struct {
+    LumeArenaChunk* chunk;
+    size_t used;
+} LumeArenaMark;
+
+static inline LumeArenaMark lume_arena_mark(void) {
+    LumeArenaMark m;
+    LUME_MUTEX_LOCK(lume_arena_mu);
+    m.chunk = lume_arena_cur;
+    m.used = lume_arena_cur ? lume_arena_cur->used : 0;
+    LUME_MUTEX_UNLOCK(lume_arena_mu);
+    return m;
+}
+
+static inline void lume_arena_release(LumeArenaMark m) {
+    LUME_MUTEX_LOCK(lume_arena_mu);
+    if (m.chunk == NULL) {
+        /* 水位是「空 arena」（第一次分配之前）。这时保留最后一块
+           反复使用 —— 否则循环里每轮 scope 都要 malloc/free 1 MiB，
+           scope 反而变成性能坑。 */
+        LumeArenaChunk* c = lume_arena_cur;
+        while (c && c->next) {
+            LumeArenaChunk* nx = c->next;
+            free(c);
+            c = nx;
+        }
+        if (c) c->used = 0;
+        lume_arena_cur = c;
+        LUME_MUTEX_UNLOCK(lume_arena_mu);
+        return;
+    }
+    LumeArenaChunk* c = lume_arena_cur;
+    while (c && c != m.chunk) {
+        LumeArenaChunk* nx = c->next;
+        free(c);
+        c = nx;
+    }
+    if (c) c->used = m.used;
+    lume_arena_cur = c;
+    LUME_MUTEX_UNLOCK(lume_arena_mu);
+}
+
+/* 当前 arena 用了多少字节（各 chunk 的 used 之和）。 */
+static inline int64_t lume_str_arena_bytes(void) {
+    LUME_MUTEX_LOCK(lume_arena_mu);
+    int64_t total = 0;
+    for (LumeArenaChunk* c = lume_arena_cur; c; c = c->next) {
+        total += (int64_t)c->used;
+    }
+    LUME_MUTEX_UNLOCK(lume_arena_mu);
+    return total;
+}
+
 /* ── std.str ── */
 
 static inline int64_t lume_str_len(const char* s) {
@@ -787,6 +852,13 @@ static inline int64_t lume_str_index_of(const char* s, const char* sub) {
 static inline const char* lume_str_repeat(const char* s, int64_t times) {
     size_t n = strlen(s);
     if (times < 0) times = 0;
+    /* 乘法溢出会让分配不足、随后越界写 —— 必须挡住。
+       times 是用户直接给的乘数，是最容易误用的入口。 */
+    if (n != 0 && (size_t)times > (((size_t)-1) / n)) {
+        fflush(stdout);
+        fputs("lume: str_repeat 结果太大\n", stderr);
+        abort();
+    }
     size_t total = n * (size_t)times;
     char* buf = lume_str_buf((int64_t)total);
     for (int64_t i = 0; i < times; i++) memcpy(buf + n * (size_t)i, s, n);
@@ -930,32 +1002,161 @@ static inline double lume_float_round(double x) { return round(x); }
    预处理阶段直接跳过整段，普通程序（不用 i128）的编译不受影响；
    只有用到 i128/u128 且编译器支持（gcc/clang 64 位）时才包含。 */
 #if defined(__SIZEOF_INT128__)
-static char _lume_i128_buf[8][48];
-static int _lume_i128_slot = 0;
-static const char* lume_i128_str(__int128 v) {
-    char* b = _lume_i128_buf[_lume_i128_slot];
-    _lume_i128_slot = (_lume_i128_slot + 1) & 7;
-    if (v == 0) { b[0] = '0'; b[1] = 0; return b; }
+static inline const char* lume_i128_str(__int128 v) {
+    /* 32 位数字 + 符号 + NUL，48 足够 */
+    char tmp[48];
+    int i = 47;
+    tmp[i] = 0;
     int neg = v < 0;
-    /* 用无符号算术取绝对值，避开 INT128_MIN 的符号溢出 UB */
+    /* 无符号取绝对值，避开 128 位最小值的 `-v` 溢出 UB */
     unsigned __int128 u = neg ? ((unsigned __int128)0 - (unsigned __int128)v)
                               : (unsigned __int128)v;
-    int i = 47;
-    while (u > 0) { b[i--] = (char)('0' + (int)(u % 10ULL)); u /= 10ULL; }
-    if (neg) b[i--] = '-';
-    return b + i + 1;
+    if (u == 0) tmp[--i] = '0';
+    while (u > 0) { tmp[--i] = (char)('0' + (int)(u % 10ULL)); u /= 10ULL; }
+    if (neg) tmp[--i] = '-';
+    size_t len = (size_t)(47 - i);
+    char* buf = lume_str_buf((int64_t)len);
+    memcpy(buf, tmp + i, len + 1);
+    return buf;
 }
-static char _lume_u128_buf[8][48];
-static int _lume_u128_slot = 0;
-static const char* lume_u128_str(unsigned __int128 v) {
-    char* b = _lume_u128_buf[_lume_u128_slot];
-    _lume_u128_slot = (_lume_u128_slot + 1) & 7;
-    if (v == 0) { b[0] = '0'; b[1] = 0; return b; }
+static inline const char* lume_u128_str(unsigned __int128 v) {
+    char tmp[48];
     int i = 47;
-    while (v > 0) { b[i--] = (char)('0' + (int)(v % 10ULL)); v /= 10ULL; }
-    return b + i + 1;
+    tmp[i] = 0;
+    if (v == 0) tmp[--i] = '0';
+    while (v > 0) { tmp[--i] = (char)('0' + (int)(v % 10ULL)); v /= 10ULL; }
+    size_t len = (size_t)(47 - i);
+    char* buf = lume_str_buf((int64_t)len);
+    memcpy(buf, tmp + i, len + 1);
+    return buf;
 }
 #endif
+
+/* ── std.os：文件 ──
+
+   自举的第一步：编译器要做的第一件事就是把一个 .lume 源文件整个吃进来。
+
+   读到的内容从 arena 切（和 str_upper / 拼接同类），所以调用方拿到的是
+   一个普通 str，不需要也不能 free —— 生命周期跟 arena 走。
+
+   失败一律返回「假值」，不设 errno 也不靠空串猜：
+   - read_file → None（空文件是合法内容，用 "" 表示失败就再也分不清
+     「读到了空文件」和「打不开」）
+   - 其余 → false
+
+   fseek + ftell 取长度的前提是普通文件。管道和终端不可 seek，会返回
+   None 而不是读出错内容 —— 这是有意的：宁可失败也不要半截数据。 */
+
+typedef struct { int8_t has; const char* val; } LumeOptStr;
+
+static inline LumeOptStr lume_file_read(const char* path) {
+    LumeOptStr r;
+    r.has = 0;
+    r.val = "";
+    FILE* f = fopen(path, "rb");
+    if (!f) return r;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return r; }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); return r; }
+    rewind(f);
+    /* lume_str_buf 内部多留 1 字节给 '\0'；size 可能是 0（空文件） */
+    char* buf = lume_str_buf((int64_t)size);
+    size_t got = size > 0 ? fread(buf, 1, (size_t)size, f) : 0;
+    fclose(f);
+    buf[got] = 0;
+    r.has = 1;
+    r.val = buf;
+    return r;
+}
+
+static inline bool lume_file_write(const char* path, const char* text) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    size_t n = strlen(text);
+    size_t written = n > 0 ? fwrite(text, 1, n, f) : 0;
+    int closed = fclose(f);
+    return written == n && closed == 0;
+}
+
+static inline bool lume_file_append(const char* path, const char* text) {
+    FILE* f = fopen(path, "ab");
+    if (!f) return false;
+    size_t n = strlen(text);
+    size_t written = n > 0 ? fwrite(text, 1, n, f) : 0;
+    int closed = fclose(f);
+    return written == n && closed == 0;
+}
+
+/* 存在性用 stat 而不是 fopen：fopen 对目录也返回非 NULL，
+   会把「目录」误判成「文件」。 */
+static inline bool lume_file_exists(const char* path) {
+#ifdef _WIN32
+    struct _stat st;
+    return _stat(path, &st) == 0;
+#else
+    struct stat st;
+    return stat(path, &st) == 0;
+#endif
+}
+
+static inline bool lume_file_remove(const char* path) {
+    return remove(path) == 0;
+}
+
+/* ── std.os：命令行参数 ──
+
+   main 开头由生成的代码调用 lume_set_args 填进来（见 items.rs）。
+   没有 main 的程序（@precompute 生成的入口）保持 argc=0，
+   arg(i) 一律返回空串。 */
+
+static int64_t lume_argc_ = 0;
+static char** lume_argv_ = NULL;
+
+static inline void lume_set_args(int argc, char** argv) {
+    lume_argc_ = (int64_t)argc;
+    lume_argv_ = argv;
+}
+
+static inline int64_t lume_arg_count(void) {
+    return lume_argc_;
+}
+
+static inline const char* lume_arg(int64_t i) {
+    if (lume_argv_ == NULL || i < 0 || i >= lume_argc_) return "";
+    return lume_argv_[i];
+}
+
+static inline void lume_exit(int64_t code) {
+    /* 日志是异步的：不先把队列排空，最后几行就随 exit 一起丢了 */
+    lume_log_flush();
+    fflush(stdout);
+    fflush(stderr);
+    exit((int)code);
+}
+
+/* ── stderr（eprint / ewrite）──
+
+   走**同步**写，不进异步日志队列：错误信息必须立刻出现（下一行
+   可能就是 abort）。代价是每次调用都刷缓冲，但错误路径不在乎这点开销。
+
+   写之前先 lume_log_flush()：stdout 是异步的，不排空的话同一段程序
+   里 say 的内容会跑到 eprint 后面去，读起来像时序错了。 */
+
+static inline void lume_eprint_literal(const char* text, size_t length) {
+    if (length == 0) return;
+    lume_log_flush();
+    fwrite(text, 1, length, stderr);
+    fflush(stderr);
+}
+
+static inline void lume_eprintf(const char* format, ...) {
+    va_list args;
+    lume_log_flush();
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+    fflush(stderr);
+}
 
 #endif
 "#;

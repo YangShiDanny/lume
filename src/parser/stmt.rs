@@ -54,6 +54,11 @@ impl Parser {
                 Ok(Stmt::Continue)
             }
             TokenKind::Match => self.parse_match_stmt(),
+            TokenKind::Scope => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt::Scope { body })
+            }
             _ => self.parse_simple_stmt(),
         }
     }

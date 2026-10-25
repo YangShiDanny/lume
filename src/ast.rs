@@ -140,6 +140,9 @@ pub enum Stmt {
     Break,
     Continue,
     Match { value: Expr, arms: Vec<MatchArm> },
+    /// `scope { ... }`：块内派生的字符串在块尾一次性还给 arena。
+    /// 变量作用域和普通块一样（块内声明在外面看不到）。
+    Scope { body: Block },
 }
 
 #[derive(Debug, Clone)]

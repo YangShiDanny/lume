@@ -7,11 +7,20 @@ use crate::ast::*;
 
 impl Codegen {
     pub(crate) fn gen_say(&mut self, args: &[Expr]) -> String {
-        self.gen_output_with(args, None, true)
+        self.gen_output_with(args, None, true, false)
     }
 
     pub(crate) fn gen_write(&mut self, args: &[Expr]) -> String {
-        self.gen_output_with(args, None, false)
+        self.gen_output_with(args, None, false, false)
+    }
+
+    /// `eprint` / `ewrite`：同样的格式串逻辑，出口换成 stderr（同步写）。
+    pub(crate) fn gen_eprint(&mut self, args: &[Expr]) -> String {
+        self.gen_output_with(args, None, true, true)
+    }
+
+    pub(crate) fn gen_ewrite(&mut self, args: &[Expr]) -> String {
+        self.gen_output_with(args, None, false, true)
     }
 
     // fields = Some(...) 表示当前在 struct 方法里，裸字段要映射成 _self->field
@@ -20,7 +29,7 @@ impl Codegen {
         args: &[Expr],
         fields: Option<&[String]>,
     ) -> String {
-        self.gen_output_with(args, fields, true)
+        self.gen_output_with(args, fields, true, false)
     }
 
     pub(crate) fn gen_write_with(
@@ -28,7 +37,23 @@ impl Codegen {
         args: &[Expr],
         fields: Option<&[String]>,
     ) -> String {
-        self.gen_output_with(args, fields, false)
+        self.gen_output_with(args, fields, false, false)
+    }
+
+    pub(crate) fn gen_eprint_with(
+        &mut self,
+        args: &[Expr],
+        fields: Option<&[String]>,
+    ) -> String {
+        self.gen_output_with(args, fields, true, true)
+    }
+
+    pub(crate) fn gen_ewrite_with(
+        &mut self,
+        args: &[Expr],
+        fields: Option<&[String]>,
+    ) -> String {
+        self.gen_output_with(args, fields, false, true)
     }
 
     fn gen_output_with(
@@ -36,6 +61,7 @@ impl Codegen {
         args: &[Expr],
         fields: Option<&[String]>,
         newline: bool,
+        to_err: bool,
     ) -> String {
         let mut format_str = String::new();
         let mut format_args: Vec<String> = Vec::new();
@@ -189,43 +215,15 @@ fn escape_c_string(s: &str) -> String {
     out
 }
 
-// ── 内置函数映射 ──
+// ── 内置函数：查 crate::builtins 那张唯一的表 ──
 
 fn builtin_c_name(name: &str) -> Option<&'static str> {
-    Some(match name {
-        // str
-        "str_len" => "lume_str_len",
-        "str_upper" => "lume_str_upper",
-        "str_lower" => "lume_str_lower",
-        "str_trim" => "lume_str_trim",
-        "str_to_int" => "lume_str_to_int",
-        "str_to_float" => "lume_str_to_float",
-        // int
-        "int_abs" => "lume_int_abs",
-        "int_min" => "lume_int_min",
-        "int_max" => "lume_int_max",
-        // float
-        "float_sqrt" | "sqrt" => "lume_float_sqrt",
-        "float_abs" => "lume_float_abs",
-        "float_pow" | "pow" => "lume_float_pow",
-        "float_sin" | "sin" => "lume_float_sin",
-        "float_cos" | "cos" => "lume_float_cos",
-        "float_tan" | "tan" => "lume_float_tan",
-        "float_floor" | "floor" => "lume_float_floor",
-        "float_ceil" | "ceil" => "lume_float_ceil",
-        "float_round" | "round" => "lume_float_round",
-        _ => return None,
-    })
+    crate::builtins::lookup(name).map(|b| b.c_name)
 }
 
 fn builtin_ret_fmt(name: &str) -> &'static str {
-    match name {
-        "str_len" | "str_to_int" | "int_abs" | "int_min" | "int_max" => "%lld",
-        "str_upper" | "str_lower" | "str_trim" => "%s",
-        "str_to_float" | "float_sqrt" | "sqrt" | "float_abs"
-        | "float_pow" | "pow" | "float_sin" | "sin" | "float_cos" | "cos"
-        | "float_tan" | "tan" | "float_floor" | "floor" | "float_ceil" | "ceil"
-        | "float_round" | "round" => "%f",
-        _ => "%lld",
+    match crate::builtins::lookup(name) {
+        Some(b) => b.ret.c_fmt(),
+        None => "%lld",
     }
 }
