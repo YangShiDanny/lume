@@ -9,9 +9,18 @@ on:
 
 jobs:
   # 测试先跑：.lume 套件不过就不该出包。
-  # 以前 CI 只 cargo build，四个测试套件一次都没在这里跑过。
+  # 两个架构各跑一遍 —— 生成的 C 在 aarch64 上也要能被 clang 编过才算数。
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    name: test (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -19,9 +28,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.arch }}
 
       - name: Install clang
-        run: sudo apt-get update && sudo apt-get install -y clang
+        run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
 
       - name: Run .lume test suites
         run: bash scripts/run_tests.sh
@@ -32,23 +43,56 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ── x86_64 ──
           - os: windows-latest
+            arch: x86_64
             artifact: lume-windows
             bin: lume.exe
             target: ""
           - os: ubuntu-latest
+            arch: x86_64
             artifact: lume-linux
             bin: lume
             target: ""
-          - os: macos-latest
-            artifact: lume-macos
-            bin: lume
-            target: ""
           - os: ubuntu-latest
+            arch: x86_64
             artifact: lume-alpine
             bin: lume
             target: x86_64-unknown-linux-musl
+          # macos-latest 本身就是 ARM64 了，要出 Intel 包只能用 -intel 标签
+          # （macos-13 已于 2025-12 退役，x86_64 的 macOS 支持 2027 秋终止）。
+          - os: macos-15-intel
+            arch: x86_64
+            artifact: lume-macos-intel
+            bin: lume
+            target: ""
 
+          # ── arm64 ──
+          # 一律用原生 ARM runner，不交叉编译：省掉 linker / sysroot 那一堆麻烦，
+          # 出来的二进制就是宿主架构的。
+          # 注意：这几个 ARM 标签目前是 public preview，且只对公开仓库开放。
+          - os: windows-11-arm
+            arch: arm64
+            artifact: lume-windows-arm64
+            bin: lume.exe
+            target: ""
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            artifact: lume-linux-arm64
+            bin: lume
+            target: ""
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            artifact: lume-alpine-arm64
+            bin: lume
+            target: aarch64-unknown-linux-musl
+          - os: macos-15
+            arch: arm64
+            artifact: lume-macos-arm64
+            bin: lume
+            target: ""
+
+    name: build (${{ matrix.artifact }})
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -67,14 +111,23 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.artifact }}
 
       - name: Install clang (Linux glibc)
-        if: runner.os == 'Linux' && matrix.target == ''
+        if: runner.os == 'Linux' && !endsWith(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
 
-      - name: Install musl toolchain (Alpine target)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # musl 目标和宿主同架构（x86_64 编 x86_64、arm64 编 arm64），
+      # 所以只装 musl-tools 就够，不用管交叉 sysroot。
+      # 但默认 linker 是系统 gcc，会把 glibc 链进去 —— 必须显式指 musl-gcc 才是真静态。
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          t="$(printf '%s' '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')"
+          echo "CARGO_TARGET_${t}_LINKER=musl-gcc" >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash
@@ -85,11 +138,48 @@ jobs:
             cargo build --release
           fi
 
-      - name: Verify static (Alpine)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+      # 架构跑偏是 arch 分支最容易出的静默事故（比如 macOS 上编出 Rosetta 的 x86_64），
+      # 直接拿 file 对一下，错了就红。Windows 没有 file，靠原生 runner 保证。
+      - name: Verify architecture
+        if: runner.os != 'Windows'
         run: |
-          file target/${{ matrix.target }}/release/lume
-          ldd target/${{ matrix.target }}/release/lume 2>&1 || echo "static"
+          if [ -n "${{ matrix.target }}" ]; then
+            bin_path="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          else
+            bin_path="target/release/${{ matrix.bin }}"
+          fi
+          if ! command -v file > /dev/null 2>&1; then
+            echo "::warning::file(1) not available, skip arch check"
+            exit 0
+          fi
+          info="$(file "$bin_path")"
+          echo "$info"
+          case "${{ matrix.arch }}" in
+            arm64)
+              if ! printf '%s' "$info" | grep -Eqi 'arm64|aarch64'; then
+                echo "::error::expected arm64, got: $info"
+                exit 1
+              fi
+              ;;
+            x86_64)
+              if ! printf '%s' "$info" | grep -Eqi 'x86[-_]64'; then
+                echo "::error::expected x86_64, got: $info"
+                exit 1
+              fi
+              ;;
+          esac
+
+      - name: Verify static (musl)
+        if: endsWith(matrix.target, 'musl')
+        run: |
+          bin_path="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          if ldd "$bin_path" 2>&1 | grep -qi "not a dynamic executable"; then
+            echo "static: yes"
+          else
+            echo "::error::$bin_path is not statically linked"
+            ldd "$bin_path"
+            exit 1
+          fi
 
       # ── 打包 ──
 
@@ -97,13 +187,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $stage = "stage/lume-windows"
+          $stage = "stage/${{ matrix.artifact }}"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item target/release/lume.exe $stage/
+          Copy-Item target/release/${{ matrix.bin }} $stage/
           Copy-Item scripts/install.ps1 $stage/
           if (Test-Path README.md) { Copy-Item README.md $stage/ }
           if (Test-Path LICENSE) { Copy-Item LICENSE $stage/ }
-          Compress-Archive -Path "$stage/*" -DestinationPath "lume-windows.zip" -Force
+          Compress-Archive -Path "$stage/*" -DestinationPath "${{ matrix.artifact }}.zip" -Force
           Write-Host "Package contents:"
           Get-ChildItem $stage | Format-Table Name, Length
 
@@ -136,7 +226,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: lume-windows.zip
+          path: ${{ matrix.artifact }}.zip
 
       - name: Upload artifact (Linux/macOS)
         if: runner.os != 'Windows'
