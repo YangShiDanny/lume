@@ -50,11 +50,13 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/lume-tests.XXXXXX")
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
-# 耗时和并发顺序是唯一该被抹掉的东西：
+# 该被抹掉的只有真正的随机量：
 #   "耗时 64 ns" / "首次 15104 ns" / "elapsed=24402 ns" → <Ns>
 #   worker[640] → worker[*]（并行块顺序不保证，连续相同行由 uniq 收掉）
+#   "// 预计算: libomp 不可用，改用串行填表" 这行取决于编译机有没有 libomp，
+#     不是程序输出，从 golden 里剔除（有 libomp 就不打印这行）。
 normalize() {
-    sed -E 's/[0-9]+ ns/<Ns>/g; s/worker\[[0-9]+\]/worker[*]/g' | uniq
+    sed -E 's/[0-9]+ ns/<Ns>/g; s/worker\[[0-9]+\]/worker[*]/g; /libomp 不可用/d' | uniq
 }
 
 cd "$WORK" || exit 1
