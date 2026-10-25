@@ -1,0 +1,10 @@
+// expect: 只有 extern fn 支持变参
+// `...` 在 Lume 里没有 C 的 ABI 兜底（我们不知道每个实参该提升成什么），
+// 所以只允许出现在 extern 声明上。
+fn sum(nums: [int], ...) -> int {
+    return 0
+}
+
+fn main() {
+    say("{sum([1, 2])}")
+}

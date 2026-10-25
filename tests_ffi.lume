@@ -1,0 +1,76 @@
+// extern fn：直接声明并调用 C 符号（libc / libm / 任何 -l 进来的库）。
+//
+// 宽度约定（必须自己对齐，编译器不做检查）：
+//   C 的 int                        → i32
+//   C 的 long / long long / size_t / 指针 → int
+//   C 的 double                     → f64
+//   C 的 char*                      → str
+//
+// C 侧标识符会变成 `lume_ext_<名字>`，符号名用 `__asm__` 指回真名 ——
+// 所以 `puts` / `printf` 这种和 <stdio.h> 撞名字的函数也能声明，
+// 不会因为 `int` vs `int64_t` 触发 conflicting types。
+
+extern fn strlen(s: str) -> int
+extern fn strcmp(a: str, b: str) -> i32
+extern fn atoi(s: str) -> i32
+extern fn atof(s: str) -> f64
+extern fn labs(x: int) -> int
+extern fn getpid() -> i32
+extern fn printf(fmt: str, ...) -> i32
+
+// @link("m") → clang 加 -lm（默认已经带了，这里验证装饰器本身不炸）
+@link("m")
+extern fn sqrt(x: f64) -> f64
+
+// extern 也能在结构体方法里调
+struct Counter {
+    base: int
+    fn len_of(s: str) -> int {
+        return base + strlen(s)
+    }
+}
+
+fn main() {
+    s := "hello"
+    say("[1] strlen(\"hello\") = {strlen(s)}   期望 5")
+
+    a := "abc"
+    b := "abd"
+    say("[2] strcmp(abc,abd) = {strcmp(a, b)}   期望负数")
+    say("[3] strcmp(abd,abc) = {strcmp(b, a)}   期望正数")
+    say("[4] strcmp(abc,abc) = {strcmp(a, a)}   期望 0")
+
+    num := "-1234"
+    say("[5] atoi(\"-1234\") = {atoi(num)}   期望 -1234")
+
+    f := "2.5"
+    say("[6] atof(\"2.5\") * 2 = {atof(f) * 2.0}   期望 5.0")
+
+    // 64 位：labs 收的 long 就是 Lume 的 int
+    big := -9000000000
+    say("[7] labs(-9000000000) = {labs(big)}   期望 9000000000")
+
+    // 无参 extern
+    say("[8] getpid() > 0 = {getpid() > 0}   期望 1")
+
+    // 返回 f64 的 extern：格式串要按 %f 走
+    say("[9] sqrt(2.0) = {sqrt(2.0)}   期望 1.414214")
+
+    // extern 结果参与普通运算 / 当条件
+    total := strlen(s) + strlen(a) + strlen(b)
+    say("[10] strlen 三个相加 = {total}   期望 11")
+    if strlen(s) > 4 {
+        say("[11] strlen(s) > 4 成立")
+    }
+
+    // 方法里调 extern
+    c := Counter(base: 100)
+    say("[12] Counter(base:100).len_of(\"abc\") = {c.len_of(a)}   期望 103")
+
+    // 变参：`...` 之后多传的实参不检查类型。
+    // 注意 varargs 的提升规则 —— `%lld` 必须配 int64_t，字面量会退化成 int。
+    x := 42
+    flush()
+    n := printf("printf 变参: %s / %lld\n", "ok", x)
+    say("[13] printf 返回 > 0 = {n > 0}   期望 1")
+}

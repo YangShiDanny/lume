@@ -770,7 +770,18 @@ impl Checker {
     }
 
     pub(crate) fn check_call_args(&mut self, fname: &str, sig: &FuncSig, args: &[Expr]) {
-        if sig.required == sig.params.len() {
+        if sig.variadic {
+            // 变参：多传的部分是 varargs，个数下界是声明的参数个数
+            if args.len() < sig.params.len() {
+                self.error_hint(
+                    format!(
+                        "变参函数 '{}' 至少要 {} 个参数，但传了 {} 个",
+                        fname, sig.params.len(), args.len()
+                    ),
+                    "`...` 之前声明的参数必须逐个传",
+                );
+            }
+        } else if sig.required == sig.params.len() {
             // 无默认参数：个数必须精确
             if args.len() != sig.params.len() {
                 self.error_hint(

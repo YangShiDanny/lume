@@ -821,7 +821,7 @@ impl Codegen {
                 }
                 self.gen_expr(expr)
             }
-            Expr::Ident(name) => name.clone(),
+            Expr::Ident(name) => self.c_fn_name(name),
             // par worker 里禁止 free：多个 worker 可能拿到同一个 owned 数组
             Expr::Call(c, _) if matches!(c.as_ref(), Expr::Ident(n) if n == "free") => {
                 self.codegen_errors.push(

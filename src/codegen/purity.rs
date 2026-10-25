@@ -31,6 +31,7 @@ impl Codegen {
                 // 必须有返回值；@cache/@precompute 的包装函数读写全局缓存表，不算纯；
                 // 返回数组的函数要 malloc，同样不可能是 const
                 if f.ret.is_some()
+                    && !f.is_extern
                     && !is_array_ty(&f.ret)
                     && !f.decorators.iter()
                         .any(|d| d.name == "cache" || d.name == "precompute")

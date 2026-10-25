@@ -226,7 +226,7 @@ impl Parser {
 
             TokenKind::Fn => {
                 self.expect(&TokenKind::LParen, "期待 (")?;
-                let params = self.parse_params()?;
+                let (params, _variadic) = self.parse_params()?;
                 self.expect(&TokenKind::RParen, "期待 )")?;
                 if self.eat(&TokenKind::Arrow) {
                     let _ = self.parse_type()?;

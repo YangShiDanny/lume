@@ -112,7 +112,8 @@ impl Codegen {
                     let tag = self.opt_tag("int64_t");
                     return format!("({}){{0, 0}}", tag);
                 }
-                name.clone()
+                // extern 函数的 C 标识符带前缀（见 c_fn_name）
+                self.c_fn_name(name)
             }
             Expr::It => "_it".to_string(),
 

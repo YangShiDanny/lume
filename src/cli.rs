@@ -33,12 +33,12 @@ pub fn build(file: &str, opts: &Opts) {
         eprintln!("warning: 文件后缀不是 .lume: {}", file);
     }
     let program = compile_to_program(file);
-    let c_code = compile_to_c(&program, opts);
+    let (c_code, link_libs) = compile_to_c(&program, opts);
     let c_path = output_c_path(file);
     std::fs::write(&c_path, &c_code).expect("写 C 文件失败");
 
     let out = output_bin_path(file);
-    compile_c(&c_path, &out, opts);
+    compile_c(&c_path, &out, opts, &link_libs);
     println!("// 编译成功: {}", out.display());
 }
 
@@ -423,7 +423,7 @@ pub fn compile_to_program(file: &str) -> crate::ast::Program {
 }
 
 
-pub fn compile_to_c(program: &crate::ast::Program, opts: &Opts) -> String {
+pub fn compile_to_c(program: &crate::ast::Program, opts: &Opts) -> (String, Vec<String>) {
     let mut precomputed: HashMap<String, Vec<i64>> = HashMap::new();
 
     for item in &program.items {
@@ -458,10 +458,12 @@ pub fn compile_to_c(program: &crate::ast::Program, opts: &Opts) -> String {
         }
         std::process::exit(1);
     }
-    c_code
+    // @link("m") → clang 的 -lm（见 Codegen::link_libs）
+    let links = codegen.link_libs.clone();
+    (c_code, links)
 }
 
-fn compile_c(src: &Path, out: &Path, opts: &Opts) {
+fn compile_c(src: &Path, out: &Path, opts: &Opts, link_libs: &[String]) {
     let mut cmd = Command::new("clang");
     cmd.arg(src).arg("-o").arg(out);
     // 默认 -O3：比 -O2 更激进地展开和向量化，数值循环收益明显
@@ -481,6 +483,12 @@ fn compile_c(src: &Path, out: &Path, opts: &Opts) {
     {
         cmd.arg("-lm");
         cmd.arg("-lpthread");
+    }
+
+    // extern fn 上 @link("x") 声明的额外库。放最后 —— 链接器按顺序解析，
+    // 库必须在引用它的目标文件之后。
+    for lib in link_libs {
+        cmd.arg(format!("-l{}", lib));
     }
 
     // 数学函数不再写 errno。这样 sqrt/pow 之类才是真正的纯函数，

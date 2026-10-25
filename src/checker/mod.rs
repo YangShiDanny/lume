@@ -62,6 +62,9 @@ pub struct FuncSig {
     /// 每个参数的默认值表达式。在调用处求值（C 的展开语义），
     /// 所以默认值只能引用调用处可见的名字，不能引用其他参数。
     pub defaults: Vec<Option<Expr>>,
+    /// `extern fn printf(fmt: str, ...)` 的变参标记。多传的实参只求值、
+    /// 不做类型检查（varargs 的 C 语义）。
+    pub variadic: bool,
     pub ret: Ty,
 }
 
@@ -118,8 +121,8 @@ impl Checker {
         for item in &program.items {
             match item {
                 Item::Fn(f) => {
-                    // 泛型函数体跳过（类型未具体化）
-                    if f.generics.is_empty() {
+                    // 泛型函数体跳过（类型未具体化）；extern fn 没有函数体
+                    if f.generics.is_empty() && !f.is_extern {
                         self.check_fn(f, None);
                     }
                 }

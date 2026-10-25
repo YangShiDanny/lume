@@ -50,6 +50,11 @@
 - [x] `if` / `else` / `else if` / `if` 表达式（三元）
 - [x] `while` / `for` / `break` / `continue`
 - [x] 前向声明（互相递归、调用后面定义的函数）
+- [x] 动态数组 `Vec[T]`（句柄 + 元素类型只在编译器侧，见自举第 5 条）
+- [x] 枚举 + `match` 穷尽性检查（自举第 6 条）
+- [x] `scope` 块（arena 水位回退，自举第 2 条）
+- [x] 运算符重载 `op_*`（见下文「运算符重载」）
+- [x] `extern fn` FFI + `@link`（自举第 8 条，可直接调 libc）
 
 ### 性能特性（已有）
 - [x] `@precompute` 编译期查表（有 libomp 并行填表，没有就串行；文件缓存）
@@ -363,7 +368,7 @@
 | 5 | 动态数组 `Vec`（token 流长度不可预知） | ✅ 已完成（2026-10-25） |
 | 6 | 枚举（`TokenKind` 几十种，现在只能用 int 常量硬凑） | ✅ 已完成（2026-10-25） |
 | 7 | map / 集合（符号表要哈希表） | ⬜ |
-| 8 | `extern` FFI（真正去调 clang） | ⬜ |
+| 8 | `extern` FFI（真正去调 clang） | ✅ 已完成（2026-10-25） |
 
 **为什么第 2 条排在 IO 前面**：字符串现在没有所有权语义，
 `read_file` 返回的指针可能在后续 `str_trim` 之后失效。先做 IO 必然返工。
@@ -477,6 +482,35 @@ lexer / parser / checker / codegen 拆成几个库，而这些库互相依赖。
   函数收/返、`Vec[Tag]`、方法体里改字段、循环里 match、`par for` 里读枚举）；
   负向 `fail/enum_match_missing`、`fail/enum_bad_variant`、
   `fail/enum_dup_value`、`fail/enum_bad_method`。
+
+第 8 条的落地形态（2026-10-25）：
+
+- 语法 `extern fn name(params) -> T`，无函数体；参数表末尾可以写 `...` 变参。
+  只支持 `fn`，**不支持 extern 全局变量**。
+- **C 标识符加 `lume_ext_` 前缀，符号名用 `__asm__("原名")` 指回**：
+  ```c
+  extern int32_t lume_ext_strcmp(const char* a, const char* b) __asm__("strcmp");
+  ```
+  直接用原名会和 `<stdio.h>` / `<string.h>` 的声明撞类型
+  （它们的 `int` 对 Lume 的 `int64_t` 是 conflicting types），加前缀后
+  两个标识符互不相识，链接期仍解析到真符号。调用点靠
+  `Codegen::c_fn_name` 换名（`gen_expr` / `par` 的 Ident 分支各一处）。
+- 宽度靠用户对齐：C 的 `int` 写 `i32`，`long`/`size_t`/指针写 `int`。
+  写错不报错 —— 真实返回 `int` 的函数若声明成 `int`，负数会变成零扩展的
+  大正数（返回值只写 eax）。已在 LUME.md 里用表格说明。
+- 数组参数**不补**伴随长度参数（`fn_array_params` 对 extern 全 false）——
+  C 侧签名里没有那个东西。
+- checker 三条新约束：extern 不能有函数体、不能是泛型；`...` 只能用在
+  extern 上。这三条**故意放在 checker 而不是 parser**：解析期报错会让整个
+  文件被判「解析失败」，同目录其它文件全被带着打警告（tests/fail 里加一个
+  坏文件就把 13 个 golden 全改了）。
+- 变参调用只检查 `...` 之前那些参数，多传的只求值。
+- `@link("m")` 装饰器 → clang 额外加 `-lm`（`Codegen::link_libs` →
+  `compile_c` 的参数）。
+- 不做回调：没有函数指针类型，`qsort` / `signal` / `atexit` 接不进来。
+- 验收：`tests_ffi.lume`（13 项：strlen/strcmp/atoi/atof/labs/getpid/
+  sqrt(@link)/printf 变参/方法里调 extern/结果参与运算与条件）；
+  负向 `fail/extern_body`、`fail/extern_variadic_plain`、`fail/extern_few_args`。
 
 ### 库机制（2026-10-25，为「自己写库」铺路）
 

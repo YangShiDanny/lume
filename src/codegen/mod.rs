@@ -145,6 +145,12 @@ pub struct Codegen {
     /// 当前嵌套的循环层数。0 = 不在任何循环体里。
     pub(crate) loop_depth: usize,
     pub(crate) scope_counter: usize,
+    /// `extern fn` 声明的函数名。这些函数在 C 侧不存在同名定义，调用点要
+    /// 换成 `lume_ext_<name>`（见 gen_extern_decl / c_fn_name）。
+    pub(crate) extern_fns: HashSet<String>,
+    /// 从 `@link("m")` 收集来的库名，最终变成 clang 的 `-l<name>`。
+    /// 去重后按出现顺序，保证命令行稳定。
+    pub(crate) link_libs: Vec<String>,
 }
 
 impl Codegen {
@@ -203,6 +209,21 @@ impl Codegen {
             opt_names: RefCell::new(HashMap::new()),
             opt_elems: RefCell::new(HashMap::new()),
             match_val_member: None,
+            extern_fns: HashSet::new(),
+            link_libs: Vec::new(),
+        }
+    }
+
+    /// extern 函数在 C 侧的名字。
+    ///
+    /// 不能直接用原名声明：`<stdio.h>` 里已经有 `int puts(const char*)`，
+    /// 我们发的是 `int64_t puts(const char*)`，这是 conflicting types。
+    /// 所以标识符加前缀，符号名用 `__asm__("puts")` 指回去 —— 两全。
+    pub(crate) fn c_fn_name(&self, name: &str) -> String {
+        if self.extern_fns.contains(name) && !self.var_types.contains_key(name) {
+            format!("lume_ext_{}", name)
+        } else {
+            name.to_string()
         }
     }
 
@@ -225,6 +246,40 @@ impl Codegen {
         // 惰性分配，所以真正要发哪些 typedef 只有跑完才知道 —— 和
         // par_workers 一样，最后再 insert 回这个位置。
         let opt_pos = self.output.len();
+
+        // 0.8 extern 声明：函数名集合 + 链接库。
+        //     必须早于任何函数体的生成 —— 调用点要靠 c_fn_name 决定
+        //     C 侧的标识符。
+        for item in &program.items {
+            if let Item::Fn(f) = item {
+                if !f.is_extern {
+                    if f.decorators.iter().any(|d| d.name == "link") {
+                        self.codegen_errors.push(format!(
+                            "@link 只对 extern fn 有意义（写在 '{}' 上会被忽略）",
+                            f.name
+                        ));
+                    }
+                    continue;
+                }
+                self.extern_fns.insert(f.name.clone());
+                for d in &f.decorators {
+                    if d.name != "link" {
+                        continue;
+                    }
+                    match d.args.first() {
+                        Some(Expr::Str(lib)) => {
+                            if !lib.is_empty() && !self.link_libs.contains(lib) {
+                                self.link_libs.push(lib.clone());
+                            }
+                        }
+                        _ => self.codegen_errors.push(format!(
+                            "@link 需要 1 个字符串参数：@link(\"m\")（在 {} 上）",
+                            f.name
+                        )),
+                    }
+                }
+            }
+        }
 
         // 0.9 枚举：类型名 → 变体表。必须早于 struct 收集 ——
         //     结构体字段的类型可以直接写枚举名，而 gen_type 只把名字原样
@@ -308,9 +363,14 @@ impl Codegen {
                         })
                         .collect(),
                 );
+                // extern 函数是别人的 C 符号，签名里没有我们的伴随长度参数
                 self.fn_array_params.insert(
                     f.name.clone(),
-                    f.params.iter().map(|p| is_array_ty(&p.ty)).collect(),
+                    if f.is_extern {
+                        vec![false; f.params.len()]
+                    } else {
+                        f.params.iter().map(|p| is_array_ty(&p.ty)).collect()
+                    },
                 );
                 // 默认参数 + 命名参数的依据。位置调用省略尾部参数时，
                 // gen_call_args 从这里取默认值在调用处展开；命名参数
@@ -323,7 +383,7 @@ impl Codegen {
                     f.name.clone(),
                     f.params.iter().map(|p| p.default.clone()).collect(),
                 );
-                if is_array_ty(&f.ret) {
+                if !f.is_extern && is_array_ty(&f.ret) {
                     self.array_ret_fns.insert(f.name.clone());
                 }
                 // 返回 Vec 的函数：Vec 自带 len，不需要 _ret_len 伴随参数，
@@ -446,6 +506,11 @@ impl Codegen {
                 if !f.generics.is_empty() {
                     continue;
                 }
+                // extern：只发 C 原型（不是 static），没有函数体
+                if f.is_extern {
+                    self.gen_extern_decl(f);
+                    continue;
+                }
                 // cache/precompute 的包装器签名和普通函数不完全一样
                 // （单参数、不带数组伴随参数），要单独发原型。
                 // 以前整个跳过，结果 par worker 里调用 @cache 函数会生成
@@ -500,6 +565,9 @@ impl Codegen {
        // 9. 普通函数（顶层常量已在 3.2 步发完）
         for item in &program.items {
             if let Item::Fn(f) = item {
+                if f.is_extern {
+                    continue;
+                }
                 self.gen_fn(f);
             }
         }

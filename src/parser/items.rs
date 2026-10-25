@@ -12,7 +12,16 @@ impl Parser {
         let is_pub = self.eat(&TokenKind::Pub);
 
         match self.peek() {
-            TokenKind::Fn => self.parse_fn(is_pub, decorators).map(Item::Fn),
+            TokenKind::Fn => self.parse_fn(is_pub, decorators, false).map(Item::Fn),
+            // `extern fn name(...) -> T`：只声明签名，body 为空
+            TokenKind::Extern => {
+                self.advance();
+                self.skip_newlines();
+                if !self.check(&TokenKind::Fn) {
+                    return Err(self.error("extern 后面只能跟 fn（不支持 extern 全局变量）"));
+                }
+                self.parse_fn(is_pub, decorators, true).map(Item::Fn)
+            }
             TokenKind::Struct => {
                 if !decorators.is_empty() {
                     return Err(self.error("struct 暂不支持装饰器"));
@@ -119,6 +128,7 @@ impl Parser {
         &mut self,
         is_pub: bool,
         decorators: Vec<Decorator>,
+        is_extern: bool,
     ) -> Result<FnDecl, ParseError> {
         self.expect(&TokenKind::Fn, "期待 fn")?;
 
@@ -144,7 +154,7 @@ impl Parser {
         }
 
         self.expect(&TokenKind::LParen, "期待 (")?;
-        let params = self.parse_params()?;
+        let (params, variadic) = self.parse_params()?;
         self.expect(&TokenKind::RParen, "期待 )")?;
 
         let ret = if self.eat(&TokenKind::Arrow) {
@@ -153,7 +163,15 @@ impl Parser {
             None
         };
 
-        let body = self.parse_block()?;
+        // `extern fn f(...)` 没有函数体。这两条约束（extern 不能有体、
+        // `...` 只能用在 extern 上）放到 checker 里查 —— 放在这里报的话，
+        // 整个文件直接「解析失败」，连项目扫描都进不去，一个写坏的文件
+        // 会把同目录其它文件的编译一起打上警告。
+        let body = if is_extern && !self.check(&TokenKind::LBrace) {
+            Block { stmts: Vec::new() }
+        } else {
+            self.parse_block()?
+        };
 
         Ok(FnDecl {
             name,
@@ -161,20 +179,35 @@ impl Parser {
             params,
             ret,
             body,
+            is_extern,
+            variadic,
             is_pub,
             decorators,
         })
     }
 
-    pub(crate) fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
+    /// 解析参数列表。返回 `(参数表, 是否变参)`。
+    ///
+    /// `...` 在词法上切成 `DotDot` + `Dot`（`..` 是范围运算符），
+    /// 所以这里要往后看一个 token 才能和 `a: [int]` 里的 `..` 区分开。
+    pub(crate) fn parse_params(&mut self) -> Result<(Vec<Param>, bool), ParseError> {
         let mut params = Vec::new();
+        let mut variadic = false;
         self.skip_newlines();
         if self.check(&TokenKind::RParen) {
-            return Ok(params);
+            return Ok((params, variadic));
         }
 
         loop {
             self.skip_newlines();
+            // `...`：变参标记，必须是最后一个
+            if self.check(&TokenKind::DotDot) && matches!(self.peek_at(1), TokenKind::Dot) {
+                self.advance();
+                self.advance();
+                variadic = true;
+                break;
+            }
+
             let name = match self.advance().clone() {
                 TokenKind::Ident(s) => s,
                 _ => return Err(self.error("期待参数名")),
@@ -200,7 +233,7 @@ impl Parser {
             }
         }
 
-        Ok(params)
+        Ok((params, variadic))
     }
 
     pub(crate) fn parse_struct(&mut self, is_pub: bool) -> Result<StructDecl, ParseError> {
@@ -223,7 +256,7 @@ impl Parser {
             let item_pub = self.eat(&TokenKind::Pub);
 
             if self.check(&TokenKind::Fn) {
-                methods.push(self.parse_fn(item_pub, decorators)?);
+                methods.push(self.parse_fn(item_pub, decorators, false)?);
             } else {
                 if !decorators.is_empty() {
                     return Err(self.error("结构体字段不支持装饰器"));

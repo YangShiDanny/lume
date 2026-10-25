@@ -1,0 +1,10 @@
+// expect: 只声明签名，不能有函数体
+// extern 是「这个符号在 C 那边」，写了函数体就有两份实现 ——
+// 必须在解析期拒绝，不能到 clang 才报 duplicate symbol。
+extern fn strlen(s: str) -> int {
+    return 0
+}
+
+fn main() {
+    say("{strlen(\"abc\")}")
+}

@@ -7,6 +7,29 @@ impl Checker {
         for item in &program.items {
             match item {
                 Item::Fn(f) => {
+                    // extern 的两条约束。放在 checker 而不是 parser：
+                    // 解析期的错误会让整个文件「解析失败」，同目录其它
+                    // 文件被迫带着警告跳过。
+                    if f.is_extern {
+                        if !f.body.stmts.is_empty() {
+                            self.error_hint(
+                                format!("extern fn '{}' 只声明签名，不能有函数体", f.name),
+                                "要写实现就删掉 extern；extern 是「这个符号在 C 那边」",
+                            );
+                        }
+                        if !f.generics.is_empty() {
+                            self.error_hint(
+                                format!("extern fn '{}' 不能是泛型", f.name),
+                                "C 侧没有泛型，每种具体类型都要单独声明一个符号",
+                            );
+                        }
+                    } else if f.variadic {
+                        self.error_hint(
+                            format!("只有 extern fn 支持变参：'{}' 的参数表里有 `...`", f.name),
+                            "Lume 函数不收 varargs（我们不知道每个实参该提升成什么类型）",
+                        );
+                    }
+
                     // @precompute 参数检查
                     if let Some(d) = f.decorators.iter().find(|d| d.name == "precompute") {
                         if f.params.len() != 1 {
@@ -48,6 +71,7 @@ impl Checker {
                         param_names: f.params.iter().map(|p| p.name.clone()).collect(),
                         required: f.params.iter().take_while(|p| p.default.is_none()).count(),
                         defaults: f.params.iter().map(|p| p.default.clone()).collect(),
+                        variadic: f.variadic,
                         ret: self.ty_from_ast(f.ret.as_ref()),
                     };
 
@@ -80,6 +104,7 @@ impl Checker {
                             param_names: m.params.iter().map(|p| p.name.clone()).collect(),
                             required: m.params.iter().take_while(|p| p.default.is_none()).count(),
                             defaults: m.params.iter().map(|p| p.default.clone()).collect(),
+                            variadic: false,
                             ret: self.ty_from_ast(m.ret.as_ref()),
                         };
                         methods.insert(m.name.clone(), sig);

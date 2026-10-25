@@ -43,6 +43,15 @@ pub struct FnDecl {
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Block,
+    /// `extern fn name(...) -> T`：只声明、不生成函数体。
+    ///
+    /// C 侧标识符会加 `lume_ext_` 前缀并用 `__asm__("name")` 指回真正的
+    /// 符号名 —— 直接用原名声明会和 libc 头文件里的声明撞类型
+    /// （`int puts(const char*)` vs `int64_t puts(...)` 是 conflicting types）。
+    pub is_extern: bool,
+    /// `extern fn printf(fmt: str, ...)`：参数表末尾的 `...`。
+    /// 只对 extern 有意义，调用处多传的实参不做类型检查。
+    pub variadic: bool,
     /// 待办：可见性，见文件头说明
     #[allow(dead_code)]
     pub is_pub: bool,

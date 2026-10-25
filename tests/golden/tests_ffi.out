@@ -1,0 +1,15 @@
+// 编译成功: tests_ffi
+[1] strlen("hello") = 5   期望 5
+[2] strcmp(abc,abd) = -1   期望负数
+[3] strcmp(abd,abc) = 1   期望正数
+[4] strcmp(abc,abc) = 0   期望 0
+[5] atoi("-1234") = -1234   期望 -1234
+[6] atof("2.5") * 2 = 5.000000   期望 5.0
+[7] labs(-9000000000) = 9000000000   期望 9000000000
+[8] getpid() > 0 = 1   期望 1
+[9] sqrt(2.0) = 1.414214   期望 1.414214
+[10] strlen 三个相加 = 11   期望 11
+[11] strlen(s) > 4 成立
+[12] Counter(base:100).len_of("abc") = 103   期望 103
+printf 变参: ok / 42
+[13] printf 返回 > 0 = 1   期望 1

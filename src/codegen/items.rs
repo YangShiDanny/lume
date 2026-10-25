@@ -193,6 +193,62 @@ impl Codegen {
         ));
     }
 
+    /// `extern fn` 的 C 原型。
+    ///
+    /// 生成的形态：
+    ///
+    /// ```c
+    /// extern int32_t lume_ext_puts(const char*) __asm__("puts");
+    /// ```
+    ///
+    /// **标识符加前缀 + `__asm__` 指回真名** 是这里唯一可行的手段：
+    /// 直接用 `puts` 当标识符会和 `<stdio.h>` 的 `int puts(const char*)`
+    /// 撞类型（我们写的是 `int32_t`/`int64_t`），clang 直接 conflicting
+    /// types 报错。加前缀后两个声明互不相识，符号名仍是 `puts`，
+    /// 链接期正常解析。
+    ///
+    /// 签名里的宽度要用户自己负责：C 的 `int` 写 `i32`，`long` /
+    /// `long long` / `size_t` / 指针写 `int`。写错不报错，但返回值/实参
+    /// 会被按错误的宽度解释。
+    pub(crate) fn gen_extern_decl(&mut self, f: &FnDecl) {
+        let ret_type = match &f.ret {
+            None => "void".to_string(),
+            Some(t) => self.gen_type(t),
+        };
+        if f.params.iter().any(|p| p.default.is_some()) {
+            self.codegen_errors.push(format!(
+                "extern fn {} 的参数不能有默认值（C 侧没有这种东西）",
+                f.name
+            ));
+        }
+        let mut params: Vec<String> = f
+            .params
+            .iter()
+            // 不能用 gen_params：那会给数组参数补一个伴随长度参数，
+            // 而 C 函数的签名里没有它。
+            .map(|p| {
+                let ty = match &p.ty {
+                    Some(t) => self.gen_type(t),
+                    None => "int64_t".to_string(),
+                };
+                format!("{} {}", ty, p.name)
+            })
+            .collect();
+        if f.params.is_empty() {
+            params.push("void".to_string());
+        }
+        if f.variadic {
+            params.push("...".to_string());
+        }
+        self.push_line(&format!(
+            "extern {} {}({}) __asm__(\"{}\");",
+            ret_type,
+            self.c_fn_name(&f.name),
+            params.join(", "),
+            f.name
+        ));
+    }
+
     pub(crate) fn gen_fn_decl(&mut self, f: &FnDecl) {
         let is_main = f.name == "main";
         let ret_type = match &f.ret {

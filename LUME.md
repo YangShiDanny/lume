@@ -146,8 +146,10 @@ import use pub const extern as and or not true false nothing
 app par async await spawn it
 ```
 
-保留但**未实现**的：`trait` `impl` `use` `extern` `async` `await` `spawn` `app`。  
+保留但**未实现**的：`trait` `impl` `use` `async` `await` `spawn` `app`。  
 （词法/语法能解析，codegen 阶段被丢弃或报错。）
+
+`extern` 只支持 `extern fn`（见「extern：直接调 C」），`extern` 全局变量不支持。
 
 ### 类型关键字
 
@@ -924,6 +926,88 @@ fn dot(a: [float], b: [float], n: int) -> float {
 
 ---
 
+## extern：直接调 C
+
+`extern fn` 只声明签名、不写函数体，编译出来的 C 就是一个原型，
+链接时去 libc / 系统库 / 你 `-l` 进来的库里找符号。
+
+```lume
+extern fn strlen(s: str) -> int
+extern fn strcmp(a: str, b: str) -> i32
+extern fn atof(s: str) -> f64
+extern fn getpid() -> i32
+extern fn printf(fmt: str, ...) -> i32
+
+@link("m")
+extern fn tgamma(x: f64) -> f64
+
+fn main() {
+    s := "hello"
+    say("len = {strlen(s)}   pid > 0 = {getpid() > 0}")
+}
+```
+
+生成：
+
+```c
+extern int64_t lume_ext_strlen(const char* s) __asm__("strlen");
+extern int32_t lume_ext_strcmp(const char* a, const char* b) __asm__("strcmp");
+extern int32_t lume_ext_printf(const char* fmt, ...) __asm__("printf");
+```
+
+### 为什么要 `lume_ext_` 前缀 + `__asm__`
+
+直接用原名声明会和系统头文件撞类型：`<stdio.h>` 里是
+`int puts(const char*)`，Lume 的 `int` 是 `int64_t`，两个声明同作用域
+就是 conflicting types。加前缀后两个标识符互不相识，`__asm__("puts")`
+把符号名指回去，链接期照常解析。所以 `puts` / `printf` / `fopen`
+这些都能安全声明，不用管头文件。
+
+### 宽度必须自己对齐
+
+编译器**不做**任何 ABI 检查，写错就是静默算错：
+
+| C 那边的类型 | Lume 里写 |
+|---|---|
+| `int`、`pid_t`、`unsigned int` | `i32` |
+| `long`、`long long`、`size_t`、`ssize_t`、指针 | `int` |
+| `double` | `f64` |
+| `float` | `f32` |
+| `char*`、`const char*` | `str` |
+| `void*` | 没有对应类型（拿 `int` 顶着，别解引用） |
+
+- 写成 `-> int` 而真实返回 `int` 时，负数会变成大正数（`int` 的返回值
+  只写 eax，高位被清零）——**所以 `int` 一律写 `i32`**。
+- 指针类型没有专门语法。要传 `NULL` 就传 `0`（`int64_t` 的 0 在寄存器
+  里就是全零，和空指针同表示）。
+
+### 变参 `...`
+
+```lume
+extern fn printf(fmt: str, ...) -> i32
+```
+
+- `...` 之前声明的参数仍然**必须逐个传**，并且做类型检查；`...` 之后
+  多传的只求值、不检查。
+- varargs 的提升规则是 C 的：`float` → `double`，小于 `int` 的整数 → `int`。
+  所以 `%lld` 必须配一个 `int` 变量，直接传字面量 `42` 会退化成 C 的
+  `int`，`%lld` 读 64 位就是垃圾。要传就 `x := 42` 再 `printf("%lld", x)`。
+
+### `@link("名字")`
+
+给 clang 加 `-l<名字>`（`@link("m")` → `-lm`）。写在任意一个 `extern fn`
+上即可，整份程序共享，重复的自动去重。`-lm` / `-lpthread` 默认已经带了。
+
+### 已知限制
+
+- 不能声明 extern **全局变量**（只支持 `fn`）。
+- 不能取 C 函数指针（没有函数指针类型），所以 `qsort` / `signal` /
+  `atexit` 这类要回调的接不进来。
+- 不能把 Lume 函数导出去给 C 调（`main` 除外）。
+- Windows 上 `__asm__` 标签是 GCC/Clang 扩展，MSVC 不认；本项目只用 clang。
+
+---
+
 ## 并行
 
 ```lume
@@ -1140,6 +1224,8 @@ fn main() {
 | `let x := None` | 推断成 `int?`；要别的类型得写 `let x: str? = None` |
 | 变量名叫 `it` / `u8` / `scope` 之类 | 它们是关键字/类型关键字，报的是「期待表达式」，不好联想 |
 | 拿 `write_file` 当流式写 | 每次调用都是一次完整的 open/write/close，内容全在内存里 |
+| `extern fn` 里 `int` / `i32` 写混 | 编译器不查 ABI：`int` 返回 `int` 会被读成零扩展的大正数 |
+| 想 `extern` 一个回调 / 函数指针 | 没有函数指针类型，`qsort` / `signal` 接不进来 |
 
 ---
 
