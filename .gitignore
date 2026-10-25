@@ -35,6 +35,9 @@ Thumbs.db
 # 本地工作区（memory + scratch 临时文件）
 .workbuddy/
 
+# 本机删除操作的回收站（这个分区的 rm 会把文件挪到 .Trash-0）
+.Trash-0/
+
 # 只在本地留着的笔记/素材
 Lume vs Fortran.md
 未来优化方向.md

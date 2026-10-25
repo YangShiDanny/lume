@@ -79,24 +79,210 @@ fn output_bin_path(file: &str) -> PathBuf {
     return PathBuf::from(stem);
 }
 
-pub fn compile_to_program(file: &str) -> crate::ast::Program {
-    let src = std::fs::read_to_string(file)
-        .unwrap_or_else(|e| {
-            eprintln!("error: 读文件失败 {}: {}", file, e);
-            std::process::exit(1);
-        });
+// ─────────────────────────────────────────────────────────────
+// 多文件项目（模块系统）
+//
+// 设计：**文件名即模块名，零 import**。编译器自动把入口文件所在目录
+// （含子目录）里的所有 .lume 当成同一个项目的模块合并。
+//
+// 三条边界规则，都是为了「别把别人的程序捡进来」：
+//   1. 带 `fn main` 的文件是**可执行入口**，不参与别人的合并。
+//      所以你把 tests_pipe.lume 和 main.lume 放同一目录也不会打架。
+//   2. 子目录里只要有自己的入口文件，就算独立项目，整个子目录跳过。
+//      所以 tests/multi/ 不会被仓库根目录的构建吞掉。
+//   3. 隐藏目录（.git / .workbuddy）、target、node_modules 一律不扫。
+//
+// 合并顺序按路径排序，保证同一份源码每次生成的 C 完全一致。
+// ─────────────────────────────────────────────────────────────
 
-    let mut lexer = Lexer::new(&src);
-    let tokens = lexer.tokenize().unwrap_or_else(|e| {
-        eprintln!("lex error: {}", e);
-        std::process::exit(1);
-    });
+const SKIP_DIRS: &[&str] = &["target", "node_modules"];
 
+fn skip_dir(name: &str) -> bool {
+    name.starts_with('.') || SKIP_DIRS.contains(&name)
+}
+
+fn collect_lume_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if p.is_dir() {
+            if !skip_dir(&name) {
+                collect_lume_files(&p, out);
+            }
+        } else if name.ends_with(".lume") {
+            out.push(p);
+        }
+    }
+}
+
+fn parse_source(path: &Path, src: &str) -> Result<Vec<Item>, String> {
+    let mut lexer = Lexer::new(src);
+    let tokens = lexer
+        .tokenize()
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
     let mut parser = Parser::new(tokens);
-    let program = parser.parse_program().unwrap_or_else(|e| {
-        eprintln!("parse error: {}", e);
+    let program = parser
+        .parse_program()
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
+    Ok(program.items)
+}
+
+fn has_main(items: &[Item]) -> bool {
+    items
+        .iter()
+        .any(|i| matches!(i, Item::Fn(f) if f.name == "main"))
+}
+
+/// 顶层名字的种类，只用于重复定义的报错措辞。
+#[derive(Clone, Copy, PartialEq)]
+enum SymKind {
+    Fn,
+    Struct,
+    Const,
+}
+
+impl SymKind {
+    fn label(self) -> &'static str {
+        match self {
+            SymKind::Fn => "函数",
+            SymKind::Struct => "结构体",
+            SymKind::Const => "常量",
+        }
+    }
+}
+
+pub fn compile_to_program(file: &str) -> crate::ast::Program {
+    let entry = PathBuf::from(file);
+    let entry_abs = std::fs::canonicalize(&entry).unwrap_or_else(|e| {
+        eprintln!("error: 读文件失败 {}: {}", file, e);
         std::process::exit(1);
     });
+
+    // 入口文件必须自己解析成功 —— 它的报错不容忍
+    let entry_src = std::fs::read_to_string(&entry).unwrap_or_else(|e| {
+        eprintln!("error: 读文件失败 {}: {}", file, e);
+        std::process::exit(1);
+    });
+    let entry_items = parse_source(&entry, &entry_src).unwrap_or_else(|msg| {
+        eprintln!("parse error: {}", msg);
+        std::process::exit(1);
+    });
+    if !has_main(&entry_items) {
+        eprintln!("error: 入口文件 {} 里没有 fn main", entry.display());
+        eprintln!("  help: 入口文件必须定义 fn main（模块文件不需要）");
+        std::process::exit(1);
+    }
+
+    let entry_dir = entry_abs
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // 1. 扫出候选文件（排序保证确定性）
+    let mut cands: Vec<PathBuf> = Vec::new();
+    collect_lume_files(&entry_dir, &mut cands);
+    cands.sort();
+
+    // 2. 逐个解析。非入口文件解析失败只警告并跳过 ——
+    //    自动扫描会把整棵树都看一遍，一个写到一半的文件不该炸掉整个构建。
+    struct Parsed {
+        path: PathBuf,
+        items: Vec<Item>,
+    }
+    let mut parsed: Vec<Parsed> = Vec::new();
+    for p in &cands {
+        let abs = match std::fs::canonicalize(p) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        if abs == entry_abs {
+            continue; // 入口在下面单独处理
+        }
+        let src = match std::fs::read_to_string(&abs) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        match parse_source(&abs, &src) {
+            Ok(items) => parsed.push(Parsed { path: abs, items }),
+            Err(msg) => eprintln!(
+                "warning: 跳过无法解析的文件（不参与本次构建）\n         {}",
+                msg
+            ),
+        }
+    }
+
+    // 3. 子目录自带入口 → 独立项目，整个子树退出本次构建
+    let mut project_dirs: Vec<PathBuf> = Vec::new();
+    for f in &parsed {
+        if has_main(&f.items) {
+            if let Some(d) = f.path.parent() {
+                if d != entry_dir.as_path() {
+                    project_dirs.push(d.to_path_buf());
+                }
+            }
+        }
+    }
+
+    let mut modules: Vec<Parsed> = Vec::new();
+    for f in parsed {
+        if has_main(&f.items) {
+            continue; // 别的入口文件不合并
+        }
+        let inside_other_project = f
+            .path
+            .parent()
+            .map(|d| {
+                project_dirs
+                    .iter()
+                    .any(|p| d == p.as_path() || d.starts_with(p))
+            })
+            .unwrap_or(false);
+        if inside_other_project {
+            continue;
+        }
+        modules.push(f);
+    }
+
+    // 4. 合并 + 重复定义检测
+    let mut items: Vec<Item> = Vec::new();
+    let mut seen: HashMap<String, (SymKind, PathBuf)> = HashMap::new();
+
+    for (path, its) in std::iter::once((entry_abs.clone(), entry_items))
+        .chain(modules.into_iter().map(|m| (m.path, m.items)))
+    {
+        for item in its {
+            let (kind, name) = match &item {
+                Item::Fn(f) => (SymKind::Fn, f.name.clone()),
+                Item::Struct(s) => (SymKind::Struct, s.name.clone()),
+                Item::Const(c) => (SymKind::Const, c.name.clone()),
+                _ => {
+                    items.push(item);
+                    continue;
+                }
+            };
+            if let Some((_, first)) = seen.get(&name) {
+                eprintln!(
+                    "error: {} '{}' 重复定义\n         {} 和 {}",
+                    kind.label(),
+                    name,
+                    first.display(),
+                    path.display()
+                );
+                eprintln!(
+                    "  help: 同名顶层符号在整个项目里只能有一份，改个名字或删掉一份"
+                );
+                std::process::exit(1);
+            }
+            seen.insert(name, (kind, path.clone()));
+            items.push(item);
+        }
+    }
+
+    let mut program = crate::ast::Program { items };
 
     let mut checker = Checker::new();
     if let Err(errors) = checker.check(&program) {
@@ -109,8 +295,7 @@ pub fn compile_to_program(file: &str) -> crate::ast::Program {
         eprintln!("// 类型检查失败，共 {} 个错误", errors.len());
         std::process::exit(1);
     }
-    
-    let mut program = program;
+
     // 只跑一遍。以前先调 optimize()（无条件 Aggressive）再按 LUME_OPT
     // 跑第二遍，导致 LUME_OPT=safe 实际无效、编译期也多跑一次。
     let opt_level = match std::env::var("LUME_OPT").as_deref() {
@@ -118,9 +303,10 @@ pub fn compile_to_program(file: &str) -> crate::ast::Program {
         _ => crate::optimize::Level::Aggressive,
     };
     crate::optimize::optimize_with(&mut program, opt_level);
-    
+
     program
 }
+
 
 pub fn compile_to_c(program: &crate::ast::Program, opts: &Opts) -> String {
     let mut precomputed: HashMap<String, Vec<i64>> = HashMap::new();

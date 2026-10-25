@@ -1,0 +1,12 @@
+// 模块文件：字符串工具
+// 跨文件调用 std 内置函数（str_upper 在 runtime 里）不受影响。
+fn shout(s: str) -> str {
+    return str_upper(s)
+}
+
+fn longest(a: str, b: str) -> str {
+    if str_len(a) >= str_len(b) {
+        return a
+    }
+    return b
+}

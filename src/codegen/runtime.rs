@@ -571,49 +571,120 @@ static inline int64_t lume_slice_off(
     return start;
 }
 
-/* ── std.str ── */
-/* 字符串函数返回内部缓冲区。用轮转槽位代替单一 static buf，
-   这样 say("{str_upper(a)} {str_upper(b)}") 不会拿到同一个指针。 */
+/* ── 字符串 arena ──
+   Lume 的 str 就是 const char*：零开销，能直接交给 printf / libc。
 
-#define LUME_STR_SLOTS 8
+   难点在「谁负责释放」。Lume 现在没有所有权检查也没有 GC，
+   逐个 free 不可能做对 —— 字符串会被塞进结构体、数组、跨函数
+   传递、当成 map 的键，精确跟踪所有权的成本远超收益。
+
+   所以用 arena：所有派生字符串（拼接、upper、trim、切片……）
+   都从一个只增不还的池子里切，整体在 lume_str_arena_reset() 时
+   一次释放。这不是偷懒，是编译器的标准做法 —— clang 的
+   ASTContext、rustc 的 TypedArena 都是这个模型：token、标识符、
+   AST 里的字符串本来就活到编译结束，逐个回收既慢又容易出错。
+
+   顺带解决两个老限制：
+   - 过去 str_* 的返回值放在 8 个静态槽里轮转，连续调用 9 次
+     就开始互相覆盖（词法器会被咬死）。现在任意多个字符串可以
+     同时存活。
+   - 过去结果上限 4095 字节，超了静默截断。现在只受内存限制。
+
+   性能：一次 take 就是「加一下 used」，比 malloc 快一个量级。 */
+
+#define LUME_ARENA_CHUNK ((size_t)1 << 20)  /* 1 MiB：够放一个小项目的全部 token */
+
+typedef struct LumeArenaChunk {
+    struct LumeArenaChunk* next;
+    size_t cap;
+    size_t used;
+} LumeArenaChunk;
+
+static LumeArenaChunk* lume_arena_cur = NULL;
+static LUME_MUTEX_T lume_arena_mu = LUME_MUTEX_INIT;
+
+/* 取一块 n 字节、16 字节对齐的空间。加锁是为了 par for 里的 worker
+   线程也能安全派生字符串（锁只在 take 期间持有，粒度很小）。 */
+static void* lume_arena_take(size_t n) {
+    n = (n + 15) & ~(size_t)15;
+    LUME_MUTEX_LOCK(lume_arena_mu);
+    LumeArenaChunk* c = lume_arena_cur;
+    if (!c || c->cap - c->used < n) {
+        size_t cap = n > LUME_ARENA_CHUNK ? n : LUME_ARENA_CHUNK;
+        LumeArenaChunk* nc =
+            (LumeArenaChunk*)malloc(sizeof(LumeArenaChunk) + cap);
+        if (!nc) {
+            LUME_MUTEX_UNLOCK(lume_arena_mu);
+            fflush(stdout);
+            fputs("lume: 内存不足（字符串 arena）\n", stderr);
+            abort();
+        }
+        nc->next = c;
+        nc->cap = cap;
+        nc->used = 0;
+        lume_arena_cur = nc;
+        c = nc;
+    }
+    char* p = (char*)c + sizeof(LumeArenaChunk) + c->used;
+    c->used += n;
+    LUME_MUTEX_UNLOCK(lume_arena_mu);
+    return p;
+}
+
+/* 一次性释放整个 arena。适合「一段临时字符串用完就丢」的场景
+   （比如解析完一个文件）。注意：释放后所有 str 变成悬垂指针。 */
+static inline void lume_str_arena_reset(void) {
+    LUME_MUTEX_LOCK(lume_arena_mu);
+    LumeArenaChunk* c = lume_arena_cur;
+    while (c) {
+        LumeArenaChunk* nx = c->next;
+        free(c);
+        c = nx;
+    }
+    lume_arena_cur = NULL;
+    LUME_MUTEX_UNLOCK(lume_arena_mu);
+}
+
+/* 申请 n 字节可写缓冲（内部多留 1 字节给 '\0'，不自动置零） */
+static inline char* lume_str_buf(int64_t n) {
+    if (n < 0) {
+        fflush(stdout);
+        fputs("lume: 字符串长度为负\n", stderr);
+        abort();
+    }
+    return (char*)lume_arena_take((size_t)n + 1);
+}
+
+/* ── std.str ── */
 
 static inline int64_t lume_str_len(const char* s) {
     return (int64_t)strlen(s);
 }
 
 static inline const char* lume_str_upper(const char* s) {
-    static char bufs[LUME_STR_SLOTS][4096];
-    static long slot = 0;
-    char* buf = bufs[LUME_NEXT_SLOT(&slot) % LUME_STR_SLOTS];
     size_t n = strlen(s);
-    if (n > 4095) n = 4095;
+    char* buf = lume_str_buf((int64_t)n);
     for (size_t i = 0; i < n; i++) buf[i] = (char)toupper((unsigned char)s[i]);
     buf[n] = 0;
     return buf;
 }
 
 static inline const char* lume_str_lower(const char* s) {
-    static char bufs[LUME_STR_SLOTS][4096];
-    static long slot = 0;
-    char* buf = bufs[LUME_NEXT_SLOT(&slot) % LUME_STR_SLOTS];
     size_t n = strlen(s);
-    if (n > 4095) n = 4095;
+    char* buf = lume_str_buf((int64_t)n);
     for (size_t i = 0; i < n; i++) buf[i] = (char)tolower((unsigned char)s[i]);
     buf[n] = 0;
     return buf;
 }
 
 static inline const char* lume_str_trim(const char* s) {
-    static char bufs[LUME_STR_SLOTS][4096];
-    static long slot = 0;
-    char* buf = bufs[LUME_NEXT_SLOT(&slot) % LUME_STR_SLOTS];
     size_t n = strlen(s);
-    if (n > 4095) n = 4095;
     size_t start = 0;
     while (start < n && isspace((unsigned char)s[start])) start++;
     size_t end = n;
     while (end > start && isspace((unsigned char)s[end - 1])) end--;
     size_t len = end - start;
+    char* buf = lume_str_buf((int64_t)len);
     memcpy(buf, s + start, len);
     buf[len] = 0;
     return buf;
@@ -642,72 +713,168 @@ static inline int64_t lume_str_ends_with(const char* s, const char* suf) {
     return strcmp(s + (ls - lf), suf) == 0 ? 1 : 0;
 }
 
-/* replace：结果可能比原文长，用轮转缓冲区装。
-   上限 4095，超了截断 —— 和其他 str_* 的行为一致。 */
+/* replace：先算精确长度再分配，不再有 4095 截断。 */
 static inline const char* lume_str_replace(
     const char* s, const char* old_s, const char* new_s
 ) {
-    static char bufs[LUME_STR_SLOTS][4096];
-    static long slot = 0;
-    char* buf = bufs[LUME_NEXT_SLOT(&slot) % LUME_STR_SLOTS];
     size_t old_len = strlen(old_s);
     size_t new_len = strlen(new_s);
+    size_t src_len = strlen(s);
     if (old_len == 0) {
-        /* 空 old 会让匹配位置永不前进 → 死循环，直接返回原文 */
-        strncpy(buf, s, 4095);
-        buf[4095] = 0;
-        return buf;
+        /* 空 old 会让匹配位置永不前进 → 死循环，原样复制一份返回 */
+        char* same = lume_str_buf((int64_t)src_len);
+        memcpy(same, s, src_len + 1);
+        return same;
     }
+    /* 第一趟只数命中次数。hits * old_len 恒 <= src_len，不会下溢 */
+    size_t hits = 0;
+    for (const char* p = s; (p = strstr(p, old_s)) != 0; p += old_len) hits++;
+    size_t total = src_len - hits * old_len + hits * new_len;
+    char* buf = lume_str_buf((int64_t)total);
+    /* 第二趟真正拷贝 */
     size_t pos = 0;
     const char* p = s;
-    while (*p != 0 && pos < 4095) {
+    for (;;) {
         const char* hit = strstr(p, old_s);
         size_t seg = hit ? (size_t)(hit - p) : strlen(p);
-        if (pos + seg > 4095) seg = 4095 - pos;
         memcpy(buf + pos, p, seg);
         pos += seg;
-        if (hit == 0) break;
-        size_t nl = new_len;
-        if (pos + nl > 4095) nl = 4095 - pos;
-        memcpy(buf + pos, new_s, nl);
-        pos += nl;
+        if (!hit) break;
+        memcpy(buf + pos, new_s, new_len);
+        pos += new_len;
         p = hit + old_len;
     }
     buf[pos] = 0;
     return buf;
 }
 
+/* ── 拼接与派生（`a + b` 的 codegen 目标）──
+   两边都是 str 时 `Add` 落到这里。绝不能让 C 的 `+` 接住 ——
+   那是指针算术，会得到一个偏移后的地址，静默错得离谱。 */
+static inline const char* lume_str_concat(const char* a, const char* b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char* buf = lume_str_buf((int64_t)(la + lb));
+    memcpy(buf, a, la);
+    memcpy(buf + la, b, lb + 1);
+    return buf;
+}
+
+/* 切片 [start, end)。越界自动夹到 [0, len]，不 abort ——
+   词法器经常按「可能偏一点」的下标取，夹边比崩溃有用。 */
+static inline const char* lume_str_slice(
+    const char* s, int64_t start, int64_t end
+) {
+    int64_t n = (int64_t)strlen(s);
+    if (start < 0) start = 0;
+    if (start > n) start = n;
+    if (end < start) end = start;
+    if (end > n) end = n;
+    size_t len = (size_t)(end - start);
+    char* buf = lume_str_buf((int64_t)len);
+    memcpy(buf, s + start, len);
+    buf[len] = 0;
+    return buf;
+}
+
+/* 子串首次出现的位置，找不到返回 -1。按字节算（str 是 UTF-8 字节
+   序列，和 str_len / 切片的语义一致）。 */
+static inline int64_t lume_str_index_of(const char* s, const char* sub) {
+    const char* hit = strstr(s, sub);
+    return hit ? (int64_t)(hit - s) : -1;
+}
+
+/* 重复 times 次。生成缩进、对齐填充都用它。 */
+static inline const char* lume_str_repeat(const char* s, int64_t times) {
+    size_t n = strlen(s);
+    if (times < 0) times = 0;
+    size_t total = n * (size_t)times;
+    char* buf = lume_str_buf((int64_t)total);
+    for (int64_t i = 0; i < times; i++) memcpy(buf + n * (size_t)i, s, n);
+    buf[total] = 0;
+    return buf;
+}
+
+/* 整数 → 字符串。自举时生成 C 代码全靠它（满屏的下标和常量）。 */
+static inline const char* lume_int_str(int64_t v) {
+    char tmp[32];
+    int i = 31;
+    tmp[i] = 0;
+    int neg = v < 0;
+    /* 用无符号取绝对值，避开 INT64_MIN 的 `-v` 溢出 UB */
+    uint64_t u = neg ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    if (u == 0) tmp[--i] = '0';
+    while (u > 0) { tmp[--i] = (char)('0' + (int)(u % 10)); u /= 10; }
+    if (neg) tmp[--i] = '-';
+    size_t len = (size_t)(31 - i);
+    char* buf = lume_str_buf((int64_t)len);
+    memcpy(buf, tmp + i, len + 1);
+    return buf;
+}
+
+/* 浮点 → 字符串。用 %g（6 位有效数字），和 say 的默认观感一致。
+   负数、科学计数法都交给 libc，别自己写。 */
+static inline const char* lume_float_str(double v) {
+    char tmp[64];
+    int n = snprintf(tmp, sizeof(tmp), "%g", v);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(tmp) - 1) n = (int)sizeof(tmp) - 1;
+    char* buf = lume_str_buf((int64_t)n);
+    memcpy(buf, tmp, (size_t)n + 1);
+    return buf;
+}
+
 /* split：返回字符串数组（段指针）+ 段数出参。
    段内容顺序放在一个 4096 的缓冲里，指针指进去；
    整套（指针数组 + 字符缓冲）按槽位轮转，连续调用不互相覆盖。 */
-#define LUME_STR_SPLIT_MAX 64
-
+/* split：按 sep 切成若干段，段数通过 out_len 带出。
+   段一律拷进 arena —— 和原文脱钩，原文被释放后分割结果仍然有效。
+   段数不再有 64 的上限。 */
 static inline const char** lume_str_split(
     const char* s, const char* sep, int64_t* out_len
 ) {
-    static char bufs[LUME_STR_SLOTS][4096];
-    static const char* ptrs[LUME_STR_SLOTS][LUME_STR_SPLIT_MAX];
-    static long slot = 0;
-    long idx = LUME_NEXT_SLOT(&slot) % LUME_STR_SLOTS;
-    char* buf = bufs[idx];
-    const char** out = ptrs[idx];
+    size_t src_len = strlen(s);
     size_t sep_len = strlen(sep);
-    if (sep_len == 0) sep_len = 1;  /* 空分隔符：退化成按字符切，避免死循环 */
-    int64_t count = 0;
-    size_t pos = 0;
-    const char* p = s;
-    while (*p != 0 && count < LUME_STR_SPLIT_MAX - 1) {
-        const char* hit = strstr(p, sep);
-        size_t seg = hit ? (size_t)(hit - p) : strlen(p);
-        if (pos + seg + 1 > 4096) seg = 4096 - pos - 1;
-        memcpy(buf + pos, p, seg);
-        buf[pos + seg] = 0;
-        out[count++] = buf + pos;
-        pos += seg + 1;
-        if (hit == 0) break;
-        p = hit + sep_len;
+    size_t step = sep_len == 0 ? 1 : sep_len;
+
+    /* 第一趟：数段数。空串算一段（一个空段）。 */
+    int64_t count = 1;
+    if (sep_len == 0) {
+        count = src_len == 0 ? 1 : (int64_t)src_len;
+    } else {
+        const char* p = s;
+        while ((p = strstr(p, sep)) != 0) { count++; p += step; }
     }
-    *out_len = count;
+
+    const char** out =
+        (const char**)lume_arena_take(sizeof(const char*) * (size_t)count);
+    /* 池子 = 所有段字符 + 每段一个 NUL，再多留 1 字节余量 */
+    char* pool = (char*)lume_arena_take(src_len + (size_t)count + 1);
+
+    int64_t k = 0;
+    size_t pos = 0;
+    if (sep_len == 0) {
+        /* 空分隔符 = 按字节切成单字符段 */
+        for (size_t i = 0; i < src_len; i++) {
+            pool[pos] = s[i];
+            pool[pos + 1] = 0;
+            out[k++] = pool + pos;
+            pos += 2;
+        }
+        if (k == 0) { pool[0] = 0; out[k++] = pool; }
+    } else {
+        const char* p = s;
+        for (;;) {
+            const char* hit = strstr(p, sep);
+            size_t seg = hit ? (size_t)(hit - p) : strlen(p);
+            memcpy(pool + pos, p, seg);
+            pool[pos + seg] = 0;
+            out[k++] = pool + pos;
+            pos += seg + 1;
+            if (!hit) break;
+            p = hit + step;
+        }
+    }
+    *out_len = k;
     return out;
 }
 

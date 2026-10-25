@@ -60,6 +60,42 @@ normalize() {
 cd "$WORK" || exit 1
 
 # ── 正向用例 ──
+# check_positive <用例名> <入口文件>
+check_positive() {
+    local stem="$1" src="$2"
+    local raw="$WORK/$stem.raw" norm="$WORK/$stem.norm"
+
+    "$BIN" run "$src" > "$raw" 2>&1
+    local rc=$?
+    normalize < "$raw" > "$norm"
+
+    if [ "$rc" -ne 0 ]; then
+        say_bad "$stem（退出码 $rc）"
+        tail -20 "$raw" | sed 's/^/       /'
+        failed_list+=("$stem"); fail=$((fail + 1)); return
+    fi
+
+    if [ -n "${UPDATE:-}" ]; then
+        cp "$norm" "$GOLDEN/$stem.out"
+        say_ok "$stem（golden 已更新）"
+        pass=$((pass + 1)); return
+    fi
+
+    if [ ! -f "$GOLDEN/$stem.out" ]; then
+        say_bad "$stem（缺 tests/golden/$stem.out，先跑 UPDATE=1 scripts/run_tests.sh 生成基线）"
+        failed_list+=("$stem"); fail=$((fail + 1)); return
+    fi
+
+    if diff -q "$GOLDEN/$stem.out" "$norm" > /dev/null; then
+        say_ok "$stem"
+        pass=$((pass + 1))
+    else
+        say_bad "$stem（输出和 golden 不一致）"
+        diff -u "$GOLDEN/$stem.out" "$norm" | head -30 | sed 's/^/       /'
+        failed_list+=("$stem"); fail=$((fail + 1))
+    fi
+}
+
 printf '==> 正向用例（golden 比对）\n'
 shopt -s nullglob
 positive=("$ROOT/main.lume")
@@ -71,46 +107,16 @@ shopt -u nullglob
 mkdir -p "$GOLDEN"
 
 for src in "${positive[@]}"; do
-    stem=$(basename "$src" .lume)
-    raw="$WORK/$stem.raw"
-    norm="$WORK/$stem.norm"
-
-    "$BIN" run "$src" > "$raw" 2>&1
-    rc=$?
-    normalize < "$raw" > "$norm"
-
-    if [ "$rc" -ne 0 ]; then
-        say_bad "$stem（退出码 $rc）"
-        tail -20 "$raw" | sed 's/^/       /'
-        failed_list+=("$stem")
-        fail=$((fail + 1))
-        continue
-    fi
-
-    if [ -n "${UPDATE:-}" ]; then
-        cp "$norm" "$GOLDEN/$stem.out"
-        say_ok "$stem（golden 已更新）"
-        pass=$((pass + 1))
-        continue
-    fi
-
-    if [ ! -f "$GOLDEN/$stem.out" ]; then
-        say_bad "$stem（缺 tests/golden/$stem.out，先跑 UPDATE=1 scripts/run_tests.sh 生成基线）"
-        failed_list+=("$stem")
-        fail=$((fail + 1))
-        continue
-    fi
-
-    if diff -q "$GOLDEN/$stem.out" "$norm" > /dev/null; then
-        say_ok "$stem"
-        pass=$((pass + 1))
-    else
-        say_bad "$stem（输出和 golden 不一致）"
-        diff -u "$GOLDEN/$stem.out" "$norm" | head -30 | sed 's/^/       /'
-        failed_list+=("$stem")
-        fail=$((fail + 1))
-    fi
+    check_positive "$(basename "$src" .lume)" "$src"
 done
+
+# ── 多文件用例（模块系统） ──
+# 入口是 tests/multi/main.lume，同目录的 mathx.lume / textx.lume
+# 和子目录 util/deep.lume 靠「自动扫描」并入，源码里没有任何 import。
+if [ -d "$ROOT/tests/multi" ]; then
+    printf '==> 多文件用例（模块系统）\n'
+    check_positive "multi" "$ROOT/tests/multi/main.lume"
+fi
 
 # ── 负向用例 ──
 printf '==> 负向用例（必须报错）\n'
@@ -129,6 +135,44 @@ for src in "${negatives[@]}"; do
     fi
 
     raw="$WORK/neg_$(basename "$src" .lume).raw"
+    "$BIN" run "$src" > "$raw" 2>&1
+    rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        say_bad "$stem（本该失败，却成功退出）"
+        failed_list+=("$stem")
+        fail=$((fail + 1))
+    elif ! grep -qF -- "$expect" "$raw"; then
+        say_bad "$stem（退出码 $rc，但输出里没有「$expect」）"
+        tail -10 "$raw" | sed 's/^/       /'
+        failed_list+=("$stem")
+        fail=$((fail + 1))
+    else
+        say_ok "$stem"
+        pass=$((pass + 1))
+    fi
+done
+
+# ── 负向：多文件项目 ──
+# 目录形式：tests/fail_multi/<用例名>/main.lume 是入口，
+# 期望的报错子串写在它的第一行（和单文件用例同格式）。
+printf '==> 负向用例（多文件）\n'
+shopt -s nullglob
+neg_multi=("$ROOT"/tests/fail_multi/*/main.lume)
+shopt -u nullglob
+
+for src in "${neg_multi[@]}"; do
+    name=$(basename "$(dirname "$src")")
+    stem="fail_multi/$name"
+    expect=$(head -1 "$src" | sed -E 's|^// *expect: *||')
+    if [ -z "$expect" ] || [ "$expect" = "$(head -1 "$src")" ]; then
+        say_bad "$stem（第一行没有 // expect: <子串>）"
+        failed_list+=("$stem")
+        fail=$((fail + 1))
+        continue
+    fi
+
+    raw="$WORK/neg_multi_$name.raw"
     "$BIN" run "$src" > "$raw" 2>&1
     rc=$?
 

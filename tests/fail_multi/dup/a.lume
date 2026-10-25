@@ -1,0 +1,4 @@
+// 与 b.lume 同名，必须被检测出来
+fn helper(x: int) -> int {
+    return x + 1
+}

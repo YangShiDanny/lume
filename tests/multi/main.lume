@@ -1,0 +1,19 @@
+// 多文件项目入口（tests/multi/）
+//
+// 同名目录下的 mathx.lume / textx.lume 和 util/deep.lume 会被自动并入，
+// 不需要 import —— 文件名即模块名。
+//
+// 注意这个目录自带 fn main，所以仓库根目录构建 main.lume 时
+// 不会把这个子目录吞进去（见 src/cli.rs 的边界规则）。
+fn main() {
+    say("triple 7 => {triple(7)}")
+    say("sum_sq 5 => {sum_sq(5)}")
+
+    name := "hi"
+    say("shout => {shout(name)}")
+    a := "ab"
+    b := "wxyz"
+    say("longest => {longest(a, b)}")
+
+    say("pair_sum 3 4 => {pair_sum(3, 4)}")
+}

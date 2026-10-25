@@ -1,0 +1,15 @@
+// 模块文件（没有 fn main）
+// 入口同目录下的 .lume 会被自动并入，不需要 import。
+const SCALE = 3
+
+fn triple(x: int) -> int {
+    return x * SCALE
+}
+
+fn sum_sq(n: int) -> int {
+    total := 0
+    for i in 1..=n {
+        total += i * i
+    }
+    return total
+}

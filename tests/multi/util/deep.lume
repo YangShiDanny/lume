@@ -1,0 +1,15 @@
+// 子目录里的模块：验证「同目录 + 子目录递归」都能扫到。
+// 这个目录自己没有 fn main，所以算上层项目的一部分，不会被当成独立项目跳过。
+struct Pair {
+    a: int
+    b: int
+
+    fn total() -> int {
+        return a + b
+    }
+}
+
+fn pair_sum(x: int, y: int) -> int {
+    p := Pair(a: x, b: y)
+    return p.total()
+}
