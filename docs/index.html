@@ -158,6 +158,24 @@
     box-shadow: 0 10px 30px -18px rgba(0,0,0,.65);
   }
   [data-theme='light'] .pill { box-shadow: 0 10px 28px -16px rgba(0,0,0,.28); }
+  /* 返回主页 */
+  .back {
+    position: relative; display: inline-flex; align-items: center; justify-content: center;
+    width: 32px; height: 32px; border-radius: 999px; flex: none;
+    color: var(--muted);
+    transition: color .25s ease, background .25s ease, transform .25s cubic-bezier(.2,.8,.2,1);
+  }
+  .back:hover { color: var(--text); background: var(--hover); transform: translateX(-2px); }
+  .back svg { width: 15px; height: 15px; }
+  .back-tip {
+    position: absolute; top: calc(100% + 12px); left: 50%;
+    transform: translate(-50%, 4px); pointer-events: none; white-space: nowrap;
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--text); background: var(--panel-2); border: 1px solid var(--border);
+    padding: 4px 9px; border-radius: 6px; opacity: 0;
+    transition: opacity .2s ease, transform .2s ease;
+  }
+  .back:hover .back-tip { opacity: 1; transform: translate(-50%, 0); }
   .brand { display: flex; align-items: center; gap: 8px; padding: 6px 14px 6px 10px; font-family: var(--font-display); font-weight: 600; font-size: 1rem; letter-spacing: -.02em; }
   .brand svg { width: 18px; height: 18px; }
   .nlink {
@@ -299,6 +317,9 @@
     .stats { grid-template-columns: repeat(2,1fr); gap: 16px; }
     .nlink { padding: 7px 9px; letter-spacing: .08em; }
     .brand { padding: 6px 8px; }
+    .back { width: 28px; height: 28px; }
+    .back-tip { display: none; }
+    .icon-btn { width: 28px; height: 28px; }
     .code-body pre { font-size: 11.5px; }
   }
   @media (hover: none) and (pointer: coarse) {
@@ -315,6 +336,10 @@
 
 <header class="topnav">
   <div class="pill">
+    <a class="back" href="https://yangshidanny.github.io/" aria-label="返回主页">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5"></path><path d="M12 19l-7-7 7-7"></path></svg>
+      <span class="back-tip">返回主页</span>
+    </a>
     <a class="brand" href="#top" aria-label="Lume">
       <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M16 4l8 7.5-8 16.5-8-16.5z" stroke="var(--accent)"/><path d="M8 11.5h16" stroke="var(--border-strong)"/></svg>
       Lume
