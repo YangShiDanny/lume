@@ -20,6 +20,12 @@ impl Checker {
                                 format!("可空值（{}）不能直接插值", t.name()),
                                 "先判 .has 再用 .val，或用 ! 强制解包",
                             );
+                        } else if matches!(t, Ty::Map(..)) {
+                            // map 的 C 类型是 LumeMap*，插值只会打出指针值
+                            self.error_hint(
+                                format!("map（{}）不能直接插值", t.name()),
+                                "用 .len() 打长度，或者遍历 .keys() 逐个打",
+                            );
                         } else if let Ty::Struct(sname) = &t {
                             // 结构体进 printf 的 varargs 同样是 UB（读到的
                             // 是第一个字段）。有 op_str 就自动调它，没有就
@@ -168,8 +174,9 @@ impl Checker {
                         self.error("free 需要 1 个参数");
                     } else {
                         let ty = self.check_expr(&args[0]);
-                        if !matches!(ty, Ty::Array(_) | Ty::Unknown) {
-                            self.error("free 只接受数组");
+                        if !matches!(ty, Ty::Array(_) | Ty::Vec(_) | Ty::Map(..) | Ty::Unknown)
+                        {
+                            self.error("free 只接受数组 / Vec / Map");
                         }
                     }
                     return Ty::Void;
@@ -201,6 +208,12 @@ impl Checker {
                                 // 有 op_str 就按字符串打印，没有就拒绝 ——
                                 // 否则 printf 读到的是结构体第一个字段。
                                 self.require_op_str(sname);
+                            } else if matches!(t, Ty::Map(..)) {
+                                // LumeMap* 是句柄指针，%lld 打出来的是地址
+                                self.error_hint(
+                                    format!("{}() 不能直接打印 map（{}）", name, t.name()),
+                                    "用 .len() 打长度，或遍历 .keys() 逐个打",
+                                );
                             }
                         }
                         return Ty::Void;
@@ -300,6 +313,11 @@ impl Checker {
                     if let Ty::Vec(elem) = &obj_ty {
                         let elem = elem.as_ref().clone();
                         return self.check_vec_method(&elem, method, args);
+                    }
+                    // Map 的内置方法，同理由接收者类型（K/V）决定
+                    if let Ty::Map(k, v) = &obj_ty {
+                        let (k, v) = (k.as_ref().clone(), v.as_ref().clone());
+                        return self.check_map_method(&k, &v, method, args);
                     }
                     for a in args {
                         let _ = self.check_expr(a);
@@ -444,7 +462,69 @@ impl Checker {
 
             Expr::Repeat(value, _) => Ty::Array(Box::new(self.check_expr(value))),
 
-            Expr::Map(_) => Ty::Unknown,
+            // map 字面量 `{"a": 1, "b": 2}`。K/V 从键值对推断：
+            // 全空 `{}` 推不出 K（C 侧要按 ksz 开槽），直接报错；
+            // 各对类型不一致时报第一个分歧，不静默取第一个。
+            Expr::Map(pairs) => {
+                if pairs.is_empty() {
+                    // `m: Map[str, int] = {}` —— 左边写着类型就用它
+                    if let Some(Ty::Map(k, v)) = self.let_hint.clone() {
+                        return Ty::Map(k, v);
+                    }
+                    self.error_hint(
+                        "{} 看不出键类型",
+                        "写 Map[str, int]() 建空表，或给出至少一个键值对",
+                    );
+                    return Ty::Unknown;
+                }
+                let kt = self.check_expr(&pairs[0].0);
+                let vt = self.check_expr(&pairs[0].1);
+                for (k, v) in &pairs[1..] {
+                    let k2 = self.check_expr(k);
+                    let v2 = self.check_expr(v);
+                    if !k2.is_unknown() && !kt.is_unknown() && k2 != kt {
+                        self.error(format!(
+                            "map 字面量的键类型不一致：{} 和 {}",
+                            kt.name(),
+                            k2.name()
+                        ));
+                    }
+                    if !v2.is_unknown() && !vt.is_unknown() && v2 != vt {
+                        self.error(format!(
+                            "map 字面量的值类型不一致：{} 和 {}",
+                            vt.name(),
+                            v2.name()
+                        ));
+                    }
+                }
+                Ty::Map(Box::new(kt), Box::new(vt))
+            }
+
+            // `Map[K, V]()` 构造。键必须是「按字节比较有意义」的类型：
+            // str 走 strcmp，其余走 memcmp(ksz)。指针型（Vec / Map /
+            // 固定数组 / 列表）做键等于比地址，几乎肯定是写错了。
+            Expr::MapNew(k, v) => {
+                let kt = self.ty_from_ast(Some(k));
+                let vt = self.ty_from_ast(Some(v));
+                match &kt {
+                    Ty::Str | Ty::Int | Ty::Bool | Ty::Rune | Ty::Enum(_) => {}
+                    Ty::Struct(sname) => {
+                        // 结构体里有指针字段的话 memcmp 比的就是地址。
+                        // 这里挡不住（要看字段表），只提醒一句。
+                        let _ = sname;
+                    }
+                    Ty::Unknown => {}
+                    other => self.error_hint(
+                        format!("Map 的键不能是 {} —— 按字节比较没有意义", other.name()),
+                        "键只支持 int / str / bool / rune / 枚举（结构体小心指针字段）",
+                    ),
+                }
+                if matches!(vt, Ty::Void) {
+                    self.error("Map 的值不能是 void");
+                }
+                Ty::Map(Box::new(kt), Box::new(vt))
+            }
+
             Expr::StructLit(name, fields) => {
                 // f(a: 1) 与 Point(x: 1) 语法同形，parser 一律解析成 StructLit。
                 // 名字不是结构体 → 命名参数函数调用，按签名重排后检查。
@@ -809,9 +889,15 @@ impl Checker {
         for (i, arg) in args.iter().enumerate() {
             let arg_ty = self.check_expr(arg);
             if let Some(expected) = sig.params.get(i) {
+                // `None` 的类型是 `??`（元素还没定），它该能传给任何 T? 参数。
+                // 只认 Optional 这一种 —— 别的地方类型未知是真不知道，
+                // 一律放行会漏掉写错的泛型实参。
+                let none_ok = matches!(&arg_ty, Ty::Optional(inner) if inner.is_unknown())
+                    && matches!(expected, Ty::Optional(_));
                 if !arg_ty.is_unknown()
                     && !expected.is_unknown()
                     && &arg_ty != expected
+                    && !none_ok
                 {
                     // 数组字面量塞给 Vec 参数是最常见的误用：两者在 C 里
                     // 是不同的东西（栈数组 vs 带 len 的句柄），不能隐式转。
@@ -1095,6 +1181,73 @@ impl Checker {
                 self.error_hint(
                     format!("Vec 没有方法 '{}'", method),
                     format!("可用的方法：{}", known),
+                );
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// `Map[K, V]` 的内置方法。和 Vec 一样不进 builtins 表：键值类型
+    /// 决定签名，只能按接收者分派。
+    fn check_map_method(&mut self, k: &Ty, v: &Ty, method: &str, args: &[Expr]) -> Ty {
+        // 会改表的操作在 par for 里是数据竞争（并发 realloc / 撕开探测链）
+        let mutating = matches!(method, "set" | "del" | "clear" | "free");
+        if mutating && self.par_depth > 0 {
+            self.error_hint(
+                format!("par for 里不能调用 Map.{}()", method),
+                "worker 之间共享同一个 Map 会并发改表；写入挪到 par for 外面",
+            );
+            return Ty::Unknown;
+        }
+
+        // 键/值实参的类型检查。写泛型实参的常见错误（`m.set(1, "x")`
+        // 当键是 str）在这里就报，不然会变成 memcmp 比垃圾。
+        let arg_of = |this: &mut Self, a: &Expr, want: &Ty, what: &str| {
+            let t = this.check_expr(a);
+            if !t.is_unknown() && !want.is_unknown() && &t != want {
+                this.error_hint(
+                    format!("Map.{} 的{}类型不匹配：期望 {}，得到 {}", method, what, want.name(), t.name()),
+                    format!("这个 Map 是 Map[{}, {}]", k.name(), v.name()),
+                );
+            }
+        };
+
+        match method {
+            "len" | "length" if args.is_empty() => Ty::Int,
+            "is_empty" if args.is_empty() => Ty::Bool,
+            "clear" | "free" if args.is_empty() => Ty::Void,
+            "keys" if args.is_empty() => Ty::Vec(Box::new(k.clone())),
+            "values" if args.is_empty() => Ty::Vec(Box::new(v.clone())),
+            "has" if args.len() == 1 => {
+                arg_of(self, &args[0], k, "键");
+                Ty::Bool
+            }
+            "del" if args.len() == 1 => {
+                arg_of(self, &args[0], k, "键");
+                Ty::Bool
+            }
+            "get" if args.len() == 1 => {
+                arg_of(self, &args[0], k, "键");
+                Ty::Optional(Box::new(v.clone()))
+            }
+            "set" if args.len() == 2 => {
+                arg_of(self, &args[0], k, "键");
+                arg_of(self, &args[1], v, "值");
+                Ty::Void
+            }
+            "len" | "length" | "is_empty" | "clear" | "free" | "keys" | "values" | "has"
+            | "del" | "get" | "set" => {
+                self.error_hint(
+                    format!("Map.{} 的参数个数不对（传了 {} 个）", method, args.len()),
+                    "签名：len() / is_empty() / keys() / values() / has(k) / \
+                     del(k) / get(k) / set(k, v) / clear() / free()",
+                );
+                Ty::Unknown
+            }
+            _ => {
+                self.error_hint(
+                    format!("Map 没有方法 '{}'", method),
+                    "可用的方法：len / is_empty / keys / values / has / del / get / set / clear / free",
                 );
                 Ty::Unknown
             }

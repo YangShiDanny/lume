@@ -1,0 +1,5 @@
+// expect: 不能直接打印 map
+fn main() {
+    m := {"a": 1}
+    say(m)
+}

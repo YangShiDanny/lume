@@ -685,6 +685,238 @@ static inline void lume_vec_free(LumeVec* v) {
     free(v);
 }
 
+/* ── Map[K, V] ──
+
+   和 Vec 同一个套路：C 侧只有一个句柄，键/值类型不进 C 的类型系统，
+   只存 ksz / vsz 两个字节数，读写走 memcpy。键类型另外只需要知道
+   「是不是 str」—— str 要按内容比较和复制，其余按字节比较。
+
+   开放寻址 + 线性探测 + 墓碑。为什么不用链式：链式要为每个桶
+   malloc 一个 node，查找多一次解引用，缓存局部性差；开放寻址把
+   键值放在连续内存里，编译器遍历符号表那种场景快得多。
+
+   表里存的 key 是**拷贝**：str 键 malloc 一份，其它类型按 ksz
+   字节拷。所以调用点传 arena 里的临时字符串也安全（scope 回退
+   之后键还在）。 */
+typedef struct {
+    uint8_t* state;   /* 0 = 空, 1 = 占用, 2 = 墓碑 */
+    char*    keys;    /* cap * ksz */
+    char*    vals;    /* cap * vsz */
+    int64_t  cap;
+    int64_t  len;     /* 占用槽数，不含墓碑 */
+    int64_t  dead;    /* 墓碑数 */
+    int64_t  ksz;
+    int64_t  vsz;
+    int32_t  kstr;    /* 1 = 键是 str */
+} LumeMap;
+
+static inline const char* lume_map_kstr_of(const void* k) {
+    const char* s = *(const char* const*)k;
+    return s ? s : "";
+}
+
+/* FNV-1a。str 按字节内容，其它类型按 ksz 字节的原始位模式。 */
+static inline uint64_t lume_map_hash(const LumeMap* m, const void* k) {
+    uint64_t h = 1469598103934665603ULL;
+    if (m->kstr) {
+        const unsigned char* p = (const unsigned char*)lume_map_kstr_of(k);
+        while (*p) { h ^= (uint64_t)*p++; h *= 1099511628211ULL; }
+    } else {
+        const unsigned char* p = (const unsigned char*)k;
+        for (int64_t i = 0; i < m->ksz; i++) { h ^= (uint64_t)p[i]; h *= 1099511628211ULL; }
+    }
+    return h;
+}
+
+static inline int lume_map_keq(const LumeMap* m, const char* a, const char* b) {
+    if (m->kstr) return strcmp(lume_map_kstr_of(a), lume_map_kstr_of(b)) == 0;
+    return memcmp(a, b, (size_t)m->ksz) == 0;
+}
+
+/* mode = 0：只查，命中返回槽位号，否则 -1。
+   mode = 1：插入用，命中返回该槽位，否则返回第一个可写槽位
+             （优先用墓碑，避免墓碑把探测链越拉越长）。 */
+static inline int64_t lume_map_probe(const LumeMap* m, const void* k, int mode) {
+    uint64_t h = lume_map_hash(m, k);
+    int64_t mask = m->cap - 1;
+    int64_t i = (int64_t)(h & (uint64_t)mask);
+    int64_t first_dead = -1;
+    for (int64_t n = 0; n < m->cap; n++) {
+        if (m->state[i] == 0) {
+            if (mode == 1) return first_dead >= 0 ? first_dead : i;
+            return -1;
+        }
+        if (m->state[i] == 2) {
+            if (first_dead < 0) first_dead = i;
+        } else if (lume_map_keq(m, m->keys + i * m->ksz, k)) {
+            return i;
+        }
+        i = (i + 1) & mask;
+    }
+    return mode == 1 ? first_dead : -1;
+}
+
+static inline LumeMap* lume_map_new(int64_t ksz, int64_t vsz, int32_t kstr) {
+    LumeMap* m = (LumeMap*)calloc(1, sizeof(LumeMap));
+    if (!m) {
+        fprintf(stderr, "lume: runtime error: out of memory (Map)\n");
+        abort();
+    }
+    m->ksz = ksz;
+    m->vsz = vsz;
+    m->kstr = kstr;
+    return m;
+}
+
+static inline void lume_map_rehash(LumeMap* m, int64_t want) {
+    int64_t cap = 8;
+    while (cap < want) cap <<= 1;
+    if (cap <= m->cap) return;
+
+    uint8_t* os = m->state;
+    char* ok = m->keys;
+    char* ov = m->vals;
+    int64_t oc = m->cap;
+
+    m->state = (uint8_t*)calloc((size_t)cap, 1);
+    m->keys = (char*)malloc((size_t)(cap * m->ksz));
+    m->vals = (char*)malloc((size_t)(cap * m->vsz));
+    if (!m->state || !m->keys || !m->vals) {
+        fprintf(stderr, "lume: runtime error: out of memory (Map grow)\n");
+        abort();
+    }
+    m->cap = cap;
+    m->len = 0;
+    m->dead = 0;
+
+    for (int64_t i = 0; i < oc; i++) {
+        if (os[i] != 1) continue;
+        /* 键只搬指针，不再复制一份（不然就漏了）*/
+        int64_t j = lume_map_probe(m, ok + i * m->ksz, 1);
+        memcpy(m->keys + j * m->ksz, ok + i * m->ksz, (size_t)m->ksz);
+        memcpy(m->vals + j * m->vsz, ov + i * m->vsz, (size_t)m->vsz);
+        m->state[j] = 1;
+        m->len++;
+    }
+    free(os);
+    free(ok);
+    free(ov);
+}
+
+static inline void lume_map_set(LumeMap* m, const void* k, const void* v) {
+    if (m->cap == 0) lume_map_rehash(m, 8);
+    /* 墓碑也算负载：墓碑堆积会让探测链退化 */
+    if ((m->len + m->dead) * 4 >= m->cap * 3) lume_map_rehash(m, m->cap * 2);
+
+    int64_t i = lume_map_probe(m, k, 1);
+    if (m->state[i] != 1) {
+        if (m->kstr) {
+            const char* s = lume_map_kstr_of(k);
+            size_t n = strlen(s) + 1;
+            char* dup = (char*)malloc(n);
+            if (!dup) {
+                fprintf(stderr, "lume: runtime error: out of memory (Map key)\n");
+                abort();
+            }
+            memcpy(dup, s, n);
+            memcpy(m->keys + i * m->ksz, &dup, sizeof(char*));
+        } else {
+            memcpy(m->keys + i * m->ksz, k, (size_t)m->ksz);
+        }
+        if (m->state[i] == 2) m->dead--;
+        m->state[i] = 1;
+        m->len++;
+    }
+    memcpy(m->vals + i * m->vsz, v, (size_t)m->vsz);
+}
+
+/* 命中返回 1 并把值写进 out（out 可以是 NULL）；否则返回 0。 */
+static inline int32_t lume_map_get(const LumeMap* m, const void* k, void* out) {
+    if (m->cap == 0) return 0;
+    int64_t i = lume_map_probe(m, k, 0);
+    if (i < 0) return 0;
+    if (out) memcpy(out, m->vals + i * m->vsz, (size_t)m->vsz);
+    return 1;
+}
+
+static inline int32_t lume_map_has(const LumeMap* m, const void* k) {
+    return lume_map_get(m, k, NULL);
+}
+
+static inline int32_t lume_map_del(LumeMap* m, const void* k) {
+    if (m->cap == 0) return 0;
+    int64_t i = lume_map_probe(m, k, 0);
+    if (i < 0) return 0;
+    if (m->kstr) {
+        char* p = *(char**)(m->keys + i * m->ksz);
+        free(p);
+    }
+    m->state[i] = 2;
+    m->len--;
+    m->dead++;
+    return 1;
+}
+
+static inline int64_t lume_map_len(const LumeMap* m) { return m->len; }
+
+static inline void lume_map_clear(LumeMap* m) {
+    if (!m) return;
+    if (m->kstr) {
+        for (int64_t i = 0; i < m->cap; i++) {
+            if (m->state[i] == 1) {
+                char* p = *(char**)(m->keys + i * m->ksz);
+                free(p);
+            }
+        }
+    }
+    if (m->state) memset(m->state, 0, (size_t)m->cap);
+    m->len = 0;
+    m->dead = 0;
+}
+
+static inline void lume_map_free(LumeMap* m) {
+    if (!m) return;
+    lume_map_clear(m);
+    free(m->state);
+    free(m->keys);
+    free(m->vals);
+    free(m);
+}
+
+/* 遍历：返回 >= from 的下一个占用槽位号，没有则 -1。
+   顺序就是桶顺序（由哈希决定），**不保证插入顺序**。 */
+static inline int64_t lume_map_iter(const LumeMap* m, int64_t from) {
+    if (!m || from < 0) from = 0;
+    for (int64_t i = from; i < m->cap; i++) {
+        if (m->state[i] == 1) return i;
+    }
+    return -1;
+}
+
+static inline char* lume_map_key_at(LumeMap* m, int64_t i) {
+    return m->keys + i * m->ksz;
+}
+
+static inline char* lume_map_val_at(LumeMap* m, int64_t i) {
+    return m->vals + i * m->vsz;
+}
+
+static inline LumeVec* lume_map_keys(const LumeMap* m) {
+    LumeVec* v = lume_vec_new(m ? m->ksz : 8);
+    for (int64_t i = lume_map_iter(m, 0); i >= 0; i = lume_map_iter(m, i + 1)) {
+        lume_vec_push(v, m->keys + i * m->ksz);
+    }
+    return v;
+}
+
+static inline LumeVec* lume_map_values(const LumeMap* m) {
+    LumeVec* v = lume_vec_new(m ? m->vsz : 8);
+    for (int64_t i = lume_map_iter(m, 0); i >= 0; i = lume_map_iter(m, i + 1)) {
+        lume_vec_push(v, m->vals + i * m->vsz);
+    }
+    return v;
+}
+
 /* ── 字符串 arena ──
    Lume 的 str 就是 const char*：零开销，能直接交给 printf / libc。
 

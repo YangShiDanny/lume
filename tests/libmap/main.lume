@@ -1,0 +1,22 @@
+// Map 跨包（正向）：项目 → counter → words。
+//
+// 和 Vec 一样，`Map[str, int]` 的 K/V 只记在编译器侧，跨包合并后
+// 必须还能查到 —— 否则 `c.of("a")` 会报「无法推断 Map 的键值类型」。
+fn main() {
+    ws := word_list()
+    c := count_all(ws)
+    say("词数 = {c.size()}   期望 3")
+    say("a = {c.of("a")}   期望 3")
+    say("b = {c.of("b")}   期望 2")
+    say("c = {c.of("c")}   期望 1")
+
+    // 另一个包的函数接收 Map 参数：签名在 words 包里登记 K/V
+    ks := keys_sorted(c2())
+    say("排序 keys = {ks[0]}{ks[1]}{ks[2]}   期望 abc")
+}
+
+/// 在项目侧也建一张同样的表，交给库去排
+fn c2() -> Map[str, int] {
+    m := {"c": 1, "a": 3, "b": 2}
+    return m
+}

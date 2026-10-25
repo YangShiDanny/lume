@@ -785,6 +785,14 @@ impl Codegen {
                     format!("{}.0", s)
                 }
             }
+            // 可空值的 .has / .val（`m.get(k).val`）。
+            // 基必须用 par 的生成路径 —— worker 是顶层函数，`m` 通过
+            // `_p->m` 进来。以前这里没有这一条，`Expr::Field` 直接掉到
+            // 最下面的 gen_expr，生成的 C 引用 worker 里不存在的 `m`。
+            Expr::Field(o, name) if name == "has" || name == "val" => {
+                let os = self.gen_par_expr(o, arrays);
+                format!("({}).{}", os, name)
+            }
             // a.len → _p->a_len（长度在 args 结构体里）
             Expr::Field(o, name) if name == "len" => {
                 if let Expr::Ident(arr) = o.as_ref() {
@@ -815,6 +823,31 @@ impl Codegen {
                                     )
                                 }
                                 _ => {}
+                            }
+                        }
+                    }
+                }
+                // Map 的方法。接收者必须用 gen_par_expr 生成 —— worker
+                // 是顶层函数，`m` 在外层作用域里，只能走 _p->m。
+                // 漏掉这一条会落到下面的 gen_expr，生成 `lume_map_get(m, ..)`
+                // 而 worker 里根本没有 m（clang: undeclared identifier）。
+                if let Expr::Field(obj, mname) = c.as_ref() {
+                    if self.infer_type(obj) == "LumeMap*" {
+                        if let Some((k, v)) = self.inferred_map_kv(obj) {
+                            let recv = self.gen_par_expr(obj, arrays);
+                            let kc = args
+                                .first()
+                                .map(|a| self.gen_par_expr(a, arrays))
+                                .unwrap_or_default();
+                            let vc = args
+                                .get(1)
+                                .map(|a| self.gen_par_expr(a, arrays))
+                                .unwrap_or_default();
+                            let n = args.len();
+                            if let Some(text) =
+                                self.map_call_text(&recv, mname, &k, &v, &kc, &vc, n)
+                            {
+                                return text;
                             }
                         }
                     }

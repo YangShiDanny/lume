@@ -57,7 +57,11 @@ impl Checker {
     pub(crate) fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let { name, ty, init } => {
+                // 声明类型先挂上，让 `{}` 这种自身推不出 K/V 的 map 字面量
+                // 能看着左边补。用完立刻摘掉 —— 右值里的嵌套 let 不该继承。
+                self.let_hint = ty.as_ref().map(|t| self.ty_from_ast(Some(t)));
                 let init_ty = self.check_expr(init);
+                self.let_hint = None;
                 if matches!(init_ty, Ty::Void) {
                     self.error(format!(
                         "void 表达式不能赋给变量 '{}'（free/say 只能作语句）",

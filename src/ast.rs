@@ -148,9 +148,6 @@ pub enum Type {
     Named(String),
     List(Box<Type>),
     Array(Box<Type>, Option<usize>),
-    /// 待办：map 类型（`map[str]int`）。parser 未产出，codegen 未实现。
-    #[allow(dead_code)]
-    Map(Box<Type>, Box<Type>),
     Tuple(Vec<Type>),
     Optional(Box<Type>),
     Error(Box<Type>),
@@ -236,6 +233,11 @@ pub enum Expr {
     Map(Vec<(Expr, Expr)>),
     StructLit(String, Vec<(String, Expr)>),
     Repeat(Box<Expr>, usize),
+    /// `Map[K, V]()`：构造一个空 map。
+    ///
+    /// 类型必须写在表达式里 —— 没有 `Map[K, V]` 的变量声明推断，
+    /// 空的 map 拿不到 K/V 就不知道 ksz / vsz。
+    MapNew(Box<Type>, Box<Type>),
     Range(Box<Expr>, Box<Expr>, bool),
     If(Box<Expr>, Block, Option<Block>),
     /// 待办：match 表达式。语句形式的 `match` 已解析，表达式形式未接 codegen。
@@ -283,6 +285,17 @@ pub fn vec_elem_type(t: &Type) -> Option<&Type> {
     match t {
         Type::Generic(base, args) if args.len() == 1 => match base.as_ref() {
             Type::Named(n) if n == "Vec" => Some(&args[0]),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `Map[K, V]` → (K, V)。和 `vec_elem_type` 一样是唯一识别入口。
+pub fn map_kv_types(t: &Type) -> Option<(&Type, &Type)> {
+    match t {
+        Type::Generic(base, args) if args.len() == 2 => match base.as_ref() {
+            Type::Named(n) if n == "Map" => Some((&args[0], &args[1])),
             _ => None,
         },
         _ => None,

@@ -24,6 +24,9 @@ pub enum Ty {
     /// 动态数组 `Vec[T]`。和 `Array` 的区别是长度在运行期可变：
     /// Array 是「指针 + 编译期/伴随参数里的长度」，Vec 是自带 len 的句柄。
     Vec(Box<Ty>),
+    /// `Map[K, V]`。C 侧是 `LumeMap*`，键值大小存在句柄里
+    /// （和 Vec 同一个套路：类型不进 C）。
+    Map(Box<Ty>, Box<Ty>),
     /// 枚举类型名。C 侧是 `int64_t` 的 typedef，这里单独记一个
     /// 名字是为了能做穷尽性检查（`match` 少了变体要报错）。
     Enum(String),
@@ -42,6 +45,7 @@ impl Ty {
             Ty::Struct(s) => s.clone(),
             Ty::Array(inner) => format!("[{}]", inner.name()),
             Ty::Vec(inner) => format!("Vec[{}]", inner.name()),
+            Ty::Map(k, v) => format!("Map[{}, {}]", k.name(), v.name()),
             Ty::Enum(s) => s.clone(),
             Ty::Optional(inner) => format!("{}?", inner.name()),
         }
@@ -96,6 +100,9 @@ pub struct Checker {
     /// 是并发从同一个 arena 切的 —— 一个 worker 回退会把别人刚分配的
     /// 字符串一起回收，所以这里只用来**拒绝** `scope`。
     pub(crate) par_depth: usize,
+    /// 正在检查的 `let` 的**声明类型**。只有 map 字面量用它：
+    /// `m: Map[str, int] = {}` 的 `{}` 自身推不出 K/V，得看左边。
+    pub(crate) let_hint: Option<Ty>,
 }
 
 impl Checker {
@@ -112,6 +119,7 @@ impl Checker {
             consts: HashMap::new(),
             const_ints: HashMap::new(),
             par_depth: 0,
+            let_hint: None,
         }
     }
 

@@ -92,6 +92,18 @@ impl Checker {
                     for m in &s.methods {
                         let label = format!("{}.{}", s.name, m.name);
                         self.check_defaults_trailing(m, &label);
+                        // 方法自带 `self`（C 侧就是第一个参数 `S* _self`）。
+                        // 再写一遍会多出一个叫 self 的 int64_t 参数，
+                        // 调用点少传一个实参 —— clang 报的是
+                        // 「too few arguments」，离真正的错处很远。
+                        for p in &m.params {
+                            if p.name == "self" {
+                                self.error(format!(
+                                    "方法 {}.{} 的参数不能叫 'self'：接收者是隐式的",
+                                    s.name, m.name
+                                ));
+                            }
+                        }
                         // 运算符方法的签名在**定义处**校验一次。留到使用处
                         // 再报的话，错误指向 `a + b`，而不是写错的那个 fn。
                         if crate::ops::is_op_method(&m.name) {
@@ -239,11 +251,19 @@ impl Checker {
                 Type::List(inner) | Type::Array(inner, _) => {
                     Ty::Array(Box::new(self.ty_from_ast(Some(inner))))
                 }
-                // Vec[T] 走 Generic 形状，见 ast::vec_elem_type
-                Type::Generic(..) => match vec_elem_type(t) {
-                    Some(inner) => Ty::Vec(Box::new(self.ty_from_ast(Some(inner)))),
-                    None => Ty::Unknown,
-                },
+                // Vec[T] / Map[K, V] 都走 Generic 形状
+                Type::Generic(..) => {
+                    if let Some((k, v)) = map_kv_types(t) {
+                        return Ty::Map(
+                            Box::new(self.ty_from_ast(Some(k))),
+                            Box::new(self.ty_from_ast(Some(v))),
+                        );
+                    }
+                    match vec_elem_type(t) {
+                        Some(inner) => Ty::Vec(Box::new(self.ty_from_ast(Some(inner)))),
+                        None => Ty::Unknown,
+                    }
+                }
                 // T? / T! 合并成同一种可空类型（见 Ty::Optional 注释）
                 Type::Optional(inner) | Type::Error(inner) => {
                     Ty::Optional(Box::new(self.ty_from_ast(Some(inner))))

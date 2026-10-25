@@ -59,6 +59,28 @@ pub struct Codegen {
     pub(crate) fn_vec_elems: HashMap<String, String>,
     /// (结构体名, 方法名) → 返回的 Vec 的元素 C 类型（`let v = obj.parse()`）
     pub(crate) method_vec_elems: HashMap<(String, String), String>,
+    // ── 哈希表 Map[K, V] ──
+    // 和 Vec 一样：C 类型恒为 `LumeMap*`，K/V 只记在下面四张表里。
+    // 存的是 (键的 C 类型, 值的 C 类型)；键是不是 str 由 `== "const char*"`
+    // 现算 —— runtime 的 kstr 标志位只影响比较走 strcmp 还是 memcmp。
+    /// 变量名 → (K, V)
+    pub(crate) map_kvs: HashMap<String, (String, String)>,
+    /// (结构体名, 字段名) → (K, V)
+    pub(crate) map_field_kvs: HashMap<(String, String), (String, String)>,
+    /// 函数名 → (K, V)
+    pub(crate) fn_map_kvs: HashMap<String, (String, String)>,
+    /// (结构体名, 方法名) → (K, V)
+    pub(crate) method_map_kvs: HashMap<(String, String), (String, String)>,
+    /// 每个 struct 定义结束时的字节偏移。装它的可空 typedef 要插在那之后
+    /// （C 的 struct 成员要完整类型）。
+    pub(crate) struct_end_pos: HashMap<String, usize>,
+    /// 当前函数/方法返回 Map 时的 (K, V)。`return {}` 这种空字面量要用。
+    pub(crate) cur_ret_map_kv: Option<(String, String)>,
+    /// Map 临时变量编号。键/值实参没有地址，得落进临时变量再取址。
+    pub(crate) map_counter: usize,
+    /// 正在生成的 `let` 的声明 K/V。`e: Map[str, int] = {}` 的 `{}`
+    /// 自身推不出 K/V，得看左边 —— 和 checker 的 let_hint 同理。
+    pub(crate) cur_let_map_kv: Option<(String, String)>,
     /// 当前函数的返回类型是 Vec 时的元素 C 类型。`return []` 要据此
     /// 建一个空 Vec，`return v` 则直接返回句柄。
     pub(crate) cur_ret_vec_elem: Option<String>,
@@ -170,6 +192,14 @@ impl Codegen {
             vec_field_elems: HashMap::new(),
             fn_vec_elems: HashMap::new(),
             method_vec_elems: HashMap::new(),
+            map_kvs: HashMap::new(),
+            map_field_kvs: HashMap::new(),
+            fn_map_kvs: HashMap::new(),
+            method_map_kvs: HashMap::new(),
+            cur_ret_map_kv: None,
+            struct_end_pos: HashMap::new(),
+            map_counter: 0,
+            cur_let_map_kv: None,
             cur_ret_vec_elem: None,
             cur_self_struct: None,
             cur_field_names: Vec::new(),
@@ -306,6 +336,11 @@ impl Codegen {
                         self.vec_field_elems
                             .insert((s.name.clone(), f.name.clone()), c);
                     }
+                    if let Some((k, v)) = map_kv_types(&f.ty) {
+                        let kv = (self.gen_type(k), self.gen_type(v));
+                        self.map_field_kvs
+                            .insert((s.name.clone(), f.name.clone()), kv);
+                    }
                 }
                 // 按出现顺序分配类型标签
                 self.struct_tags.insert(s.name.clone(), tag_counter);
@@ -323,6 +358,11 @@ impl Codegen {
                         let c = self.gen_type(elem);
                         self.method_vec_elems
                             .insert((s.name.clone(), m.name.clone()), c);
+                    }
+                    if let Some((k, v)) = m.ret.as_ref().and_then(map_kv_types) {
+                        let kv = (self.gen_type(k), self.gen_type(v));
+                        self.method_map_kvs
+                            .insert((s.name.clone(), m.name.clone()), kv);
                     }
                     self.method_array_params.insert(
                         (s.name.clone(), m.name.clone()),
@@ -392,6 +432,12 @@ impl Codegen {
                     let c = self.gen_type(elem);
                     self.fn_vec_elems.insert(f.name.clone(), c);
                 }
+                if let Some((k, v)) = f.ret.as_ref().and_then(map_kv_types) {
+                    let kv = (self.gen_type(k), self.gen_type(v));
+                    self.fn_map_kvs.insert(f.name.clone(), kv);
+                }
+                // 参数是 Map[K, V] 的登记放在 gen_fn（进函数作用域时），
+                // 和 Vec 一样 —— map_kvs 每次进函数都会被清空。
             }
         }
 
@@ -461,6 +507,9 @@ impl Codegen {
                     .all(|d| !all_structs.contains(d.as_str()) || emitted.contains(d) || *d == s.name);
                 if ready {
                     self.gen_struct_decl(s);
+                    // 记下这个 struct 定义结束的位置：装它的可空 typedef
+                    // 必须插在它**后面**（成员要完整类型）。
+                    self.struct_end_pos.insert(s.name.clone(), self.output.len());
                     emitted.insert(s.name.clone());
                     progressed = true;
                 } else {
@@ -473,6 +522,7 @@ impl Codegen {
                 // 比在这里静默丢定义好。
                 for s in deferred {
                     self.gen_struct_decl(s);
+                    self.struct_end_pos.insert(s.name.clone(), self.output.len());
                 }
                 break;
             }
@@ -573,17 +623,29 @@ impl Codegen {
         }
 
         let mut out = std::mem::take(&mut self.output);
+
+        // 三批要回填的内容（par 的 args 结构体、可空 typedef 的两种）。
+        // 位置是生成途中记下的字节偏移，插前面的会把后面的顶偏，
+        // 所以统一按位置**从大到小**插 —— 位置互不影响。
+        let mut inserts: Vec<(usize, String)> = Vec::new();
         // par for 的 args 结构体 + worker 声明必须早于方法/函数定义；
         // worker **定义**则要等所有函数原型（含 @cache 包装器、泛型单态化）
         // 都发完之后再追加 —— 否则 worker 里调用它们会变成隐式声明。
         if !self.par_structs.is_empty() || !self.par_worker_decls.is_empty() {
-            out.insert_str(
+            inserts.push((
                 worker_pos,
-                &format!("{}{}", self.par_structs, self.par_worker_decls),
-            );
+                format!("{}{}", self.par_structs, self.par_worker_decls),
+            ));
         }
-        // 可空 typedef 必须早于所有使用点（struct 字段/函数原型）
-        out.insert_str(opt_pos, &self.gen_opt_typedefs());
+        // 可空 typedef：基础类型的插在最前面，装结构体的插到那个 struct
+        // 的定义之后（见 gen_opt_typedefs 的说明）。
+        let (opt_early, opt_late) = self.gen_opt_typedefs();
+        inserts.extend(opt_late);
+        inserts.push((opt_pos, opt_early));
+        inserts.sort_by(|a, b| b.0.cmp(&a.0));
+        for (pos, text) in inserts {
+            out.insert_str(pos, &text);
+        }
         if !self.par_workers.is_empty() {
             out.push('\n');
             out.push_str(&self.par_workers);
@@ -617,7 +679,15 @@ impl Codegen {
     }
 
     /// 发出本次用到的全部 lume_opt_N 定义。
-    fn gen_opt_typedefs(&self) -> String {
+    ///
+    /// 返回 `(早发的一批, 要插到某个 struct 后面的一批)`。
+    ///
+    /// **装结构体的可空值必须排在被装的结构体之后**：C 的 struct 成员要
+    /// 完整类型，`typedef struct { int8_t has; P val; } lume_opt_0;` 放在
+    /// `P` 的定义前面就是 unknown type name。反过来，字段是 `P?` 的 struct
+    /// 又要排在 `lume_opt_0` 后面 —— 两个顺序都要满足，只能按依赖关系
+    /// 逐个插（struct 本身已经有拓扑排序，见第 3 步）。
+    fn gen_opt_typedefs(&self) -> (String, Vec<(usize, String)>) {
         // 按 tag 的编号排序，保证输出稳定（HashMap 迭代序随机）
         let mut pairs: Vec<(String, String)> = self
             .opt_elems
@@ -629,22 +699,37 @@ impl Codegen {
             .map(|(tag, elem)| (tag.clone(), elem.clone()))
             .collect();
         if pairs.is_empty() {
-            return String::new();
+            return (String::new(), Vec::new());
         }
         pairs.sort_by(|a, b| {
             let na: usize = a.0.trim_start_matches("lume_opt_").parse().unwrap_or(0);
             let nb: usize = b.0.trim_start_matches("lume_opt_").parse().unwrap_or(0);
             na.cmp(&nb)
         });
-        let mut s = String::from("/* ---- 可空类型 (T? / T!) ---- */\n");
+        let mut early = String::from("/* ---- 可空类型 (T? / T!) ---- */\n");
+        let mut late: Vec<(usize, String)> = Vec::new();
+        let mut early_any = false;
         for (tag, elem) in pairs {
-            s.push_str(&format!(
+            let line = format!(
                 "typedef struct {{ int8_t has; {} val; }} {};\n",
                 elem, tag
-            ));
+            );
+            match self.struct_end_pos.get(&elem) {
+                Some(&pos) => late.push((pos, line)),
+                None => {
+                    early.push_str(&line);
+                    early_any = true;
+                }
+            }
         }
-        s.push('\n');
-        s
+        // 从后往前插，前面的位置才不会被顶偏
+        late.sort_by(|a, b| b.0.cmp(&a.0));
+        if early_any {
+            early.push('\n');
+        } else {
+            early.clear();
+        }
+        (early, late)
     }
 
     pub fn generate_precompute_program(
@@ -724,7 +809,9 @@ impl Codegen {
         self.array_params.clear();
         self.owned_arrays.clear();
         self.vec_elems.clear();
+        self.map_kvs.clear();
         self.cur_self_struct = None;
+        self.cur_ret_map_kv = None;
         self.cur_field_names.clear();
     }
 

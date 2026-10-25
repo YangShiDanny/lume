@@ -84,6 +84,9 @@ impl Codegen {
             // Vec[T] → 统一是 `LumeVec*`。元素类型不进 C 类型：
             // C 没有泛型，元素大小存在句柄的 esz 里（见 runtime 的 LumeVec）。
             Type::Generic(..) if vec_elem_type(t).is_some() => "LumeVec*".to_string(),
+            // Map[K, V] → 统一是 `LumeMap*`。和 Vec 同理：键值大小存在
+            // 句柄的 ksz / vsz 里，K/V 本身只记在编译器侧的四张表里。
+            Type::Generic(..) if map_kv_types(t).is_some() => "LumeMap*".to_string(),
             // T? / T! 合并成同一种可空类型（见 checker Ty::Optional）
             Type::Optional(inner) | Type::Error(inner) => {
                 let elem = self.gen_type(inner);
@@ -126,6 +129,9 @@ impl Codegen {
                 }
             }
             Expr::Repeat(value, _) => self.infer_type(value),
+            // `Map[str, int]()` 和 `{"a": 1}` 的 C 类型都是句柄 `LumeMap*`。
+            // K/V 不进 C 类型（存在句柄里的 ksz / vsz），走 inferred_map_kv。
+            Expr::MapNew(..) | Expr::Map(_) => "LumeMap*".to_string(),
             // 比较 / 逻辑 → bool；算术 → 看操作数，不能一律 int64_t
             Expr::Binary(l, op, r) => match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt |
@@ -281,6 +287,31 @@ impl Codegen {
                     }
                 }
 
+                // Map 的方法。get 返回可空值，keys/values 返回 Vec[K]/Vec[V]
+                // —— 不在这里给出 opt tag，`.has` / `.val` 就认不出它是可空的。
+                if let Expr::Field(obj, method) = callee.as_ref() {
+                    if self.infer_type(obj) == "LumeMap*" {
+                        if let Some((k, v)) = self.inferred_map_kv(obj) {
+                            return match method.as_str() {
+                                "len" | "length" => "int64_t".to_string(),
+                                "is_empty" | "has" | "del" => "bool".to_string(),
+                                "get" => self.opt_tag(&v),
+                                "keys" | "values" | "set" | "clear" | "free" => {
+                                    // 这些的 C 类型不参与表达式推断
+                                    // （keys/values 是 LumeVec*，set 是 void）
+                                    let _ = k;
+                                    if matches!(method.as_str(), "keys" | "values") {
+                                        "LumeVec*".to_string()
+                                    } else {
+                                        "void".to_string()
+                                    }
+                                }
+                                _ => "int64_t".to_string(),
+                            };
+                        }
+                    }
+                }
+
                 // 泛型调用：按返回类型推断
                 if let Expr::Ident(fname) = callee.as_ref() {
                     if let Some(gf) = self.generic_fns.get(fname) {
@@ -369,8 +400,53 @@ impl Codegen {
             Expr::Call(callee, _) => match callee.as_ref() {
                 Expr::Ident(fname) => self.fn_vec_elems.get(fname).cloned(),
                 Expr::Field(obj, m) => {
+                    // `m.keys()` / `m.values()`：元素类型是接收者的 K / V。
+                    // 不能像普通方法那样登记进 method_vec_elems —— 同一个
+                    // 名字在每个 Map[K, V] 上结果都不同。
+                    if let Some((k, v)) = self.inferred_map_kv(obj) {
+                        if m == "keys" {
+                            return Some(k);
+                        }
+                        if m == "values" {
+                            return Some(v);
+                        }
+                    }
                     let sname = self.infer_type(obj);
                     self.method_vec_elems.get(&(sname, m.clone())).cloned()
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// 表达式如果是 Map[K, V]（的句柄），返回 (K 的 C 类型, V 的 C 类型)。
+    ///
+    /// 和 `inferred_vec_elem` 完全对称：C 类型恒为 `LumeMap*`，K/V 只记在
+    /// 编译器的四张表里。**新增「产生 Map 的表达式」时必须登记**，否则
+    /// `m.get(...)` 会报「无法推断 Map 的键值类型」。
+    pub(crate) fn inferred_map_kv(&self, e: &Expr) -> Option<(String, String)> {
+        match e {
+            Expr::Ident(n) => self.map_kvs.get(n).cloned().or_else(|| {
+                // 方法体里的裸字段名
+                let sname = self.cur_self_struct.as_ref()?;
+                self.map_field_kvs
+                    .get(&(sname.clone(), n.clone()))
+                    .cloned()
+            }),
+            Expr::Field(base, fname) => {
+                let sname = match base.as_ref() {
+                    Expr::Ident(b) if b == "self" => self.cur_self_struct.clone(),
+                    Expr::Ident(b) => self.var_types.get(b).cloned(),
+                    _ => None,
+                }?;
+                self.map_field_kvs.get(&(sname, fname.clone())).cloned()
+            }
+            Expr::Call(callee, _) => match callee.as_ref() {
+                Expr::Ident(fname) => self.fn_map_kvs.get(fname).cloned(),
+                Expr::Field(obj, m) => {
+                    let sname = self.infer_type(obj);
+                    self.method_map_kvs.get(&(sname, m.clone())).cloned()
                 }
                 _ => None,
             },
@@ -418,17 +494,13 @@ pub(crate) fn collect_struct_deps(t: &Type, out: &mut Vec<String>) {
         Type::Named(n) => out.push(n.clone()),
         Type::List(i) | Type::Optional(i) | Type::Error(i) => collect_struct_deps(i, out),
         Type::Array(i, _) => collect_struct_deps(i, out),
-        Type::Map(k, v) => {
-            collect_struct_deps(k, out);
-            collect_struct_deps(v, out);
-        }
         Type::Tuple(v) => {
             for x in v {
                 collect_struct_deps(x, out);
             }
         }
-        Type::Generic(base, args) => {
-            collect_struct_deps(base, out);
+        // Vec[T] / Map[K, V]：跳过容器名本身（不是用户 struct），只收类型参数
+        Type::Generic(_, args) => {
             for a in args {
                 collect_struct_deps(a, out);
             }

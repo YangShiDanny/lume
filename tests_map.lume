@@ -1,0 +1,212 @@
+// Map[K, V] —— 自举第 7 块地基
+//
+// C 侧只有一个句柄 LumeMap*，键值大小存在句柄里（ksz / vsz），
+// K/V 本身只记在编译器侧 —— 和 Vec 的 LumeVec* 是同一套思路。
+
+struct P {
+    x: int
+    y: int
+}
+
+struct Bag {
+    counts: Map[str, int]
+    fn add(k: str) {
+        c := counts.get(k)
+        n := 0
+        if c.has {
+            n = c.val
+        }
+        counts.set(k, n + 1)
+    }
+    fn total() -> int {
+        t := 0
+        vs := counts.values()
+        for i in 0 .. vs.len() {
+            t = t + vs[i]
+        }
+        return t
+    }
+}
+
+/// 返回的 Map 会被调用点登记成 Map[int, int]
+fn make_pairs() -> Map[int, int] {
+    m := Map[int, int]()
+    m.set(10, 100)
+    m.set(20, 200)
+    return m
+}
+
+/// Map 是引用语义：传进函数改的就是外面那张表
+fn bump(m: Map[str, int], k: str) {
+    c := m.get(k)
+    n := 0
+    if c.has {
+        n = c.val
+    }
+    m.set(k, n + 10)
+}
+
+/// 值遍历。参数上的 K/V 由 fn 的签名登记（gen_fn 里记进 map_kvs）
+fn sum_all(m: Map[str, int]) -> int {
+    t := 0
+    for v in m.values() {
+        t = t + v
+    }
+    return t
+}
+
+/// 插入排序：keys() / values() 的顺序是桶顺序（哈希决定），
+/// 要稳定输出就得自己排。
+fn sort_strs(v: Vec[str]) {
+    n := v.len()
+    for i in 0 .. n {
+        j := i + 1
+        while j < n {
+            if v[j] < v[i] {
+                tmp := v[i]
+                v[i] = v[j]
+                v[j] = tmp
+            }
+            j = j + 1
+        }
+    }
+}
+
+fn main() {
+    // ── 1. 字面量 ──
+    m := {"banana": 2, "apple": 5, "cherry": 1}
+    say("[1] len = {m.len()}   期望 3")
+    say("[2] is_empty = {m.is_empty()}   期望 0")
+    say("[3] has(apple) = {m.has("apple")}   期望 1")
+    say("[4] has(durian) = {m.has("durian")}   期望 0")
+
+    // ── 2. get 返回 V?，必须先看 .has ──
+    a := m.get("apple")
+    say("[5] apple = {a.val}   期望 5")
+    say("[6] apple.has = {a.has}   期望 1")
+    miss := m.get("durian")
+    say("[7] durian.has = {miss.has}   期望 0")
+    say("[8] 未命中时 .val = {miss.val}   期望 0（零初始化，不是垃圾）")
+
+    // ── 3. set 新建 + 覆盖 ──
+    m.set("durian", 7)
+    say("[9] 加 durian 后 len = {m.len()}   期望 4")
+    m.set("apple", 9)
+    say("[10] 覆盖 apple = {m.get("apple").val}   期望 9")
+    say("[11] 覆盖不改长度 len = {m.len()}   期望 4")
+
+    // ── 4. del ──
+    say("[12] del(apple) = {m.del("apple")}   期望 1")
+    say("[13] 再 del(apple) = {m.del("apple")}   期望 0")
+    say("[14] del 后 len = {m.len()}   期望 3")
+    say("[15] del 后 apple.has = {m.get("apple").has}   期望 0")
+    // 删掉再放回来：墓碑不挡插入
+    m.set("apple", 5)
+    say("[16] 复活 apple = {m.get("apple").val}   期望 5")
+
+    // ── 5. keys / values ──
+    vs := m.values()
+    tot := 0
+    for i in 0 .. vs.len() {
+        tot = tot + vs[i]
+    }
+    say("[17] 值之和 = {tot}   期望 15（2+1+7+5）")
+    ks := m.keys()
+    sort_strs(ks)
+    say("[18] 排序后 keys = {ks[0]},{ks[1]},{ks[2]},{ks[3]}   期望 apple,banana,cherry,durian")
+
+    // ── 6. int 键 ──
+    c := make_pairs()
+    say("[19] c.len = {c.len()}   期望 2")
+    say("[20] c.get(10) = {c.get(10).val}   期望 100")
+    say("[21] c.has(30) = {c.has(30)}   期望 0")
+    c.set(30, 300)
+    say("[22] 加 30 后 len = {c.len()}   期望 3")
+    say("[23] c.del(10) = {c.del(10)}   期望 1")
+
+    // ── 7. 声明类型建空表 ──
+    e: Map[str, int] = {}
+    say("[24] 空表 len = {e.len()}   期望 0")
+    say("[25] 空表 is_empty = {e.is_empty()}   期望 1")
+    e.set("k", 1)
+    say("[26] 空表加一项 len = {e.len()}   期望 1")
+
+    // ── 8. 结构体做值 ──
+    ps := Map[str, P]()
+    ps.set("a", P(x: 1, y: 2))
+    ps.set("b", P(x: 3, y: 4))
+    g := ps.get("a")
+    say("[27] a = ({g.val.x},{g.val.y})   期望 (1,2)")
+    say("[28] ps.len = {ps.len()}   期望 2")
+
+    // ── 9. 结构体字段 ──
+    b := Bag(counts: Map[str, int]())
+    b.add("x")
+    b.add("x")
+    b.add("y")
+    say("[29] b.total = {b.total()}   期望 3")
+    say("[30] b.counts.len = {b.counts.len()}   期望 2")
+    say("[31] x 的次数 = {b.counts.get("x").val}   期望 2")
+    // 方法体里直接拿字段当接收者
+    say("[32] 字段上 has(z) = {b.counts.has("z")}   期望 0")
+
+    // ── 10. 字符串值 / bool 值 ──
+    d := {"cn": "中国", "en": "hi"}
+    say("[33] d[cn] = {d.get("cn").val}   期望 中国")
+    flags := Map[str, bool]()
+    flags.set("v", true)
+    say("[34] flags[v] = {flags.get("v").val}   期望 1")
+    say("[35] flags[缺失] = {flags.get("w").val}   期望 0")
+
+    // ── 11. clear / free ──
+    ps.clear()
+    say("[36] clear 后 len = {ps.len()}   期望 0")
+    say("[37] clear 后 is_empty = {ps.is_empty()}   期望 1")
+    ps.set("z", P(x: 9, y: 9))
+    say("[38] clear 后还能装 = {ps.len()}   期望 1")
+    free(ps)
+    say("[39] free 之后程序还活着")
+
+    // ── 12. 大一点的规模：词频 ──
+    words := ["a", "b", "a", "c", "b", "a", "d"]
+    f := Map[str, int]()
+    for i in 0 .. words.len() {
+        w := words[i]
+        cur := f.get(w)
+        n := 0
+        if cur.has {
+            n = cur.val
+        }
+        f.set(w, n + 1)
+    }
+    say("[40] 词表 len = {f.len()}   期望 4")
+    say("[41] a 出现 = {f.get("a").val}   期望 3")
+    say("[42] b 出现 = {f.get("b").val}   期望 2")
+    say("[43] d 出现 = {f.get("d").val}   期望 1")
+
+    // ── 13. 遍历与并行读 ──
+    // keys() 的顺序是桶顺序，逐个取回值再求和，与顺序无关
+    sum := 0
+    for w in f.keys() {
+        sum = sum + f.get(w).val
+    }
+    say("[44] 遍历 keys 求和 = {sum}   期望 7")
+
+    // par for 里能读（并发改表被 checker 挡着，读是安全的）。
+    // worker 拿到的是 _p->f，和外层的同一个句柄。
+    keys2 := f.keys()
+    psum := 0
+    par for i in 0 .. keys2.len() {
+        psum = psum + f.get(keys2[i]).val
+    }
+    say("[45] par for 读求和 = {psum}   期望 7")
+
+    // ── 14. 传进函数：改的是外面那张表 ──
+    mp := Map[str, int]()
+    bump(mp, "a")
+    bump(mp, "a")
+    bump(mp, "b")
+    say("[46] 传参后 len = {mp.len()}   期望 2")
+    say("[47] 传参后 a = {mp.get("a").val}   期望 20")
+    say("[48] sum_all = {sum_all(mp)}   期望 30")
+}

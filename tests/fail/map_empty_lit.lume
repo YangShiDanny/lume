@@ -1,0 +1,5 @@
+// expect: 看不出键类型
+fn main() {
+    m := {}
+    say(m.len())
+}

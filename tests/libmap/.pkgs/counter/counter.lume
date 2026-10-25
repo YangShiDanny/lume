@@ -1,0 +1,44 @@
+// 用 Map 做词频统计的包。跨包要点：
+//
+// - `Map[str, int]` 出现在**函数签名里**，所以包自己要 import 提供
+//   Map 的东西……其实什么都要不 import：Map 是语言内置的，`Map`
+//   这个名字不进库的符号表。
+// - 但 Counter 的方法体要调 `count_all`，而 count_all 用到了 words 包
+//   的东西吗？没有。真正跨包的是 main 那边先拿到 Vec[str]。
+import words
+
+struct Counter {
+    n: Map[str, int]
+    fn add(w: str) {
+        c := n.get(w)
+        k := 0
+        if c.has {
+            k = c.val
+        }
+        n.set(w, k + 1)
+    }
+    fn of(w: str) -> int {
+        c := n.get(w)
+        if c.has {
+            return c.val
+        }
+        return 0
+    }
+    fn size() -> int {
+        return n.len()
+    }
+}
+
+/// 结构体字面量里给 Map 字段一个空句柄
+fn new_counter() -> Counter {
+    return Counter(n: Map[str, int]())
+}
+
+/// 遍历 Vec 时逐个累加。这里的 K/V 全靠函数签名登记的 map_kvs
+fn count_all(ws: Vec[str]) -> Counter {
+    c := new_counter()
+    for w in ws {
+        c.add(w)
+    }
+    return c
+}

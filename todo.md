@@ -367,8 +367,52 @@
 | 4 | 命令行参数 + `exit` | ✅ 已完成（2026-10-25） |
 | 5 | 动态数组 `Vec`（token 流长度不可预知） | ✅ 已完成（2026-10-25） |
 | 6 | 枚举（`TokenKind` 几十种，现在只能用 int 常量硬凑） | ✅ 已完成（2026-10-25） |
-| 7 | map / 集合（符号表要哈希表） | ⬜ |
+| 7 | map / 集合（符号表要哈希表） | ✅ 已完成（2026-10-25） |
 | 8 | `extern` FFI（真正去调 clang） | ✅ 已完成（2026-10-25） |
+
+**八块地基全部就位** —— 自举本身的障碍只剩写代码了。`lume.lume` 可以把
+`read_file` 读源、`Vec[Token]` 装 token、`Map[str, int]` 做符号表、
+`extern system("clang ...")` 交出去编译。
+
+第 7 条的落地形态（2026-10-25）：
+
+- 语法：`Map[K, V]()` 建空表 + `{"a": 1}` 字面量。K/V 只记在编译器侧的
+  四张表里（变量 / struct 字段 / 函数返回 / 方法返回），C 侧只有一个
+  `LumeMap` 句柄（`state`/`keys`/`vals`/`cap`/`len`/`dead`/`ksz`/`vsz`）——
+  和 `Vec` 的 `LumeVec` 同一套路，不随 K/V 组合膨胀代码。
+- 开地址法 + 墓碑（删掉留标记，否则探测链会断），负载 3/4 翻倍 rehash。
+  `str` 键 dup 一份存进表（runtime free），其它键按 ksz 字节 memcpy。
+- 方法：len / is_empty / get / set / has / del / keys / values / clear / free。
+  `get` 返回 `V?`，没命中时 `val` 零初始化 —— 不给垃圾。
+- **没有 `m[k]` 下标**：`get` 返回 `V?`，下标又要能当左值，凑不出清晰语义。
+- `par for` 里只能读（并发改表是数据竞争），写入在 checker 拒绝。
+  这条顺带暴露了 `gen_par_expr` 缺 `.val` / `.has` 分支 —— 它会掉进
+  `gen_expr`，生成的 C 引用 worker 里不存在的变量名。
+- 验收：`tests_map.lume`（48 项，含词频统计 / par for 只读 / 传参）、
+  `tests/libmap`（跨包：项目 → counter → words）、
+  负向 `fail/map_bad_key`、`map_key_type`、`map_bad_method`、`map_set_arity`、
+  `map_par_write`、`map_print`、`map_interp`、`map_empty_lit`。
+
+做第 7 条时顺手修的真 bug（都是自己撞出来的，不是猜的）：
+
+- **可空 typedef 的发射顺序**：`typedef struct { int8_t has; P val; } lume_opt_0;`
+  必须排在 `P` 的定义之后（C 的成员要完整类型），但字段是 `P?` 的 struct
+  又要排在它之后。原来一律插在文件最前面，于是「可空结构体」根本用不了 ——
+  不是 Map 引入的，只是 Map[str, P] 让它无处可躲。现在按位置插：基础类型
+  的插最前面，装结构体的插到那个 struct 定义之后；三批回填统一按位置
+  从大到小插，避免互相顶偏。
+- **`None` 在四个位置都拿到错的 tag**：`let`/`return` 早有处理，但
+  struct 字面量字段（`Holder(p: None)`）、函数实参（`f(None)`）没有。
+  另外 `None` 一律生成 `{0, 0}` —— 值是结构体时第二个 0 初始化不了它。
+  统一改成 `{0}`（C 的聚合初始化会把剩下的全零初始化）。checker 那边
+  也要放行：`None` 的类型是 `??`，传给 `T?` 参数时会被当成类型不匹配。
+- **`for w in f.keys()` 走不通**：`for x in <expr>` 只认字面量和变量，
+  其它表达式一律输出 `/* for: 暂不支持 */`（还漏了闭合的大括号）。
+  现在把可迭代对象先落到临时变量再遍历 —— 顺带避免每轮都调一次
+  `keys()`（它每次都新建 Vec）。
+- **方法的参数不能叫 `self`**：写 `fn add(self, k: str)` 会多出一个
+  `int64_t self` 参数，调用点少传一个实参，clang 报
+  「too few arguments」——离真正的错处很远。现在 checker 直接报。
 
 **为什么第 2 条排在 IO 前面**：字符串现在没有所有权语义，
 `read_file` 返回的指针可能在后续 `str_trim` 之后失效。先做 IO 必然返工。

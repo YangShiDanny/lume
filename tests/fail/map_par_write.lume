@@ -1,0 +1,8 @@
+// expect: par for 里不能调用 Map.set()
+fn main() {
+    m := Map[str, int]()
+    par for i in 0 .. 4 {
+        m.set("x", i)
+    }
+    say(m.len())
+}

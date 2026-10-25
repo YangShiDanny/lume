@@ -1,0 +1,6 @@
+// expect: 按字节比较没有意义
+fn main() {
+    m := Map[Vec[int], int]()
+    v: Vec[int] = [1]
+    m.set(v, 1)
+}

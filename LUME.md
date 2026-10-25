@@ -137,6 +137,7 @@ lume run tool.lume -- --native        # 程序自己收到 --native
 | `#FF8800`         | int   | 必须是 6 位十六进制，生成 `0xFF8800` |
 | `true` / `false`  | bool  |                           |
 | `nothing`         | —     | 生成 C 的 `NULL`             |
+| `{"a": 1}`        | map   | 键值对字面量，K/V 从第一对推         |
 
 ### 关键字
 
@@ -155,6 +156,12 @@ app par async await spawn it
 
 `int i8 i16 i32 i64 u1 u2 u4 u8 u16 u32 u64 f32 f64 float bool str rune`
 
+### 不能拿来当变量名的类型名
+
+`Vec` 和 `Map`。它们不是关键字（词法上就是普通标识符），但类型位置和
+表达式位置都**优先按容器类型**解析 —— `Vec[int]` 里的 `int` 会被当类型
+而不是表达式。拿它们当变量名会得到莫名其妙的报错。
+
 ---
 
 ## 类型
@@ -171,10 +178,13 @@ app par async await spawn it
 | `str`               | `const char*`                    |                             |
 | `rune`              | `uint32_t`                       |                             |
 | 结构体名                | 同名                               |                             |
+| 枚举名                 | `int64_t` + `#define`             | 见「枚举」                        |
+| `Vec[T]`            | `LumeVec*`                       | 元素类型不进 C，见「动态数组」            |
+| `Map[K, V]`         | `LumeMap*`                       | K/V 不进 C，见「哈希表」              |
 | `[T]`               | `T*`                             | 列表                          |
 | `[T; N]`            | `T*`                             | ⚠ N 被解析但 codegen 忽略         |
-
-类型后缀 `T?`（Optional）、`T!`（Error）、`T[U]`（Generic）能解析，但 codegen 里落到 `void*` —— 未实现。
+| `T?` / `T!`         | `lume_opt_N` / `LumeOptStr`      | `{ int8_t has; T val; }`，两种后缀合并  |
+| `T[U]`（其它）          | 未实现                              | 只有 `Vec[T]` / `Map[K, V]` 认       |
 
 ---
 
@@ -847,6 +857,71 @@ fn main() {
 
 ---
 
+## 哈希表 `Map[K, V]`
+
+自举编译器要符号表，所以除了 `Vec[T]` 还有一个哈希表：
+
+```lume
+fn main() {
+    m := {"banana": 2, "apple": 5}      // 字面量，K/V 从第一对推
+    m.set("cherry", 1)                  // 插入/覆盖
+    say("{m.len()}")                    // 3
+
+    a := m.get("apple")                 // 返回 int?（可空）
+    if a.has {
+        say("{a.val}")                  // 5
+    }
+    say("{m.has("durian")}")            // false：不建条目
+
+    m.del("apple")
+    say("{m.len()}")                    // 2
+
+    for k in m.keys() {                 // 遍历键（顺序由哈希决定）
+        say("{k} = {m.get(k).val}")
+    }
+}
+```
+
+方法：
+
+| 方法 | 返回 | 说明 |
+|---|---|---|
+| `m.len()` | int | 条目数 |
+| `m.is_empty()` | bool | `len == 0` |
+| `m.get(k)` | `V?` | 查表；没命中 `has == 0`，`val` 零初始化 |
+| `m.set(k, v)` | void | 插入或覆盖 |
+| `m.has(k)` | bool | 只查，不建条目 |
+| `m.del(k)` | bool | 删除；不存在返回 false |
+| `m.keys()` | `Vec[K]` | 键的快照 |
+| `m.values()` | `Vec[V]` | 值的快照 |
+| `m.clear()` | void | 清空，保留桶数组 |
+| `m.free()` | void | 释放全部内存（含 str 键的副本） |
+
+规则：
+
+- **空的 `{}` 要写明类型**：`m: Map[str, int] = {}`——`{}` 自身推不出 K/V。
+  不写就直接用 `Map[str, int]()`，它自带类型。
+- **没有 `m[k]` 下标**：取值得写 `m.get(k).val`。因为 `get` 返回的是 `V?`，
+  直接下标就得处理「键不存在时返回什么」，而下标又要能当左值 —— 两者凑
+  在一起会生成说不清语义的 C。
+- **键只支持 `int` / `str` / `bool` / `rune` / 枚举**。其它类型（尤其是
+  `Vec` / `Map` / 数组）按字节比较没有意义，编译期直接拒绝。结构体键能用，
+  但里面有指针字段的话 `memcmp` 比的是地址。
+- `str` 键会被 **dup 一份**存进表里（runtime 负责 free）；其它键按字节
+  memcpy。所以 `m.set(k, v)` 之后改原来的字符串不会影响表里的内容。
+- 和 `Vec` 一样是**引用**语义，传进函数改的是同一张表。
+- C 侧只有一个 `LumeMap` 句柄（`state`/`keys`/`vals`/`cap`/`len`/`ksz`/`vsz`），
+  键值大小存在句柄里，不随 K/V 组合膨胀代码。开地址法 + 墓碑，
+  负载超过 3/4 就翻倍 rehash。
+- `keys()` / `values()` 返回的是**新 Vec**（快照），改动它不影响表；
+  顺序是桶顺序，**不保证插入顺序**，要稳定输出就自己排。
+- `par for` 里**只能读**：`set/del/clear/free` 会被类型检查拒绝
+  （并发改表是数据竞争）。`get` / `has` / `len` 可以 —— 读共享表是安全的。
+- `say(m)` 和 `"{m}"` 会报编译错（句柄指针打出来是地址）。要打就
+  遍历 `.keys()`。
+
+---
+
 ## 泛型
 
 ```lume
@@ -1184,7 +1259,8 @@ fn main() {
 - 数组元素类型不一致
 - `let` 声明类型与初始值类型不符
 
-**不检查**：泛型函数体、`match` 穷尽性、数组越界。
+**不检查**：泛型函数体、数组越界（`Vec` 与已知长度的固定数组除外，那两个
+是运行期检查）。
 
 ---
 
@@ -1194,7 +1270,7 @@ fn main() {
 |---|---|
 | `trait` `impl` `async` `await` `spawn` `app` `use` `extern` | 能解析，未实现 |
 | `import 不存在的名字` | 项目里当软提示静默忽略；**库里**是硬依赖，找不到直接报错 |
-| 闭包捕获、`map` 类型 | 未实现 |
+| 闭包捕获 | 未实现 |
 | 带数据的枚举 `Num(int)` | 未实现：变体只能是无载荷的整数常量 |
 | `if t == 0`（枚举和整数混比） | 类型不同，编译期报错；写 `Tag.X` |
 | 枚举变体的值重复 | 编译期报错（C 里 `switch` 会出现 duplicate case） |
@@ -1222,6 +1298,13 @@ fn main() {
 | 结构体上 `a + b`（没定义 `op_add`） | 编译期报错，提示要写哪个 `op_*` |
 | 重载 `and` / `or` / `|>` | 这三个不走运算符重载 |
 | `let x := None` | 推断成 `int?`；要别的类型得写 `let x: str? = None` |
+| `m[k]`（Map 下标） | 不支持：`get` 返回 `V?`，下标又要能当左值，凑不出清晰语义。写 `m.get(k).val` |
+| `m := {}`（空字面量） | 推不出 K/V。写 `m: Map[str, int] = {}` 或 `Map[str, int]()` |
+| `Map[Vec[int], int]` 之类指针键 | 按字节比较没有意义，编译期拒绝 |
+| `say(m)` / `"{m}"` | 句柄指针打出来是地址，编译期拒绝；遍历 `.keys()` |
+| `par for` 里 `set` / `del` / `clear` / `free` | 编译期报错：并发改表是数据竞争（读可以） |
+| 指望 `keys()` 按插入顺序排列 | 顺序是桶顺序（哈希决定），要稳定就自己排 |
+| `x := 1` 之后又 `x := 2` | `:=` 一律新建变量，重名是 C 的 redefinition 错误；改值用 `x = 2` |
 | 变量名叫 `it` / `u8` / `scope` 之类 | 它们是关键字/类型关键字，报的是「期待表达式」，不好联想 |
 | 拿 `write_file` 当流式写 | 每次调用都是一次完整的 open/write/close，内容全在内存里 |
 | `extern fn` 里 `int` / `i32` 写混 | 编译器不查 ABI：`int` 返回 `int` 会被读成零扩展的大正数 |

@@ -309,6 +309,11 @@ impl Codegen {
             .as_ref()
             .and_then(vec_elem_type)
             .map(|e| self.gen_type(e));
+        self.cur_ret_map_kv = m
+            .ret
+            .as_ref()
+            .and_then(map_kv_types)
+            .map(|(k, v)| (self.gen_type(k), self.gen_type(v)));
 
         for p in &m.params {
             let ty = match &p.ty {
@@ -319,6 +324,11 @@ impl Codegen {
             if let Some(elem) = p.ty.as_ref().and_then(vec_elem_type) {
                 let c = self.gen_type(elem);
                 self.vec_elems.insert(p.name.clone(), c);
+            }
+            // Map 参数：K/V 也要登记，否则 `m.get(k)` 不知道按什么类型取
+            if let Some((k, v)) = p.ty.as_ref().and_then(map_kv_types) {
+                let kv = (self.gen_type(k), self.gen_type(v));
+                self.map_kvs.insert(p.name.clone(), kv);
             }
         }
         // 方法里的数组参数也要登记，否则 par for 认不出来
@@ -411,6 +421,11 @@ impl Codegen {
             .as_ref()
             .and_then(vec_elem_type)
             .map(|e| self.gen_type(e));
+        self.cur_ret_map_kv = f
+            .ret
+            .as_ref()
+            .and_then(map_kv_types)
+            .map(|(k, v)| (self.gen_type(k), self.gen_type(v)));
 
         for p in &f.params {
             let ty = match &p.ty {
@@ -423,6 +438,11 @@ impl Codegen {
             if let Some(elem) = p.ty.as_ref().and_then(vec_elem_type) {
                 let c = self.gen_type(elem);
                 self.vec_elems.insert(p.name.clone(), c);
+            }
+            // Map 参数同理：函数体里 m.set(k, v) 要知道 K/V 的 C 类型
+            if let Some((k, v)) = p.ty.as_ref().and_then(map_kv_types) {
+                let kv = (self.gen_type(k), self.gen_type(v));
+                self.map_kvs.insert(p.name.clone(), kv);
             }
         }
 

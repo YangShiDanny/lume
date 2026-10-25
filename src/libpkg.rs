@@ -450,17 +450,13 @@ fn collect_type_refs(t: &crate::ast::Type, out: &mut HashSet<String>) {
         }
         Type::List(i) | Type::Optional(i) | Type::Error(i) => collect_type_refs(i, out),
         Type::Array(i, _) => collect_type_refs(i, out),
-        Type::Map(k, v) => {
-            collect_type_refs(k, out);
-            collect_type_refs(v, out);
-        }
         Type::Tuple(v) => {
             for x in v {
                 collect_type_refs(x, out);
             }
         }
-        Type::Generic(base, args) => {
-            collect_type_refs(base, out);
+        // Vec[T] / Map[K, V]：容器名不是用户符号，只收类型参数
+        Type::Generic(_, args) => {
             for a in args {
                 collect_type_refs(a, out);
             }
@@ -572,6 +568,11 @@ fn collect_expr_refs(e: &Expr, out: &mut HashSet<String>) {
             }
         }
         Expr::Repeat(x, _) => collect_expr_refs(x, out),
+        // `Map[K, V]()` 里没有表达式，但 K / V 本身可能是本地 struct 名
+        Expr::MapNew(k, v) => {
+            collect_type_refs(k, out);
+            collect_type_refs(v, out);
+        }
         Expr::Range(a, b, _) => {
             collect_expr_refs(a, out);
             collect_expr_refs(b, out);

@@ -1,0 +1,28 @@
+fn word_list() -> Vec[str] {
+    v: Vec[str] = []
+    v.push("a")
+    v.push("b")
+    v.push("a")
+    v.push("c")
+    v.push("b")
+    v.push("a")
+    return v
+}
+
+/// 反向：把 Map 的键收上来排个序，跨包也要能用
+fn keys_sorted(m: Map[str, int]) -> Vec[str] {
+    ks := m.keys()
+    n := ks.len()
+    for i in 0 .. n {
+        j := i + 1
+        while j < n {
+            if ks[j] < ks[i] {
+                tmp := ks[i]
+                ks[i] = ks[j]
+                ks[j] = tmp
+            }
+            j = j + 1
+        }
+    }
+    return ks
+}

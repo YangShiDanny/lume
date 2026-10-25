@@ -81,6 +81,13 @@ impl Parser {
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
 
+        // `Map[K, V]()` 的括号：类型已经带在 MapNew 上了，这里只把 `()`
+        // 吃掉。不接受实参 —— map 没有字面量初始化形式（用 set 逐个填）。
+        if matches!(expr, Expr::MapNew(..)) && self.check(&TokenKind::LParen) {
+            self.advance();
+            self.expect(&TokenKind::RParen, "Map[K, V]() 不接受参数")?;
+        }
+
         loop {
             match self.peek() {
                 TokenKind::Dot => {
@@ -221,6 +228,51 @@ impl Parser {
             TokenKind::False => Ok(Expr::Bool(false)),
             TokenKind::Nothing => Ok(Expr::Nothing),
             TokenKind::It => Ok(Expr::It),
+
+            // map 字面量 `{"a": 1, "b": 2}`。
+            //
+            // `{` 在**表达式位置**是没歧义的：块只出现在 `fn` / `struct` /
+            // `if` / `while` / `for` / `match` 之后，那些地方各自直接吃
+            // 掉 `{`，绝不会走到 parse_primary。所以这里看到 `{` 就一定是
+            // map 字面量。空的 `{}` 也算（K/V 交给 checker 从用法推断，
+            // 推不出来就报「看不出键类型」）。
+            TokenKind::LBrace => {
+                let mut pairs = Vec::new();
+                self.skip_newlines();
+                if !self.check(&TokenKind::RBrace) {
+                    loop {
+                        self.skip_newlines();
+                        let k = self.parse_expr()?;
+                        self.expect(&TokenKind::Colon, "期待 :（写法是 {键: 值}）")?;
+                        let v = self.parse_expr()?;
+                        pairs.push((k, v));
+                        self.skip_newlines();
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.skip_newlines();
+                self.expect(&TokenKind::RBrace, "期待 }")?;
+                Ok(Expr::Map(pairs))
+            }
+
+            // `Map[K, V]()` —— 构造一个空 map。
+            //
+            // 必须抢在 `Expr::Ident` 之前：`Map` 后面跟的是**类型参数**，
+            // 交给 postfix 的索引分支会把 `str` 当表达式解析，直接报
+            // 「期待表达式」。整个语言里只有这一个「表达式位置的类型名」，
+            // 就地吃掉方括号是最省事的。代价：变量不能叫 `Map`。
+            TokenKind::Ident(name)
+                if name == "Map" && matches!(self.peek_at(0), TokenKind::LBracket) =>
+            {
+                self.expect(&TokenKind::LBracket, "期待 [")?;
+                let k = self.parse_type()?;
+                self.expect(&TokenKind::Comma, "期待 ,（写法是 Map[键类型, 值类型]）")?;
+                let v = self.parse_type()?;
+                self.expect(&TokenKind::RBracket, "期待 ]")?;
+                Ok(Expr::MapNew(Box::new(k), Box::new(v)))
+            }
 
             TokenKind::Ident(name) => Ok(Expr::Ident(name)),
 

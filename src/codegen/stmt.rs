@@ -3,7 +3,7 @@ use super::expr::bare_parens;
 use crate::ast::*;
 
 /// None 字面量：裸 `None` 或 `None()` 调用
-fn is_none_literal(e: &Expr) -> bool {
+pub(crate) fn is_none_literal(e: &Expr) -> bool {
     match e {
         Expr::Ident(n) => n == "None",
         Expr::Call(callee, args) => {
@@ -69,6 +69,29 @@ impl Codegen {
                     }
                 }
 
+                // ── Map[K, V] 声明（同样要抢在固定数组之前）──
+                // `m: Map[str, int] = {...}`：K/V 由声明给
+                if let Some((k, v)) = ty.as_ref().and_then(map_kv_types) {
+                    let kv = (self.gen_type(k), self.gen_type(v));
+                    // `{}` 这种空字面量要靠声明补 K/V，挂上再生成
+                    self.cur_let_map_kv = Some(kv.clone());
+                    self.gen_map_let(name, kv, init, None);
+                    self.cur_let_map_kv = None;
+                    return;
+                }
+                // `let m := {"a": 1}`：K/V 从第一对推
+                if ty.is_none() {
+                    if let Some(kv) = self.map_kv_of_lit(init) {
+                        self.gen_map_let(name, kv, init, None);
+                        return;
+                    }
+                    // `let m := counts()`：来源函数/方法的返回类型
+                    if let Some(kv) = self.inferred_map_kv(init) {
+                        self.gen_map_let(name, kv, init, None);
+                        return;
+                    }
+                }
+
                 if let Some((elem_ty, len)) =
                     self.gen_repeat_array_init(name, ty.as_ref(), init, None)
                 {
@@ -100,7 +123,7 @@ impl Codegen {
                 let value = if is_none_literal(init)
                     && matches!(ty, Some(Type::Optional(_)) | Some(Type::Error(_)))
                 {
-                    format!("({}){{0, 0}}", c_ty)
+                    Self::none_init(&c_ty)
                 } else {
                     self.gen_expr(init)
                 };
@@ -213,7 +236,7 @@ impl Codegen {
                     let s = if is_none_literal(e)
                         && self.is_opt_tag(&self.cur_ret_c)
                     {
-                        format!("({}){{0, 0}}", self.cur_ret_c)
+                        Self::none_init(&self.cur_ret_c)
                     } else {
                         self.gen_expr(e)
                     };
@@ -277,6 +300,29 @@ impl Codegen {
         self.push_line(&format!("LumeVec* {} = {};", name, v));
     }
 
+    /// `let m: Map[str, int] = {...}` / `let m := {"a": 1}` / `let m := f()`。
+    ///
+    /// 字面量的构造语句由 gen_expr 插进来（它自己知道 K/V），这里只负责
+    /// 把变量登记成 `LumeMap*` 并记下 K/V —— 之后 `m.get(...)` 才知道
+    /// 按什么类型取值。
+    pub(crate) fn gen_map_let(
+        &mut self,
+        name: &str,
+        kv: (String, String),
+        init: &Expr,
+        fields: Option<&[String]>,
+    ) {
+        self.var_types
+            .insert(name.to_string(), "LumeMap*".to_string());
+        self.map_kvs.insert(name.to_string(), kv);
+        self.owned_arrays.remove(name);
+        let v = match fields {
+            Some(f) => self.gen_expr_with_self(init, f),
+            None => self.gen_expr(init),
+        };
+        self.push_line(&format!("LumeMap* {} = {};", name, v));
+    }
+
     pub(crate) fn gen_stmt_with_self(&mut self, stmt: &Stmt, fields: &[String]) {
         match stmt {
             Stmt::Let { name, ty, init } => {
@@ -321,6 +367,25 @@ impl Codegen {
                     }
                 }
 
+                // ── Map[K, V] 声明（方法体内）──
+                if let Some((k, v)) = ty.as_ref().and_then(map_kv_types) {
+                    let kv = (self.gen_type(k), self.gen_type(v));
+                    self.cur_let_map_kv = Some(kv.clone());
+                    self.gen_map_let(name, kv, init, Some(fields));
+                    self.cur_let_map_kv = None;
+                    return;
+                }
+                if ty.is_none() {
+                    if let Some(kv) = self.map_kv_of_lit(init) {
+                        self.gen_map_let(name, kv, init, Some(fields));
+                        return;
+                    }
+                    if let Some(kv) = self.inferred_map_kv(init) {
+                        self.gen_map_let(name, kv, init, Some(fields));
+                        return;
+                    }
+                }
+
                 if let Some((elem_ty, len)) =
                     self.gen_repeat_array_init(name, ty.as_ref(), init, Some(fields))
                 {
@@ -352,7 +417,7 @@ impl Codegen {
                 let value = if is_none_literal(init)
                     && matches!(ty, Some(Type::Optional(_)) | Some(Type::Error(_)))
                 {
-                    format!("({}){{0, 0}}", c_ty)
+                    Self::none_init(&c_ty)
                 } else {
                     self.gen_expr_with_self(init, fields)
                 };
@@ -434,7 +499,7 @@ impl Codegen {
                     let s = if is_none_literal(e)
                         && self.is_opt_tag(&self.cur_ret_c)
                     {
-                        format!("({}){{0, 0}}", self.cur_ret_c)
+                        Self::none_init(&self.cur_ret_c)
                     } else {
                         self.gen_expr_with_self(e, fields)
                     };
@@ -658,7 +723,35 @@ impl Codegen {
                     ));
                 }
             }
-            _ => self.push_line("/* for: 暂不支持 */"),
+            // `for w in f.keys()` / `for x in make()`：可迭代对象不是变量。
+            // 先落到临时变量 —— 循环条件每轮都要读 `->len`，把表达式
+            // 直接塞进去会每轮都新建一个 Vec（keys() 每次都分配）。
+            _ => {
+                if let Some(elem_ty) = self.inferred_vec_elem(iter) {
+                    let code = match fopt {
+                        Some(f) => self.gen_expr_with_self(iter, f),
+                        None => self.gen_expr(iter),
+                    };
+                    self.vec_counter += 1;
+                    let tmp = format!("_lume_fv{}", self.vec_counter);
+                    self.push_line(&format!("LumeVec* {} = {};", tmp, code));
+                    let idx = format!("_i_{}", tmp);
+                    // 不打 vectorize 提示：Vec 可能装 str / 结构体
+                    self.push_line(&format!(
+                        "for (int64_t {} = 0; {} < ({})->len; {}++) {{",
+                        idx, idx, tmp, idx
+                    ));
+                    self.push_line(&format!(
+                        "{} {} = *(({}*)(({})->data) + {});",
+                        elem_ty, var, elem_ty, tmp, idx
+                    ));
+                    self.var_types.insert(var.to_string(), elem_ty);
+                } else {
+                    self.push_line(
+                        "/* for: 可迭代对象必须是 Vec 或数组（字面量 / 变量 / 切片）*/",
+                    );
+                }
+            }
         }
         self.gen_loop_body(body, fopt);
         self.push_line("}");

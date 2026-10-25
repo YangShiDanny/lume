@@ -110,7 +110,7 @@ impl Codegen {
             Expr::Ident(name) => {
                 if name == "None" {
                     let tag = self.opt_tag("int64_t");
-                    return format!("({}){{0, 0}}", tag);
+                    return Self::none_init(&tag);
                 }
                 // extern 函数的 C 标识符带前缀（见 c_fn_name）
                 self.c_fn_name(name)
@@ -218,7 +218,7 @@ impl Codegen {
                 let ec = self.gen_expr(e);
                 let ret = &self.cur_ret_c;
                 format!(
-                    "({{ __typeof__({}) _t = {}; if (!_t.has) {{ return ({}){{0, 0}}; }} _t.val; }})",
+                    "({{ __typeof__({}) _t = {}; if (!_t.has) {{ return ({}){{0}}; }} _t.val; }})",
                     ec, ec, ret
                 )
             }
@@ -252,11 +252,11 @@ impl Codegen {
                             return format!("(({}){{1, {}}})", tag, xc);
                         }
                         let tag = self.opt_tag("int64_t");
-                        return format!("({}){{0, 0}}", tag);
+                        return Self::none_init(&tag);
                     }
                     if name == "None" {
                         let tag = self.opt_tag("int64_t");
-                        return format!("({}){{0, 0}}", tag);
+                        return Self::none_init(&tag);
                     }
                 }
 
@@ -294,6 +294,13 @@ impl Codegen {
                 // Vec 的方法（push / pop / len / is_empty / clear / reserve / free）
                 if let Expr::Field(obj, method) = callee.as_ref() {
                     if let Some(c) = self.gen_vec_method(obj, method, args, None) {
+                        return c;
+                    }
+                }
+
+                // Map 的方法（get / set / has / del / keys / values / len ...）
+                if let Expr::Field(obj, method) = callee.as_ref() {
+                    if let Some(c) = self.gen_map_method(obj, method, args, None) {
                         return c;
                     }
                 }
@@ -436,6 +443,27 @@ impl Codegen {
                 format!("{{{}}}", vec![item; *count].join(", "))
             }
 
+            // `Map[str, int]()`：只建空表，条目靠 .set 逐个填
+            Expr::MapNew(k, v) => {
+                let kv = (self.gen_type(k), self.gen_type(v));
+                self.gen_map_new(&kv.0, &kv.1)
+            }
+
+            // `{"a": 1, "b": 2}`：建表 + 逐对 set。
+            // 空的 `{}` 自身没有 K/V，看 return 的类型或 let 的声明；
+            // 都没有就只能报错 —— C 侧要知道 ksz 才能开槽。
+            Expr::Map(pairs) => match self.map_kv_for_lit(expr) {
+                Some(kv) => self.gen_map_lit(pairs, kv, None),
+                None => {
+                    self.codegen_errors.push(
+                        "{} 看不出键值类型：写成 Map[str, int]() 或 \
+                         给出至少一个键值对"
+                            .to_string(),
+                    );
+                    "/* TODO */".to_string()
+                }
+            },
+
             _ => "/* TODO */".to_string(),
         }
     }
@@ -486,6 +514,33 @@ impl Codegen {
                 Some((cty, format!("&{}", tmp)))
             }
         }
+    }
+
+    /// 第 i 个实参写的是 `None`，且对应形参是可空类型 → 那个可空的 tag。
+    /// 否则 None。
+    fn none_arg_tag(&self, callee: &Expr, i: usize, a: &Expr) -> Option<String> {
+        if !crate::codegen::stmt::is_none_literal(a) {
+            return None;
+        }
+        let name = match callee {
+            Expr::Ident(n) => n,
+            _ => return None,
+        };
+        let ty = self.fn_param_types.get(name)?.get(i)?;
+        if self.is_opt_tag(ty) {
+            Some(ty.clone())
+        } else {
+            None
+        }
+    }
+
+    /// `None` 的 C 形式：`(tag){0}`。
+    ///
+    /// 用 `{0}` 而不是 `{0, 0}`：值是结构体时第二个 0 初始化不了它
+    /// （clang: initializing 'P' with 'int'）。C 的聚合初始化规则是
+    /// 「剩下的全部零初始化」，所以一个 0 就够了。
+    pub(crate) fn none_init(tag: &str) -> String {
+        format!("({}){{0}}", tag)
     }
 
     /// 表达式是不是字符串。用来把 `==` 从指针比较改成内容比较。
@@ -835,6 +890,163 @@ impl Codegen {
         }
     }
 
+    /// `m.set(k, v)` / `m.get(k)` / `m.has(k)` / `m.keys()` ……
+    /// 返回 None = 接收者不是 Map（调用点继续按普通函数/方法处理）。
+    ///
+    /// 和 `gen_vec_method` 完全对称：C 类型恒为 `LumeMap*`，K/V 只记在
+    /// 编译器的四张表里。runtime 的键/值参数都是 `const void*`，所以
+    /// 每个实参都要先落进临时变量再取址 —— 字面量没有地址。
+    pub(crate) fn gen_map_method(
+        &mut self,
+        obj: &Expr,
+        method: &str,
+        args: &[Expr],
+        fields: Option<&[String]>,
+    ) -> Option<String> {
+        if self.infer_type(obj) != "LumeMap*" {
+            return None;
+        }
+        let (k, v) = match self.inferred_map_kv(obj) {
+            Some(kv) => kv,
+            None => {
+                self.codegen_errors.push(format!(
+                    "无法推断 Map 的键值类型（.{}(...)）。Map 只能来自带 Map[K, V]\
+                     类型的变量、结构体字段，或返回 Map 的函数/方法",
+                    method
+                ));
+                return None;
+            }
+        };
+        let m = self.gen_in(obj, fields);
+        let kc = args
+            .first()
+            .map(|a| self.gen_in(a, fields))
+            .unwrap_or_default();
+        let vc = args
+            .get(1)
+            .map(|a| self.gen_in(a, fields))
+            .unwrap_or_default();
+        self.map_call_text(&m, method, &k, &v, &kc, &vc, args.len())
+    }
+
+    /// 已知接收者、键、值的 C 代码，生成 map 方法调用。
+    ///
+    /// 三个表达式生成器（gen_expr / with_self / par）各自把接收者写成
+    /// 不同的样子（`m` / `_self->counts` / `_p->m`），所以实参代码由
+    /// 调用方生成好再交进来 —— 三处共用这一份，别各抄一遍。
+    pub(crate) fn map_call_text(
+        &mut self,
+        m: &str,
+        method: &str,
+        k: &str,
+        v: &str,
+        kc: &str,
+        vc: &str,
+        nargs: usize,
+    ) -> Option<String> {
+        match method {
+            "len" | "length" if nargs == 0 => Some(format!("lume_map_len({})", m)),
+            "is_empty" if nargs == 0 => Some(format!("(lume_map_len({}) == 0LL)", m)),
+            "clear" if nargs == 0 => Some(format!("lume_map_clear({})", m)),
+            "free" if nargs == 0 => Some(format!("lume_map_free({})", m)),
+            "keys" if nargs == 0 => Some(format!("lume_map_keys({})", m)),
+            "values" if nargs == 0 => Some(format!("lume_map_values({})", m)),
+            "has" if nargs == 1 => {
+                let kt = self.map_tmp_code(kc, k, "_lume_mk");
+                Some(format!("(lume_map_has({}, &{}) != 0)", m, kt))
+            }
+            "del" if nargs == 1 => {
+                let kt = self.map_tmp_code(kc, k, "_lume_mk");
+                Some(format!("(lume_map_del({}, &{}) != 0)", m, kt))
+            }
+            // get 返回 V?：runtime 只给「有没有命中」，可空结构体在
+            // 这里现场组装。语句表达式给个块作用域，不然 `a.get(x).has`
+            // 和 `b.get(y).has` 的同名临时变量会撞。
+            "get" if nargs == 1 => {
+                let kt = self.map_tmp_code(kc, k, "_lume_mk");
+                let tag = self.opt_tag(v);
+                self.map_counter += 1;
+                let n = self.map_counter;
+                Some(format!(
+                    "({{ {} _lume_mg{} = {{0}}; \
+                     _lume_mg{}.has = (int8_t)lume_map_get({}, &{}, &_lume_mg{}.val); \
+                     _lume_mg{}; }})",
+                    tag, n, n, m, kt, n, n
+                ))
+            }
+            "set" if nargs == 2 => {
+                let kt = self.map_tmp_code(kc, k, "_lume_mk");
+                let vt = self.map_tmp_code(vc, v, "_lume_mv");
+                Some(format!("lume_map_set({}, &{}, &{})", m, kt, vt))
+            }
+            _ => None,
+        }
+    }
+
+    /// 把已经生成好的键/值代码落进临时变量，返回变量名。
+    /// `lume_map_*` 收的是地址，而实参常常是字面量或表达式。
+    /// 这条声明会被插到当前语句之前（输出是线性拼接的）。
+    fn map_tmp_code(&mut self, code: &str, ty: &str, prefix: &str) -> String {
+        self.map_counter += 1;
+        let tmp = format!("{}{}", prefix, self.map_counter);
+        self.push_line(&format!("{} {} = {};", ty, tmp, code));
+        tmp
+    }
+
+    /// `Map[str, int]()` 与 `{"a": 1}` 的 (K, V) C 类型。
+    /// 字面量自己带着类型，不用查表。
+    pub(crate) fn map_kv_of_lit(&self, e: &Expr) -> Option<(String, String)> {
+        match e {
+            Expr::MapNew(k, v) => Some((self.gen_type(k), self.gen_type(v))),
+            Expr::Map(pairs) => {
+                let (k, v) = pairs.first()?;
+                Some((self.infer_type(k), self.infer_type(v)))
+            }
+            _ => None,
+        }
+    }
+
+    /// 字面量的 K/V 从哪儿来：自己带的 → let 的声明 → 函数的返回类型。
+    /// 空字面量 `{}` 只能靠后两条（`e: Map[str, int] = {}`）。
+    pub(crate) fn map_kv_for_lit(&self, e: &Expr) -> Option<(String, String)> {
+        self.map_kv_of_lit(e)
+            .or_else(|| self.cur_let_map_kv.clone())
+            .or_else(|| self.cur_ret_map_kv.clone())
+    }
+
+    /// 构造一个 map：`lume_map_new(ksz, vsz, kstr)`。
+    /// kstr 告诉 runtime 键是字符串（比较走 strcmp 而不是 memcmp）。
+    fn gen_map_new(&mut self, k: &str, v: &str) -> String {
+        let kstr = if k == "const char*" { 1 } else { 0 };
+        self.map_counter += 1;
+        let tmp = format!("_lume_mlit{}", self.map_counter);
+        self.push_line(&format!(
+            "LumeMap* {} = lume_map_new((int64_t)sizeof({}), (int64_t)sizeof({}), {});",
+            tmp, k, v, kstr
+        ));
+        tmp
+    }
+
+    /// `{"a": 1, "b": 2}` 字面量。类型从第一对推，键冲突由 runtime
+    /// 的 set 覆盖（后写的赢）。空的 `{}` 要由调用点补 K/V。
+    fn gen_map_lit(
+        &mut self,
+        pairs: &[(Expr, Expr)],
+        kv: (String, String),
+        fields: Option<&[String]>,
+    ) -> String {
+        let (kt, vt) = kv;
+        let tmp = self.gen_map_new(&kt, &vt);
+        for (pk, pv) in pairs {
+            let kc = self.gen_in(pk, fields);
+            let vc = self.gen_in(pv, fields);
+            let kk = self.map_tmp_code(&kc, &kt, "_lume_mk");
+            let vv = self.map_tmp_code(&vc, &vt, "_lume_mv");
+            self.push_line(&format!("lume_map_set({}, &{}, &{});", tmp, kk, vv));
+        }
+        tmp
+    }
+
     /// 结构体字面量里某个字段的初值。
     ///
     /// Vec 字段的 `[]` / `[a, b]` 必须现场建一个句柄 —— `LumeVec*` 是指针，
@@ -866,6 +1078,19 @@ impl Codegen {
                 self.push_line(&format!("lume_vec_push({}, &{});", tmp, vt));
             }
             return tmp;
+        }
+        // `Holder(p: None)`：字段声明就是可空类型，直接用它的 tag。
+        // 走 gen_expr 的话 `None` 只会拿到 int64_t 那个 tag，类型对不上。
+        if crate::codegen::stmt::is_none_literal(fval) {
+            if let Some(fty) = self
+                .structs
+                .get(struct_name)
+                .and_then(|fs| fs.iter().find(|(n, _)| n == fname).map(|(_, t)| t.clone()))
+            {
+                if self.is_opt_tag(&fty) {
+                    return Self::none_init(&fty);
+                }
+            }
         }
         self.gen_in(fval, self_fields)
     }
@@ -1143,6 +1368,10 @@ impl Codegen {
             // 不能走 gen_arg —— 它会把 Slice 当普通表达式降级处理。
             let s = if matches!(a, Expr::Slice(..)) {
                 self.slice_ptr_expr(a)
+            } else if let Some(tag) = self.none_arg_tag(callee, i, a) {
+                // `f(None)`：形参声明是可空类型就按它的 tag 生成，
+                // 否则 None 只拿得到 int64_t 那个 tag。
+                Self::none_init(&tag)
             } else {
                 match fields {
                     Some(f) => self.gen_arg_with_self(a, f),
@@ -1237,6 +1466,19 @@ impl Codegen {
             return "((void)0)".to_string();
         }
         match &args[0] {
+            // Vec / Map 的句柄：各自的 free 还要释放内部缓冲和 str 键的副本
+            Expr::Ident(name)
+                if self.var_types.get(name).map(|t| t.as_str())
+                    == Some("LumeVec*") =>
+            {
+                format!("lume_vec_free({})", name)
+            }
+            Expr::Ident(name)
+                if self.var_types.get(name).map(|t| t.as_str())
+                    == Some("LumeMap*") =>
+            {
+                format!("lume_map_free({})", name)
+            }
             Expr::Ident(name) if self.owned_arrays.remove(name) => {
                 format!("free((void*)({}))", name)
             }
@@ -1475,6 +1717,13 @@ impl Codegen {
                     }
                 }
 
+                // Map 的方法（同上，字段也能装 Map）
+                if let Expr::Field(obj, method) = callee.as_ref() {
+                    if let Some(c) = self.gen_map_method(obj, method, args, Some(fields)) {
+                        return c;
+                    }
+                }
+
                 // a.len() —— 数组长度。
                 // 局部字面量是常量，数组参数是伴随参数 {name}_len
                 if let Expr::Field(obj, method) = callee.as_ref() {
@@ -1679,6 +1928,25 @@ impl Codegen {
                 let item = self.gen_expr_with_self(value, fields);
                 format!("{{{}}}", vec![item; *count].join(", "))
             }
+
+            // 落到 gen_expr 会丢掉 `fields`（方法体里的裸字段名），
+            // 所以 Map 这两种构造都要在这里自己走一遍。
+            Expr::MapNew(k, v) => {
+                let kv = (self.gen_type(k), self.gen_type(v));
+                self.gen_map_new(&kv.0, &kv.1)
+            }
+
+            Expr::Map(pairs) => match self.map_kv_for_lit(expr) {
+                Some(kv) => self.gen_map_lit(pairs, kv, Some(fields)),
+                None => {
+                    self.codegen_errors.push(
+                        "{} 看不出键值类型：写成 Map[str, int]() 或 \
+                         给出至少一个键值对"
+                            .to_string(),
+                    );
+                    "/* TODO */".to_string()
+                }
+            },
 
             _ => self.gen_expr(expr),
         }
