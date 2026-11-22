@@ -1,0 +1,2 @@
+fn parse_manifest(path:string) -> int
+ret 0

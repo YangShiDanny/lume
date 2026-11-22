@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Lume",
+  "scopeName": "source.lume",
+  "fileTypes": ["lume"],
+  "patterns": [
+    {
+      "begin": "#",
+      "beginCaptures": {"0": {"name":"punctuation.definition.comment.lume"}},
+      "end": "$",
+      "name": "comment.line.number-sign.lume"
+    },
+    {
+      "match": "#.*$",
+      "name": "comment.line.number-sign.lume"
+    },
+    {
+      "match": "\\b(fn|ret|if|else|while|and|or|not|is|true|false|end)\\b",
+      "name": "keyword.control.lume"
+    },
+    {
+      "match": "(:=|=|\\+|-|\\*|/|%|<|<=|>|>=|==|!=)",
+      "name": "keyword.operator.lume"
+    },
+    {
+      "match": "\"(\\\\.|[^\"\\\\])*\"",
+      "name": "string.quoted.double.lume"
+    },
+    {
+      "match": "\\b(-?\\d+)\\b",
+      "name": "constant.numeric.integer.lume"
+    },
+    {
+      "match": "([a-zA-Z_][a-zA-Z0-9_]*)(:)([a-zA-Z0-9_]+)",
+      "captures": {
+        "1": {"name":"variable.other.lume"},
+        "2": {"name":"punctuation.separator.type-annotation.lume"},
+        "3": {"name":"storage.type.lume"}
+      }
+    }
+  ]
+}

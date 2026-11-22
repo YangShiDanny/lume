@@ -1,0 +1,11 @@
+# Lume 自举世界入口
+
+fn bootstrap()
+    lexer:int = load_source("lib/syntax/lexer.lume")
+    parser:int = load_source("lib/syntax/parser.lume")
+    ast:int = load_source("lib/syntax/ast.lume")
+    lower:int = load_source("lib/syntax/lower.lume")
+    build:int = load_source("lib/build/build.lume")
+
+    print_bootstrap_ready()
+end

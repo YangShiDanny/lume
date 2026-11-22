@@ -1,0 +1,7 @@
+# AST 到 lumec_core IR 降低器
+
+fn lower_file(ast:int) -> int
+ret 0
+
+fn lower_ret(expr:int) -> int
+ret expr

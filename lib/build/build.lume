@@ -1,0 +1,7 @@
+# Lume 项目构建入口
+
+fn build(manifest:string) -> int
+    modules:int = parse_manifest(manifest)
+    clang:int = compile_c_modules(modules)
+    lume:int = compile_lume_modules(modules)
+ret llvm_link(clang, lume)

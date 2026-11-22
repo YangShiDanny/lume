@@ -1,0 +1,27 @@
+{
+  "Function": {
+    "prefix": "fn",
+    "body": ["fn ${1:name}(${2:arg}:${3:int}) -> ${4:int}", "    ${0}", "ret 0"],
+    "description": "Declare a Lume function"
+  },
+  "If": {
+    "prefix": "if",
+    "body": ["if ${1:cond}", "    ${0}", "end"],
+    "description": "Conditional block"
+  },
+  "If expression": {
+    "prefix": "ifexpr",
+    "body": ["${1:value}:${2:int} = if ${3:cond}", "    ${4:1}", "else", "    ${5:0}", "end"],
+    "description": "Conditional block expression"
+  },
+  "While": {
+    "prefix": "while",
+    "body": ["while ${1:cond}", "    ${0}", "end"],
+    "description": "While loop"
+  },
+  "Walrus": {
+    "prefix": ":=",
+    "body": "${1:value} := ${2:expr}",
+    "description": "Walrus assignment"
+  }
+}

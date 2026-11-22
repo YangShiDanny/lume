@@ -1,0 +1,8 @@
+# Lume 源码语法分析器
+
+fn parse(source:string) -> int
+    tokens:int = lex(source)
+ret parse_file(tokens)
+
+fn parse_file(tokens:int) -> int
+ret 0

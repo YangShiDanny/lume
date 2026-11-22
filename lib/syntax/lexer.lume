@@ -1,0 +1,8 @@
+# Lume 源码词法分析器
+
+fn is_space(ch:string) -> int
+ret ch is " "
+
+fn lex(source:string) -> int
+    tokens:int = []
+ret tokens

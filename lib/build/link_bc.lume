@@ -1,0 +1,2 @@
+fn llvm_link(c_modules:int, lume_modules:int) -> int
+ret 0

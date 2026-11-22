@@ -1,0 +1,10 @@
+fn add(a:int, b:int) -> int
+ret a + b
+
+fn main() -> int
+    result:int = if add(20, 22) == 42
+        42
+    else
+        0
+    end
+ret result

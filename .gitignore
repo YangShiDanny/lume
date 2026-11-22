@@ -1,0 +1,13 @@
+target/
+crates/*/target/
+**/*.bc
+**/*.ll
+*.o
+*.so
+*.out
+node_modules/
+editor/vscode-lume/out/
+editor/vscode‑lume/out/
+crates/*/src/all_src.md
+crates/*/src/pack.sh
+usr

@@ -1,0 +1,43 @@
+{
+  "name": "lume-language",
+  "displayName": "Lume Language",
+  "description": "Syntax highlighting and language tools for Lume",
+  "version": "0.1.0",
+  "publisher": "lumec",
+  "engines": {"vscode": "^1.85.0"},
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:lume"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [{
+      "id": "lume",
+      "aliases": ["Lume"],
+      "extensions": [".lume"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "lume",
+      "scopeName": "source.lume",
+      "path": "./syntaxes/lume.tmLanguage.json"
+    }],
+    "snippets": [{
+      "language": "lume",
+      "path": "./snippets/lume.code-snippets.json"
+    }],
+    "commands": [
+      {"command":"lume.runFile","title":"Lume: Run Current File"},
+      {"command":"lume.checkFile","title":"Lume: Check Current File"}
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "@vscode/vsce": "^3.2.1"
+  }
+}

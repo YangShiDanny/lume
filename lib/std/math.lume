@@ -1,0 +1,5 @@
+fn abs(value:int) -> int
+    if value < 0
+        ret 0 - value
+end
+ret value

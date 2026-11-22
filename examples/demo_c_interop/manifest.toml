@@ -1,0 +1,18 @@
+[project]
+name = "demo_c_interop"
+version = "0.1.0"
+build_mode = "jit"
+
+[[module]]
+path = "src/main.lume"
+lang = "lume"
+export = ["entry"]
+
+[[module]]
+path = "src/calc.c"
+lang = "c"
+cflags = ["-O1"]
+export = ["c_matmul"]
+
+[ffi.extern]
+c_matmul = { params = ["i64", "*u8"], ret = "i64" }

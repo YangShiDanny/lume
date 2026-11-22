@@ -1,0 +1,2 @@
+fn print(text:string) -> int
+ret core_print(text)

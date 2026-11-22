@@ -1,0 +1,2 @@
+fn array_len(array:int) -> int
+ret 0

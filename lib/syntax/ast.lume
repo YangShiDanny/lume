@@ -1,0 +1,7 @@
+# AST 定义
+
+fn ast_file(name:string)
+ret 0
+
+fn ast_func(name:string, params:int, ret_ty:string, body:int)
+ret 0

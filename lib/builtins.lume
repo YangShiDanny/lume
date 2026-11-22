@@ -1,0 +1,11 @@
+fn read_source(path:string) -> int
+ret core_read_file(path)
+
+fn run_tool(program:string, args:int) -> int
+ret core_run_command(program, args)
+
+fn gc_keep(ptr:int) -> int
+ret gc_push_root(ptr)
+
+fn gc_release() -> int
+ret gc_pop_root()

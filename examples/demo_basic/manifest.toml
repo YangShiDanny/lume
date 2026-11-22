@@ -1,0 +1,9 @@
+[project]
+name = "demo_basic"
+version = "0.1.0"
+build_mode = "jit"
+
+[[module]]
+path = "src/main.lume"
+lang = "lume"
+export = ["main"]

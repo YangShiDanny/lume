@@ -1,0 +1,2 @@
+fn compile_c_modules(modules:int) -> int
+ret 0
