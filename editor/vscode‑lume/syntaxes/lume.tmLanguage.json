@@ -27,8 +27,8 @@
       "name": "string.quoted.double.lume"
     },
     {
-      "match": "\\b(-?\\d+)\\b",
-      "name": "constant.numeric.integer.lume"
+      "match": "\\b(-?\\d+(?:\\.\\d+)?)\\b",
+      "name": "constant.numeric.lume"
     },
     {
       "match": "([a-zA-Z_][a-zA-Z0-9_]*)(:)([a-zA-Z0-9_]+)",

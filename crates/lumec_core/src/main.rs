@@ -114,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         match evaluator.call(entry, vec![]) {
             Ok(Value::Int(value)) => println!("{}", value),
+            Ok(Value::Float(value)) => println!("{}", value),
             Ok(Value::Bool(value)) => println!("{}", value),
             Ok(Value::String(value)) => println!("{}", value),
             Ok(Value::Array(values)) => println!("{:?}", values),
@@ -151,6 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     match evaluator.call(entry, vec![]) {
         Ok(Value::Int(value)) => println!("{}", value),
+        Ok(Value::Float(value)) => println!("{}", value),
         Ok(Value::Bool(value)) => println!("{}", value),
         Ok(Value::String(value)) => println!("{}", value),
         Ok(Value::Array(values)) => println!("{:?}", values),

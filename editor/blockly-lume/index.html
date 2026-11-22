@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lume Blockly Editor</title>
+  <style>
+    html,body { height:100%; margin:0; padding:0; }
+    #app { display:flex; width:100%; height:100%; }
+    #blocklyDiv { flex:1; height:100%; }
+    #codePanel {
+      width:420px;
+      height:100%;
+      box-sizing:border-box;
+      padding:8px;
+    }
+    #codeOutput {
+      width:100%;
+      height:calc(100% - 30px);
+      font-family: monospace;
+      resize:none;
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="blocklyDiv"></div>
+  <div id="codePanel">
+    <h4>Lume 代码输出</h4>
+    <textarea id="codeOutput" readonly></textarea>
+  </div>
+</div>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

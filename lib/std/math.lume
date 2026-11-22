@@ -3,3 +3,27 @@ fn abs(value:int) -> int
         ret 0 - value
 end
 ret value
+
+fn sin(x:float) -> float
+ret llvm_sin(x)
+
+fn cos(x:float) -> float
+ret llvm_cos(x)
+
+fn exp(x:float) -> float
+ret llvm_exp(x)
+
+fn ln(x:float) -> float
+ret llvm_log(x)
+
+fn sqrt(x:float) -> float
+ret llvm_sqrt(x)
+
+fn pow(x:float, y:float) -> float
+ret pow(x, y)
+
+fn sleef_sin(x:float) -> float
+ret sleef_sin_u10(x)
+
+fn sleef_cos(x:float) -> float
+ret sleef_cos_u10(x)

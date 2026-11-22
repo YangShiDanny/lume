@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Int(i64),
+    Float(f64),
     String(String),
     Bool(bool),
     Ident(String),
@@ -78,6 +79,7 @@ struct Line {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LexTokenKind {
     Int,
+    Float,
     String,
     Ident,
     Op,
@@ -92,9 +94,9 @@ struct LexToken {
 fn strip_comment(line: &str) -> String {
     let mut quoted = false;
     let mut escaped = false;
-    let mut chars = line.chars().peekable();
+    let chars = line.chars();
     let mut out = String::new();
-    while let Some(ch) = chars.next() {
+    for ch in chars {
         if escaped {
             out.push(ch);
             escaped = false;
@@ -131,8 +133,17 @@ fn expression_tokens(source: &str) -> Vec<LexToken> {
             while i < chars.len() && chars[i].is_ascii_digit() {
                 i += 1;
             }
+            let kind = if i + 1 < chars.len() && chars[i] == '.' && chars[i + 1].is_ascii_digit() {
+                i += 1;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                LexTokenKind::Float
+            } else {
+                LexTokenKind::Int
+            };
             tokens.push(LexToken {
-                kind: LexTokenKind::Int,
+                kind,
                 text: chars[start..i].iter().collect(),
             });
         } else if chars[i] == '"' {
@@ -313,6 +324,12 @@ impl ExprParser {
                     .text
                     .parse()
                     .map_err(|_| "invalid integer".to_string())?,
+            ),
+            LexTokenKind::Float => Expr::Float(
+                token
+                    .text
+                    .parse()
+                    .map_err(|_| "invalid float".to_string())?,
             ),
             LexTokenKind::String => Expr::String(token.text),
             LexTokenKind::Ident => match token.text.as_str() {
@@ -627,7 +644,7 @@ fn parse_stmt(lines: &[Line], index: usize) -> Result<(Stmt, usize), String> {
             }
             return Ok((Stmt::Assign { name, expr }, next));
         }
-        let expr = parse_expr(&rhs).map_err(|e| e)?;
+        let expr = parse_expr(&rhs)?;
         if let Some(ty) = ty {
             return Ok((
                 Stmt::VarDecl {
@@ -716,5 +733,34 @@ ret res
             .call("max", vec![Value::Int(7), Value::Int(3)])
             .unwrap();
         assert!(matches!(value, Value::Int(7)));
+    }
+
+    #[test]
+    fn evaluates_float_math_and_sleef_aliases() {
+        let funcs = parse_source(
+            r#"
+fn math() -> float
+    result:float = sin(0.0) + sqrt(9.0) + pow(2.0, 3.0)
+    result = result + sleef_sin_u10(0.0)
+ret result
+"#,
+        )
+        .unwrap();
+        let value = Evaluator::new(funcs).call("math", vec![]).unwrap();
+        assert!(matches!(value, Value::Float(value) if (value - 11.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn evaluates_log_builtin() {
+        let funcs = parse_source(
+            r#"
+fn log_test() -> int
+    log_at("info", "math initialized")
+ret 1
+"#,
+        )
+        .unwrap();
+        let value = Evaluator::new(funcs).call("log_test", vec![]).unwrap();
+        assert!(matches!(value, Value::Int(1)));
     }
 }

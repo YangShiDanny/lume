@@ -1,0 +1,16 @@
+# Structured log-level wrappers.
+
+fn log_trace(message:string)
+ret trace(message)
+
+fn log_debug(message:string)
+ret debug(message)
+
+fn log_info(message:string)
+ret info(message)
+
+fn log_warn(message:string)
+ret warn(message)
+
+fn log_error(message:string)
+ret error(message)

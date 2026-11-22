@@ -1,0 +1,9 @@
+fn main() -> int
+    angle:float = 0.5
+    sine:float = sin(angle)
+    radius:float = sqrt(9.0)
+    result:float = sleef_sin_u10(angle) + pow(radius, 2.0)
+
+    log_info("calculating math results")
+    print(result)
+ret 0

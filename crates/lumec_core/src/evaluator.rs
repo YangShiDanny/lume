@@ -1,9 +1,12 @@
 use crate::parser::{Expr, FuncDef, Stmt};
+#[cfg(feature = "system-sleef")]
+use crate::sleef;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
+    Float(f64),
     Bool(bool),
     String(String),
     Array(Vec<Value>),
@@ -14,6 +17,7 @@ impl Value {
     fn truthy(&self) -> bool {
         match self {
             Value::Int(v) => *v != 0,
+            Value::Float(v) => *v != 0.0 && !v.is_nan(),
             Value::Bool(v) => *v,
             Value::String(v) => !v.is_empty(),
             Value::Array(v) => !v.is_empty(),
@@ -192,6 +196,7 @@ impl Evaluator {
     fn eval(&self, expr: &Expr, env: &mut HashMap<String, Value>) -> Result<Value, String> {
         match expr {
             Expr::Int(v) => Ok(Value::Int(*v)),
+            Expr::Float(v) => Ok(Value::Float(*v)),
             Expr::String(v) => Ok(Value::String(v.clone())),
             Expr::Bool(v) => Ok(Value::Bool(*v)),
             Expr::Ident(name) => env
@@ -202,6 +207,7 @@ impl Evaluator {
                 let value = self.eval(inner, env)?;
                 match (op.as_str(), value) {
                     ("-", Value::Int(v)) => Ok(Value::Int(-v)),
+                    ("-", Value::Float(v)) => Ok(Value::Float(-v)),
                     ("not", value) => Ok(Value::Bool(!value.truthy())),
                     _ => Err("invalid unary operation".into()),
                 }
@@ -285,6 +291,22 @@ fn binary(op: &str, lhs: Value, rhs: Value) -> Result<Value, String> {
         "!=" => Ok(Value::Bool(!values_equal(&lhs, &rhs))),
         "is" => Ok(Value::Bool(values_equal(&lhs, &rhs))),
         "+" | "-" | "*" | "/" | "%" | "<" | "<=" | ">" | ">=" => {
+            if matches!(&lhs, Value::Float(_)) || matches!(&rhs, Value::Float(_)) {
+                let lhs = value_float(&lhs, op)?;
+                let rhs = value_float(&rhs, op)?;
+                return Ok(match op {
+                    "+" => Value::Float(lhs + rhs),
+                    "-" => Value::Float(lhs - rhs),
+                    "*" => Value::Float(lhs * rhs),
+                    "/" => Value::Float(lhs / rhs),
+                    "%" => Value::Float(lhs % rhs),
+                    "<" => Value::Bool(lhs < rhs),
+                    "<=" => Value::Bool(lhs <= rhs),
+                    ">" => Value::Bool(lhs > rhs),
+                    ">=" => Value::Bool(lhs >= rhs),
+                    _ => unreachable!(),
+                });
+            }
             let lhs = value_int(&lhs, op)?;
             let rhs = value_int(&rhs, op)?;
             Ok(match op {
@@ -321,9 +343,18 @@ fn value_int(value: &Value, op: &str) -> Result<i64, String> {
     }
 }
 
+fn value_float(value: &Value, op: &str) -> Result<f64, String> {
+    match value {
+        Value::Int(v) => Ok(*v as f64),
+        Value::Float(v) => Ok(*v),
+        _ => Err(format!("operator `{op}` requires numbers")),
+    }
+}
+
 fn values_equal(lhs: &Value, rhs: &Value) -> bool {
     match (lhs, rhs) {
         (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Unit, Value::Unit) => true,
@@ -360,13 +391,137 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
             let n = value_int(&args[0], "c_matmul")?;
             Ok(Some(Value::Int(n.saturating_mul(2))))
         }
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
+        | "acosh" | "atanh" | "exp" | "exp2" | "expm1" | "ln" | "log" | "log2" | "log10"
+        | "log1p" | "sqrt" | "cbrt" | "floor" | "ceil" | "round" | "trunc" | "abs"
+        | "sleef_sin_u10" | "sleef_sin_u35" | "sleef_cos_u10" | "sleef_cos_u35"
+        | "sleef_tan_u10" | "sleef_exp_u10" | "sleef_log_u10" | "sleef_sqrt_u05" | "llvm_sin"
+        | "llvm_cos" | "llvm_exp" | "llvm_log" | "llvm_sqrt" => {
+            require_arity(name, args, 1)?;
+            let input = value_float(&args[0], name)?;
+            if name == "abs"
+                && let Value::Int(value) = &args[0]
+            {
+                return value
+                    .checked_abs()
+                    .map(|value| Some(Value::Int(value)))
+                    .ok_or_else(|| "integer absolute value overflow".into());
+            }
+            let output = unary_math(name, input)?;
+            Ok(Some(Value::Float(output)))
+        }
+        "pow" | "atan2" | "hypot" | "fmod" | "remainder" | "copysign" | "sleef_pow_u10"
+        | "sleef_pow_u35" => {
+            require_arity(name, args, 2)?;
+            let lhs = value_float(&args[0], name)?;
+            let rhs = value_float(&args[1], name)?;
+            Ok(Some(Value::Float(binary_math(name, lhs, rhs))))
+        }
+        "trace" | "debug" | "info" | "warn" | "error" | "log_trace" | "log_debug" | "log_info"
+        | "log_warn" | "log_error" => {
+            require_arity(name, args, 1)?;
+            let level = name.strip_prefix("log_").unwrap_or(name);
+            eprintln!("[{level}] {}", value_to_string(&args[0]));
+            Ok(Some(Value::Unit))
+        }
+        "log_at" => {
+            require_arity(name, args, 2)?;
+            let level = match &args[0] {
+                Value::String(level) => level.as_str(),
+                _ => return Err("log_at expects a string level as its first argument".into()),
+            };
+            if !matches!(level, "trace" | "debug" | "info" | "warn" | "error") {
+                return Err(format!("unknown log level `{level}`"));
+            }
+            eprintln!("[{level}] {}", value_to_string(&args[1]));
+            Ok(Some(Value::Unit))
+        }
         _ => Ok(None),
+    }
+}
+
+fn require_arity(name: &str, args: &[Value], expected: usize) -> Result<(), String> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{name}` expects {expected} arguments, received {}",
+            args.len()
+        ))
+    }
+}
+
+fn unary_math(name: &str, x: f64) -> Result<f64, String> {
+    #[cfg(feature = "system-sleef")]
+    {
+        let value = unsafe {
+            match name {
+                "sleef_sin_u10" => Some(sleef::sin_u10(x)),
+                "sleef_sin_u35" => Some(sleef::sin_u35(x)),
+                "sleef_cos_u10" => Some(sleef::cos_u10(x)),
+                "sleef_cos_u35" => Some(sleef::cos_u35(x)),
+                "sleef_tan_u10" => Some(sleef::tan_u10(x)),
+                "sleef_exp_u10" => Some(sleef::exp_u10(x)),
+                "sleef_log_u10" => Some(sleef::log_u10(x)),
+                "sleef_sqrt_u05" => Some(sleef::sqrt_u05(x)),
+                _ => None,
+            }
+        };
+        if let Some(value) = value {
+            return Ok(value);
+        }
+    }
+    Ok(match name {
+        "sin" | "sleef_sin_u10" | "sleef_sin_u35" | "llvm_sin" => x.sin(),
+        "cos" | "sleef_cos_u10" | "sleef_cos_u35" | "llvm_cos" => x.cos(),
+        "tan" | "sleef_tan_u10" => x.tan(),
+        "asin" => x.asin(),
+        "acos" => x.acos(),
+        "atan" => x.atan(),
+        "sinh" => x.sinh(),
+        "cosh" => x.cosh(),
+        "tanh" => x.tanh(),
+        "asinh" => x.asinh(),
+        "acosh" => x.acosh(),
+        "atanh" => x.atanh(),
+        "exp" | "sleef_exp_u10" | "llvm_exp" => x.exp(),
+        "exp2" => x.exp2(),
+        "expm1" => x.exp_m1(),
+        "ln" | "log" | "sleef_log_u10" | "llvm_log" => x.ln(),
+        "log2" => x.log2(),
+        "log10" => x.log10(),
+        "log1p" => x.ln_1p(),
+        "sqrt" | "sleef_sqrt_u05" | "llvm_sqrt" => x.sqrt(),
+        "cbrt" => x.cbrt(),
+        "floor" => x.floor(),
+        "ceil" => x.ceil(),
+        "round" => x.round(),
+        "trunc" => x.trunc(),
+        "abs" => x.abs(),
+        _ => return Err(format!("unknown math function `{name}`")),
+    })
+}
+
+fn binary_math(name: &str, x: f64, y: f64) -> f64 {
+    #[cfg(feature = "system-sleef")]
+    if matches!(name, "sleef_pow_u10" | "sleef_pow_u35") {
+        return unsafe { sleef::pow_u10(x, y) };
+    }
+    match name {
+        "pow" | "sleef_pow_u10" | "sleef_pow_u35" => x.powf(y),
+        "atan2" => x.atan2(y),
+        "hypot" => x.hypot(y),
+        "fmod" => x % y,
+        "remainder" => x - (x / y).round_ties_even() * y,
+        "copysign" => x.copysign(y),
+        _ => f64::NAN,
     }
 }
 
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::Int(v) => v.to_string(),
+        Value::Float(v) => v.to_string(),
         Value::Bool(v) => v.to_string(),
         Value::String(v) => v.clone(),
         Value::Array(items) => format!(
