@@ -284,7 +284,7 @@ fn compile_module<'ctx>(
         let external = Module::parse_bitcode_from_buffer(&buffer, context)
             .map_err(|error| CoreError::new(format!("cannot parse LLVM bitcode: {error}")))?;
         for function in external.get_functions() {
-            if let Some(name) = function.get_name().to_str().ok() {
+            if let Ok(name) = function.get_name().to_str() {
                 external_names.insert(name.to_string());
             }
         }

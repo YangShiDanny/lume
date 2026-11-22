@@ -26,6 +26,11 @@ pub enum Stmt {
         name: String,
         expr: Expr,
     },
+    IndexAssign {
+        name: String,
+        index: Expr,
+        expr: Expr,
+    },
     Walrus {
         name: String,
         expr: Expr,
@@ -457,7 +462,7 @@ pub fn parse_source(source: &str) -> Result<Vec<FuncDef>, ParseError> {
             if lines[index].indent <= base_indent && lines[index].text.starts_with("fn ") {
                 break;
             }
-            if lines[index].text == "end" {
+            if lines[index].indent <= base_indent && lines[index].text == "end" {
                 index += 1;
                 break;
             }
@@ -533,11 +538,88 @@ fn split_assignment(text: &str) -> Option<(String, Option<String>, String)> {
     }
 }
 
+fn parse_if_statement(
+    lines: &[Line],
+    index: usize,
+    condition: &str,
+) -> Result<(Stmt, usize), String> {
+    let (stmt, next) = parse_if_chain(lines, index, condition)?;
+    Ok((stmt, next))
+}
+
+fn parse_if_expression(
+    lines: &[Line],
+    index: usize,
+    condition: &str,
+) -> Result<(Stmt, Expr, usize), String> {
+    let (stmt, next) = parse_if_chain(lines, index, condition)?;
+    let expr = match &stmt {
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => Expr::If(Box::new(cond.clone()), then_body.clone(), else_body.clone()),
+        _ => unreachable!(),
+    };
+    Ok((stmt, expr, next))
+}
+
+fn parse_if_chain(lines: &[Line], index: usize, condition: &str) -> Result<(Stmt, usize), String> {
+    let indent = lines[index].indent;
+    let cond = parse_expr(condition)?;
+    let mut next = index + 1;
+    let mut then_body = Vec::new();
+    while next < lines.len() && lines[next].indent > indent {
+        let (stmt, following) = parse_stmt(lines, next)?;
+        then_body.push(stmt);
+        next = following;
+    }
+
+    if next >= lines.len() || lines[next].indent > indent {
+        return Err("if block is missing `end`".into());
+    }
+
+    let mut else_body = Vec::new();
+    if lines[next].indent == indent && lines[next].text == "else" {
+        next += 1;
+        while next < lines.len() && lines[next].indent > indent {
+            let (stmt, following) = parse_stmt(lines, next)?;
+            else_body.push(stmt);
+            next = following;
+        }
+    } else if lines[next].indent == indent
+        && let Some(else_if_condition) = lines[next].text.strip_prefix("else if ")
+    {
+        let (else_if, following) = parse_if_chain(lines, next, else_if_condition)?;
+        else_body.push(else_if);
+        return Ok((
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            },
+            following,
+        ));
+    }
+
+    if next >= lines.len() || lines[next].indent != indent || lines[next].text != "end" {
+        return Err("if block is missing `end`".into());
+    }
+    Ok((
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        },
+        next + 1,
+    ))
+}
+
 fn parse_stmt(lines: &[Line], index: usize) -> Result<(Stmt, usize), String> {
     let line = &lines[index];
     let text = line.text.as_str();
     if text == "end" {
-        return Ok((Stmt::Expr(Expr::Bool(false)), index + 1));
+        return Err("unexpected `end`".into());
     }
     if text == "ret" {
         return Ok((Stmt::Ret(None), index + 1));
@@ -550,88 +632,35 @@ fn parse_stmt(lines: &[Line], index: usize) -> Result<(Stmt, usize), String> {
         let cond = parse_expr(rest)?;
         let mut next = index + 1;
         let mut body = Vec::new();
+        let mut closed = false;
         while next < lines.len() {
-            if lines[next].text == "end" && lines[next].indent <= line.indent {
+            if lines[next].text == "end" && lines[next].indent == line.indent {
                 next += 1;
+                closed = true;
                 break;
             }
             if lines[next].indent <= line.indent {
-                break;
+                return Err("while block is missing `end`".into());
             }
             let (stmt, following) = parse_stmt(lines, next)?;
             body.push(stmt);
             next = following;
         }
+        if !closed {
+            return Err("while block is missing `end`".into());
+        }
         return Ok((Stmt::While { cond, body }, next));
     }
 
     if let Some(rest) = text.strip_prefix("if ") {
-        let cond = parse_expr(rest)?;
-        let mut next = index + 1;
-        let mut then_body = Vec::new();
-        let mut else_body = Vec::new();
-        let mut in_else = false;
-        while next < lines.len() {
-            if lines[next].indent <= line.indent {
-                if lines[next].text == "else" {
-                    in_else = true;
-                    next += 1;
-                    continue;
-                }
-                if lines[next].text == "end" {
-                    next += 1;
-                    break;
-                }
-                break;
-            }
-            let (stmt, following) = parse_stmt(lines, next)?;
-            if in_else {
-                else_body.push(stmt);
-            } else {
-                then_body.push(stmt);
-            }
-            next = following;
-        }
-        return Ok((
-            Stmt::If {
-                cond,
-                then_body,
-                else_body,
-            },
-            next,
-        ));
+        return parse_if_statement(lines, index, rest);
     }
 
     if let Some(assign) = split_assignment(text) {
         let (name, ty, rhs) = assign;
         if rhs.starts_with("if ") {
-            let cond = parse_expr(rhs.strip_prefix("if ").unwrap())?;
-            let mut next = index + 1;
-            let mut then_body = Vec::new();
-            let mut else_body = Vec::new();
-            let mut in_else = false;
-            while next < lines.len() {
-                if lines[next].indent <= line.indent {
-                    if lines[next].text == "else" {
-                        in_else = true;
-                        next += 1;
-                        continue;
-                    }
-                    if lines[next].text == "end" {
-                        next += 1;
-                        break;
-                    }
-                    break;
-                }
-                let (stmt, following) = parse_stmt(lines, next)?;
-                if in_else {
-                    else_body.push(stmt);
-                } else {
-                    then_body.push(stmt);
-                }
-                next = following;
-            }
-            let expr = Expr::If(Box::new(cond), then_body, else_body);
+            let (_, expr, next) =
+                parse_if_expression(lines, index, rhs.strip_prefix("if ").unwrap())?;
             if let Some(ty) = ty {
                 return Ok((
                     Stmt::VarDecl {
@@ -643,6 +672,60 @@ fn parse_stmt(lines: &[Line], index: usize) -> Result<(Stmt, usize), String> {
                 ));
             }
             return Ok((Stmt::Assign { name, expr }, next));
+        }
+        if rhs.starts_with("while ") {
+            let cond = parse_expr(rhs.strip_prefix("while ").unwrap())?;
+            let mut next = index + 1;
+            let mut body = Vec::new();
+            let mut closed = false;
+            while next < lines.len() {
+                if lines[next].text == "end" && lines[next].indent == line.indent {
+                    next += 1;
+                    closed = true;
+                    break;
+                }
+                if lines[next].indent <= line.indent {
+                    break;
+                }
+                let (stmt, following) = parse_stmt(lines, next)?;
+                body.push(stmt);
+                next = following;
+            }
+            if !closed {
+                return Err("while block expression is missing `end`".into());
+            }
+            let expr = Expr::While(Box::new(cond), body);
+            if let Some(ty) = ty {
+                return Ok((
+                    Stmt::VarDecl {
+                        name,
+                        ty: Some(ty),
+                        init: expr,
+                    },
+                    next,
+                ));
+            }
+            return Ok((Stmt::Assign { name, expr }, next));
+        }
+        if let Some(open) = name.find('[')
+            && let Some(close) = name.rfind(']')
+            && close > open
+        {
+            let target = name[..open].trim();
+            let target = match parse_expr(target)? {
+                Expr::Ident(target) => target,
+                _ => return Err("array assignment target must be an identifier".into()),
+            };
+            let index_expr = parse_expr(&name[open + 1..close])?;
+            let value_expr = parse_expr(&rhs)?;
+            return Ok((
+                Stmt::IndexAssign {
+                    name: target,
+                    index: index_expr,
+                    expr: value_expr,
+                },
+                index + 1,
+            ));
         }
         let expr = parse_expr(&rhs)?;
         if let Some(ty) = ty {
@@ -733,6 +816,128 @@ ret res
             .call("max", vec![Value::Int(7), Value::Int(3)])
             .unwrap();
         assert!(matches!(value, Value::Int(7)));
+    }
+
+    #[test]
+    fn evaluates_else_if_block_expression() {
+        let funcs = parse_source(
+            r#"
+fn classify(n:int) -> int
+    result:int = if n < 0
+        -1
+    else if n == 0
+        0
+    else
+        1
+    end
+ret result
+"#,
+        )
+        .unwrap();
+        let evaluator = Evaluator::new(funcs);
+        assert!(matches!(
+            evaluator.call("classify", vec![Value::Int(-3)]).unwrap(),
+            Value::Int(-1)
+        ));
+        assert!(matches!(
+            evaluator.call("classify", vec![Value::Int(0)]).unwrap(),
+            Value::Int(0)
+        ));
+        assert!(matches!(
+            evaluator.call("classify", vec![Value::Int(3)]).unwrap(),
+            Value::Int(1)
+        ));
+    }
+
+    #[test]
+    fn evaluates_while_block_expression() {
+        let funcs = parse_source(
+            r#"
+fn count_to_three() -> int
+    i:int = 0
+    result:int = while i < 3
+        i := i + 1
+        i
+    end
+ret result
+"#,
+        )
+        .unwrap();
+        let value = Evaluator::new(funcs)
+            .call("count_to_three", vec![])
+            .unwrap();
+        assert!(matches!(value, Value::Int(3)));
+    }
+
+    #[test]
+    fn while_block_expression_without_iterations_returns_zero() {
+        let funcs = parse_source(
+            r#"
+fn no_iterations() -> int
+    result:int = while false
+        9
+    end
+ret result
+"#,
+        )
+        .unwrap();
+        let value = Evaluator::new(funcs).call("no_iterations", vec![]).unwrap();
+        assert!(matches!(value, Value::Int(0)));
+    }
+
+    #[test]
+    fn evaluates_array_element_assignment() {
+        let funcs = parse_source(
+            r#"
+fn update() -> int
+    values:int = [10, 20, 30]
+    values[1] = 42
+ret values[1]
+"#,
+        )
+        .unwrap();
+        let value = Evaluator::new(funcs).call("update", vec![]).unwrap();
+        assert!(matches!(value, Value::Int(42)));
+    }
+
+    #[test]
+    fn array_element_assignment_reports_out_of_bounds() {
+        let funcs = parse_source(
+            r#"
+fn update() -> int
+    values:int = [10]
+    values[1] = 42
+ret 0
+"#,
+        )
+        .unwrap();
+        let error = Evaluator::new(funcs).call("update", vec![]).unwrap_err();
+        assert!(error.contains("out of bounds"));
+    }
+
+    #[test]
+    fn reports_missing_control_flow_end() {
+        let error = parse_source(
+            r#"
+fn incomplete() -> int
+    if true
+        ret 1
+"#,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("missing `end`"));
+    }
+
+    #[test]
+    fn reports_unmatched_end() {
+        let error = parse_source(
+            r#"
+fn unmatched()
+    end
+"#,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("unexpected `end`"));
     }
 
     #[test]

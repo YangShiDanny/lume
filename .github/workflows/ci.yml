@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Rust + Lume + VS Code
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: 安装 LLVM 23
+        shell: bash
+        run: |
+          curl --retry 5 --retry-delay 2 --retry-all-errors \
+            -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 23
+          sudo apt-get install -y llvm-23-dev clang-23
+          echo "LLVM_SYS_231_PREFIX=/usr/lib/llvm-23" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-23/bin" >> "$GITHUB_PATH"
+          llvm-config-23 --version
+
+      - name: 检查 Rust 格式
+        run: cargo fmt --manifest-path crates/lumec_core/Cargo.toml -- --check
+
+      - name: 运行 Rust 测试
+        run: cargo test --workspace
+
+      - name: 运行 Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 构建 Release 版本
+        run: cargo build --workspace --release
+
+      - name: 检查并运行 Lume 示例
+        run: |
+          cargo run -p lumec_core -- check examples/demo_basic/src/main.lume
+          cargo run -p lumec_core -- run examples/demo_basic/src/main.lume
+          cargo run -p lumec_core -- run examples/demo_math_logging.lume
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editor/vscode‑lume/package-lock.json
+
+      - name: 编译 VS Code 扩展
+        working-directory: editor/vscode‑lume
+        run: |
+          npm ci
+          npm run compile

@@ -86,6 +86,11 @@ impl Evaluator {
                     let value = self.eval(expr, env)?;
                     env.insert(name.clone(), value);
                 }
+                Stmt::IndexAssign { name, index, expr } => {
+                    let index = self.eval(index, env)?;
+                    let value = self.eval(expr, env)?;
+                    assign_index(env, name, index, value)?;
+                }
                 Stmt::Walrus { name, expr } => {
                     if !env.contains_key(name) {
                         return Err(format!(
@@ -157,6 +162,11 @@ impl Evaluator {
                     let value = self.eval(expr, env)?;
                     env.insert(name.clone(), value);
                 }
+                Stmt::IndexAssign { name, index, expr } => {
+                    let index = self.eval(index, env)?;
+                    let value = self.eval(expr, env)?;
+                    assign_index(env, name, index, value)?;
+                }
                 Stmt::Walrus { name, expr } => {
                     let value = self.eval(expr, env)?;
                     env.insert(name.clone(), value.clone());
@@ -214,6 +224,12 @@ impl Evaluator {
             }
             Expr::Binary(op, lhs, rhs) => {
                 let lhs = self.eval(lhs, env)?;
+                if op == "and" && !lhs.truthy() {
+                    return Ok(Value::Bool(false));
+                }
+                if op == "or" && lhs.truthy() {
+                    return Ok(Value::Bool(true));
+                }
                 let rhs = self.eval(rhs, env)?;
                 binary(op, lhs, rhs)
             }
@@ -271,11 +287,7 @@ impl Evaluator {
                     if guard > 100_000 {
                         return Err("while expression exceeded 100000 iterations".into());
                     }
-                    match self.exec_block(body, env)? {
-                        EvalResult::Return(value) => return Ok(value),
-                        EvalResult::Normal => {}
-                    }
-                    last = Value::Int(guard as i64);
+                    last = self.eval_block_value(body, env)?;
                 }
                 Ok(last)
             }
@@ -285,8 +297,6 @@ impl Evaluator {
 
 fn binary(op: &str, lhs: Value, rhs: Value) -> Result<Value, String> {
     match op {
-        "and" => Ok(Value::Bool(lhs.truthy() && rhs.truthy())),
-        "or" => Ok(Value::Bool(lhs.truthy() || rhs.truthy())),
         "==" => Ok(Value::Bool(values_equal(&lhs, &rhs))),
         "!=" => Ok(Value::Bool(!values_equal(&lhs, &rhs))),
         "is" => Ok(Value::Bool(values_equal(&lhs, &rhs))),
@@ -333,6 +343,30 @@ fn binary(op: &str, lhs: Value, rhs: Value) -> Result<Value, String> {
             })
         }
         _ => Err(format!("unsupported operator `{op}`")),
+    }
+}
+
+fn assign_index(
+    env: &mut HashMap<String, Value>,
+    name: &str,
+    index: Value,
+    value: Value,
+) -> Result<(), String> {
+    let index = match index {
+        Value::Int(index) => usize::try_from(index).map_err(|_| "negative array index")?,
+        _ => return Err("array index must be an integer".into()),
+    };
+    match env.get_mut(name) {
+        Some(Value::Array(items)) => {
+            let len = items.len();
+            let slot = items
+                .get_mut(index)
+                .ok_or_else(|| format!("array index {index} out of bounds for length {len}"))?;
+            *slot = value;
+            Ok(())
+        }
+        Some(_) => Err(format!("`{name}` is not an array")),
+        None => Err(format!("undefined variable `{name}`")),
     }
 }
 

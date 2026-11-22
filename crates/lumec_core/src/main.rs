@@ -51,35 +51,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut lume_source = None;
         for line in manifest.lines() {
             let line = line.trim();
-            if let Some(rest) = line.strip_prefix("path = \"") {
-                if let Some(found) = rest.strip_suffix("\"") {
-                    let module_path = project_dir.join(found);
-                    if found.ends_with(".lume") {
-                        lume_source = Some(module_path);
-                    } else if found.ends_with(".c") {
-                        let output = project_dir.join(format!(
-                            "{}.bc",
-                            module_path
-                                .file_stem()
-                                .and_then(|v| v.to_str())
-                                .unwrap_or("module")
-                        ));
-                        let status = std::process::Command::new("clang")
-                            .args(["-emit-llvm", "-c"])
-                            .arg(&module_path)
-                            .arg("-o")
-                            .arg(&output)
-                            .status();
-                        match status {
-                            Ok(status) if status.success() => {}
-                            Ok(status) => {
-                                eprintln!("{}: clang failed with {}", path, status);
-                                std::process::exit(1);
-                            }
-                            Err(error) => {
-                                eprintln!("{}: clang: {}", path, error);
-                                std::process::exit(1);
-                            }
+            if let Some(rest) = line.strip_prefix("path = \"")
+                && let Some(found) = rest.strip_suffix("\"")
+            {
+                let module_path = project_dir.join(found);
+                if found.ends_with(".lume") {
+                    lume_source = Some(module_path);
+                } else if found.ends_with(".c") {
+                    let output = project_dir.join(format!(
+                        "{}.bc",
+                        module_path
+                            .file_stem()
+                            .and_then(|v| v.to_str())
+                            .unwrap_or("module")
+                    ));
+                    let status = std::process::Command::new("clang")
+                        .args(["-emit-llvm", "-c"])
+                        .arg(&module_path)
+                        .arg("-o")
+                        .arg(&output)
+                        .status();
+                    match status {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => {
+                            eprintln!("{}: clang failed with {}", path, status);
+                            std::process::exit(1);
+                        }
+                        Err(error) => {
+                            eprintln!("{}: clang: {}", path, error);
+                            std::process::exit(1);
                         }
                     }
                 }
