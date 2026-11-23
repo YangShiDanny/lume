@@ -265,6 +265,7 @@ impl Checker<'_> {
                         Ok(Type::Bool)
                     }
                     "+" if lhs == Type::String && rhs == Type::String => Ok(Type::String),
+                    "+" if lhs == Type::Array && rhs == Type::Array => Ok(Type::Array),
                     "+" | "-" | "*" | "/" | "%" => {
                         if !is_numeric(&lhs) || !is_numeric(&rhs) {
                             return Err(self.error(format!("operator `{op}` requires numbers")));
@@ -437,10 +438,13 @@ impl Checker<'_> {
             }
             Expr::Index(array, index) => {
                 let array_type = self.check_expr(array)?;
-                self.require_compatible(&Type::Array, &array_type, "indexed value")?;
                 let index_type = self.check_expr(index)?;
                 self.require_compatible(&Type::Int, &index_type, "array index")?;
-                Ok(Type::Any)
+                match array_type {
+                    Type::Array | Type::Any => Ok(Type::Any),
+                    Type::String => Ok(Type::String),
+                    _ => Err(self.error("indexing requires an array or string")),
+                }
             }
             Expr::Array(items) => {
                 let mut element_type = Type::Any;
@@ -509,6 +513,19 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
         "print" => {
             require_builtin_arity(name, args, 1)?;
             Ok(Type::Unit)
+        }
+        "is_alpha"
+        | "is_digit"
+        | "is_alphanumeric"
+        | "is_whitespace"
+        | "is_newline"
+        | "is_identifier_start"
+        | "is_identifier_continue" => {
+            require_builtin_arity(name, args, 1)?;
+            if !matches!(args[0], Type::String | Type::Any) {
+                return Err(format!("builtin `{name}` expects a string"));
+            }
+            Ok(Type::Bool)
         }
         "len" => {
             require_builtin_arity(name, args, 1)?;

@@ -1,7 +1,16 @@
-# AST 定义
+# Lume 源码前端使用的动态 AST 节点构造器。
 
-fn ast_file(name:string)
-ret 0
+fn ast_node(kind:string, value:string, children:Nodes) -> Node
+ret Node{kind:kind, value:value, children:children}
 
-fn ast_func(name:string, params:int, ret_ty:string, body:int)
-ret 0
+fn ast_file(functions:Nodes, error:string) -> ASTFile
+ret ASTFile{kind:"file", functions:functions, error:error}
+
+fn ast_function(name:string, params:Nodes, return_type:string, body:Nodes) -> Node
+ret Node{kind:"function", name:name, params:params, return_type:return_type, body:body}
+
+fn ast_error(message:string) -> Node
+ret Node{kind:"error", message:message}
+
+fn ast_parsed(node:Node, next:int) -> Parsed
+ret Parsed{node:node, next:next}

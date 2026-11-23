@@ -290,6 +290,9 @@ impl Evaluator {
                     return Ok(Value::Bool(true));
                 }
                 let rhs = self.eval(rhs, env)?;
+                if op == "and" || op == "or" {
+                    return Ok(Value::Bool(rhs.truthy()));
+                }
                 binary(op, lhs, rhs)
             }
             Expr::Call(name, args) => {
@@ -371,7 +374,14 @@ impl Evaluator {
                             .cloned()
                             .ok_or_else(|| "array index out of bounds".into())
                     }
-                    _ => Err("index is only supported for integer arrays".into()),
+                    (Value::String(text), Value::Int(index)) => {
+                        let index = usize::try_from(index).map_err(|_| "negative string index")?;
+                        text.chars()
+                            .nth(index)
+                            .map(|character| Value::String(character.to_string()))
+                            .ok_or_else(|| "string index out of bounds".into())
+                    }
+                    _ => Err("index is only supported for arrays and strings".into()),
                 }
             }
             Expr::Array(items) => {
@@ -445,6 +455,19 @@ impl Evaluator {
 }
 
 fn binary(op: &str, lhs: Value, rhs: Value) -> Result<Value, String> {
+    match (op, lhs, rhs) {
+        ("+", Value::String(lhs), Value::String(rhs)) => {
+            return Ok(Value::String(lhs + &rhs));
+        }
+        ("+", Value::Array(mut lhs), Value::Array(rhs)) => {
+            lhs.extend(rhs);
+            return Ok(Value::Array(lhs));
+        }
+        (op, lhs, rhs) => return binary_numeric(op, lhs, rhs),
+    }
+}
+
+fn binary_numeric(op: &str, lhs: Value, rhs: Value) -> Result<Value, String> {
     match op {
         "==" => Ok(Value::Bool(values_equal(&lhs, &rhs))),
         "!=" => Ok(Value::Bool(!values_equal(&lhs, &rhs))),
@@ -581,9 +604,42 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
             }
             match &args[0] {
                 Value::Array(items) => Ok(Some(Value::Int(items.len() as i64))),
-                Value::String(text) => Ok(Some(Value::Int(text.len() as i64))),
+                Value::String(text) => Ok(Some(Value::Int(text.chars().count() as i64))),
                 _ => Err("len expects string or array".into()),
             }
+        }
+        "is_alpha"
+        | "is_digit"
+        | "is_alphanumeric"
+        | "is_whitespace"
+        | "is_newline"
+        | "is_identifier_start"
+        | "is_identifier_continue" => {
+            require_arity(name, args, 1)?;
+            let character = match &args[0] {
+                Value::String(value) => {
+                    let mut chars = value.chars();
+                    let Some(character) = chars.next() else {
+                        return Ok(Some(Value::Bool(false)));
+                    };
+                    if chars.next().is_some() {
+                        return Err(format!("{name} expects a single-character string"));
+                    }
+                    character
+                }
+                _ => return Err(format!("{name} expects a string")),
+            };
+            let valid = match name {
+                "is_alpha" => character.is_alphabetic(),
+                "is_digit" => character.is_ascii_digit(),
+                "is_alphanumeric" => character.is_alphanumeric(),
+                "is_whitespace" => character.is_whitespace(),
+                "is_newline" => character == '\n',
+                "is_identifier_start" => character == '_' || character.is_alphabetic(),
+                "is_identifier_continue" => character == '_' || character.is_alphanumeric(),
+                _ => unreachable!(),
+            };
+            Ok(Some(Value::Bool(valid)))
         }
         "c_matmul" => {
             if args.is_empty() {

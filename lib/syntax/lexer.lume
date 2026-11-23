@@ -1,8 +1,89 @@
-# Lume 源码词法分析器
+# Lume 源码词法分析器。位置使用 Unicode 字符索引，范围为 [start, end)。
 
-fn is_space(ch:string) -> int
-ret ch is " "
+fn token(kind:string, text:string, start:int, end:int, line:int, column:int) -> Token
+ret Token{kind:kind, text:text, start:start, end:end, line:line, column:column}
 
-fn lex(source:string) -> int
-    tokens:int = []
+fn lex(source:string) -> Tokens
+    tokens:Tokens = []
+    index:int = 0
+    source_length:int = len(source)
+    line_number:int = 1
+    column:int = 0
+    while index < source_length
+        ch:string = source[index]
+        if is_newline(ch)
+            tokens = tokens + [token("newline", "", index, index + 1, line_number, column)]
+            index := index + 1
+            line_number := line_number + 1
+            column := 0
+        else if is_whitespace(ch)
+            index := index + 1
+            column := column + 1
+        else if ch is "#"
+            while index < source_length and not is_newline(source[index])
+                index := index + 1
+                column := column + 1
+            end
+        else if is_identifier_start(ch)
+            identifier_start:int = index
+            identifier_column:int = column
+            identifier_text:string = ch
+            index := index + 1
+            column := column + 1
+            while index < source_length and is_identifier_continue(source[index])
+                identifier_text := identifier_text + source[index]
+                index := index + 1
+                column := column + 1
+            end
+            tokens = tokens + [token("ident", identifier_text, identifier_start, index, line_number, identifier_column)]
+        else if is_digit(ch)
+            number_start:int = index
+            number_column:int = column
+            number_text:string = ch
+            index := index + 1
+            column := column + 1
+            while index < source_length and is_digit(source[index])
+                number_text := number_text + source[index]
+                index := index + 1
+                column := column + 1
+            end
+            tokens = tokens + [token("int", number_text, number_start, index, line_number, number_column)]
+        else if ch is "\""
+            string_start:int = index
+            string_column:int = column
+            index := index + 1
+            column := column + 1
+            string_text:string = ""
+            while index < source_length and source[index] != "\""
+                string_text := string_text + source[index]
+                index := index + 1
+                column := column + 1
+            end
+            if index < source_length
+                index := index + 1
+                column := column + 1
+                tokens = tokens + [token("string", string_text, string_start, index, line_number, string_column)]
+            else
+                ret []
+            end
+        else
+            symbol_start:int = index
+            symbol_column:int = column
+            next_index:int = index + 1
+            next:string = ""
+            if next_index < source_length
+                next := source[next_index]
+            end
+            pair:string = ch + next
+            if pair is "==" or pair is "!=" or pair is "<=" or pair is ">=" or pair is ":=" or pair is "->"
+                index := index + 2
+                column := column + 2
+                tokens = tokens + [token("symbol", pair, symbol_start, index, line_number, symbol_column)]
+            else
+                index := index + 1
+                column := column + 1
+                tokens = tokens + [token("symbol", ch, symbol_start, index, line_number, symbol_column)]
+            end
+        end
+    end
 ret tokens

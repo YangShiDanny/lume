@@ -10,8 +10,21 @@ permissions:
 
 jobs:
   build-test:
-    name: Rust + Lume + VS Code
-    runs-on: ubuntu-24.04
+    name: Rust + Lume (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            llvm-script: .github/scripts/setup-llvm-linux.sh
+            exe: lume-bootstrap
+          - os: macos-14
+            llvm-script: .github/scripts/setup-llvm-macos.sh
+            exe: lume-bootstrap
+          - os: windows-2022
+            llvm-script: .github/scripts/setup-llvm-windows.ps1
+            exe: lume-bootstrap.exe
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -21,35 +34,49 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: 安装 LLVM 23
+      - name: 安装 LLVM 23 (Unix)
+        if: runner.os != 'Windows'
         shell: bash
-        run: |
-          curl --retry 5 --retry-delay 2 --retry-all-errors \
-            -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 23
-          sudo apt-get install -y llvm-23-dev clang-23
-          echo "LLVM_SYS_231_PREFIX=/usr/lib/llvm-23" >> "$GITHUB_ENV"
-          echo "/usr/lib/llvm-23/bin" >> "$GITHUB_PATH"
-          llvm-config-23 --version
+        run: bash "${{ matrix.llvm-script }}"
+
+      - name: 安装 LLVM 23 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\${{ matrix.llvm-script }}
 
       - name: 检查 Rust 格式
+        shell: bash
         run: cargo fmt --manifest-path crates/lumec_core/Cargo.toml -- --check
 
       - name: 运行 Rust 测试
+        shell: bash
         run: cargo test --workspace
 
       - name: 运行 Clippy
+        shell: bash
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: 构建 Release 版本
+        shell: bash
         run: cargo build --workspace --release
 
       - name: 检查并运行 Lume 示例
+        shell: bash
         run: |
-          cargo run -p lumec_core -- check examples/demo_basic/src/main.lume
-          cargo run -p lumec_core -- run examples/demo_basic/src/main.lume
-          cargo run -p lumec_core -- run examples/demo_math_logging.lume
+          BIN="target/release/${{ matrix.exe }}"
+          "$BIN" check examples/demo_basic/src/main.lume
+          "$BIN" run examples/demo_basic/src/main.lume
+          "$BIN" run examples/demo_math_logging.lume
+          "$BIN" jit examples/demo_basic/src/main.lume
+          "$BIN" jit examples/demo_llvm_jit.lume
+          "$BIN" llvm-ir examples/demo_llvm_jit.lume
+
+  build-vscode:
+    name: VS Code 扩展
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
 
       - name: 安装 Node.js
         uses: actions/setup-node@v4

@@ -226,17 +226,19 @@ ret result
 
 ## LLVM JIT 编译路径
 
-除解释执行的 `run` 外，`jit` 和 `llvm-ir` 命令可将受支持的整数直线代码
-转换为项目 IR，再交给 LLVM：
+除解释执行的 `run` 外，`jit` 和 `llvm-ir` 命令可将受支持的整数函数、
+条件分支、循环和逻辑表达式转换为项目 IR，再交给 LLVM：
 
 ```bash
 cargo run -p lumec_core -- jit examples/demo_llvm_jit.lume
 cargo run -p lumec_core -- llvm-ir examples/demo_llvm_jit.lume
 ```
 
-此路径目前支持整数常量、局部变量、四则中的加减乘除、比较、命名函数调用
-和返回。控制流、浮点、数组、结构体、闭包等会显式报告暂不支持。该功能是
-自举编译链的前端原型，不代表 Lume 编译器已经自举或覆盖完整语言。
+此路径目前支持整数常量、局部变量、加减乘除、比较、短路 `and`/`or`/`not`、
+命名函数调用、`if`/`while` 语句及 `if`/`while` 块表达式。浮点、数组、
+结构体、闭包、泛型、模式匹配仍会明确报告暂不支持。当前解析器和 IR lowering
+仍由 Rust 实现；这是可执行的 LLVM 编译子集，但不代表 Lume 编写的前端已经
+替换 stage0 或完成自举。
 
 ## 当前限制
 
@@ -247,6 +249,6 @@ cargo run -p lumec_core -- llvm-ir examples/demo_llvm_jit.lume
 - 结构体目前是动态字段值，尚无独立声明/schema；闭包只支持单表达式和按值捕获；泛型仅支持语法擦除，未完整实现类型参数推导。
 - 模式匹配支持字面量、绑定名和通配符，暂不支持解构、守卫、类型/范围模式或编译期穷尽性分析。
 - 静态类型检查为基础子集；完整错误恢复、流敏感分析、数组元素类型和模块命名空间尚未实现。
-- LLVM JIT 前端只支持整数直线函数；`run` 仍由解释器执行。Lume 编写的 lexer/parser/lower/build 骨架尚未构成可自举编译链。
+- LLVM JIT 前端仅支持上述整数和控制流子集；浮点、聚合值、闭包、泛型和模式匹配尚未降低到 IR。`run` 仍由解释器执行。Lume 编写的 lexer/parser/lower/build 文件仍是骨架，完整 stage1/stage2 自举尚未完成。
 
 发现与实现不符时，请以可运行代码和测试为准，并通过项目 issue/PR 反馈。

@@ -286,8 +286,13 @@ impl ExprParser {
     fn parse_compare(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_add()?;
         loop {
-            let op = self.peek().map(|t| t.text.as_str());
-            if matches!(op, Some("<" | "<=" | ">" | ">=" | "==" | "!=" | "is")) {
+            let is_operator = self
+                .peek()
+                .is_some_and(|token| token.kind == LexTokenKind::Op);
+            let op = self.peek().map(|token| token.text.as_str());
+            if (is_operator && matches!(op, Some("<" | "<=" | ">" | ">=" | "==" | "!=")))
+                || self.is_keyword("is")
+            {
                 let op = self.take().unwrap().text;
                 left = Expr::Binary(op, Box::new(left), Box::new(self.parse_add()?));
             } else {
@@ -301,7 +306,11 @@ impl ExprParser {
         let mut left = self.parse_mul()?;
         loop {
             let op = self.peek().map(|t| t.text.as_str());
-            if matches!(op, Some("+") | Some("-")) {
+            if self
+                .peek()
+                .is_some_and(|token| token.kind == LexTokenKind::Op)
+                && matches!(op, Some("+") | Some("-"))
+            {
                 let op = self.take().unwrap().text;
                 left = Expr::Binary(op, Box::new(left), Box::new(self.parse_mul()?));
             } else {
@@ -315,7 +324,11 @@ impl ExprParser {
         let mut left = self.parse_unary()?;
         loop {
             let op = self.peek().map(|t| t.text.as_str());
-            if matches!(op, Some("*") | Some("/") | Some("%")) {
+            if self
+                .peek()
+                .is_some_and(|token| token.kind == LexTokenKind::Op)
+                && matches!(op, Some("*") | Some("/") | Some("%"))
+            {
                 let op = self.take().unwrap().text;
                 left = Expr::Binary(op, Box::new(left), Box::new(self.parse_unary()?));
             } else {
@@ -330,7 +343,10 @@ impl ExprParser {
             self.take();
             return Ok(Expr::Unary("not".into(), Box::new(self.parse_unary()?)));
         }
-        if self.peek().map(|t| t.text.as_str()) == Some("-") {
+        if self
+            .peek()
+            .is_some_and(|token| token.kind == LexTokenKind::Op && token.text == "-")
+        {
             self.take();
             return Ok(Expr::Unary("-".into(), Box::new(self.parse_unary()?)));
         }
@@ -1065,6 +1081,14 @@ ret c
     }
 
     #[test]
+    fn parses_string_comparisons_combined_with_or() {
+        parse_source(
+            "fn is_add(operator:string) -> bool\nret operator is \"+\" or operator is \"-\"\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn parses_and_executes_erased_generic_functions() {
         let funcs = parse_source(
             r#"
@@ -1138,6 +1162,68 @@ ret add_base(5)
         crate::typecheck::check_program(&funcs).unwrap();
         let value = Evaluator::new(funcs).call("main", vec![]).unwrap();
         assert!(matches!(value, Value::Int(42)));
+    }
+
+    #[test]
+    fn runs_the_lume_written_lexer() {
+        let functions = parse_source(include_str!("../../../lib/syntax/lexer.lume")).unwrap();
+        crate::typecheck::check_program(&functions).unwrap();
+        let value = Evaluator::new(functions)
+            .call(
+                "lex",
+                vec![Value::String(
+                    "fn answer() -> int # comment\nret 42\n".into(),
+                )],
+            )
+            .unwrap();
+        let Value::Array(tokens) = value else {
+            panic!("lexer must return an array");
+        };
+        assert_eq!(tokens.len(), 10);
+        assert!(matches!(
+            &tokens[0],
+            Value::Struct { fields, .. }
+                if matches!(fields.get("text"), Some(Value::String(text)) if text == "fn")
+                    && matches!(fields.get("start"), Some(Value::Int(0)))
+        ));
+        assert!(matches!(
+            &tokens[1],
+            Value::Struct { fields, .. }
+                if matches!(fields.get("text"), Some(Value::String(text)) if text == "answer")
+                    && matches!(fields.get("start"), Some(Value::Int(3)))
+                    && matches!(fields.get("line"), Some(Value::Int(1)))
+                    && matches!(fields.get("column"), Some(Value::Int(3)))
+        ));
+        assert!(matches!(
+            &tokens[6],
+            Value::Struct { fields, .. }
+                if matches!(fields.get("kind"), Some(Value::String(kind)) if kind == "newline")
+                    && matches!(fields.get("line"), Some(Value::Int(1)))
+        ));
+    }
+
+    #[test]
+    fn runs_the_lume_written_parser_on_integer_functions() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lib/syntax/parser.lume");
+        let functions = crate::modules::load_source_graph(path).unwrap();
+        crate::typecheck::check_program(&functions).unwrap();
+        let value = Evaluator::new(functions)
+            .call(
+                "parse",
+                vec![Value::String(
+                    "fn add(a:int, b:int) -> int\nret a + b\n\nfn main() -> int\nret add(19, 23)\n"
+                        .into(),
+                )],
+            )
+            .unwrap();
+        let Value::Struct { fields, .. } = value else {
+            panic!("parser must return an AST file");
+        };
+        assert!(matches!(fields.get("error"), Some(Value::String(error)) if error.is_empty()));
+        assert!(
+            matches!(fields.get("functions"), Some(Value::Array(functions)) if functions.len() == 2)
+        );
     }
 
     #[test]

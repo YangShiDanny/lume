@@ -1,8 +1,345 @@
-# Lume 源码语法分析器
+# Lume 编写的递归下降解析器。
+import "lexer.lume"
+import "ast.lume"
 
-fn parse(source:string) -> int
-    tokens:int = lex(source)
+fn get_token(tokens:Tokens, index:int) -> Token
+    if index < 0 or index >= len(tokens)
+        ret Token{kind:"eof", text:"", start:-1, end:-1, line:-1, column:-1}
+    end
+ret tokens[index]
+
+fn parse(source:string) -> ASTFile
+    tokens:Tokens = lex(source)
 ret parse_file(tokens)
 
-fn parse_file(tokens:int) -> int
-ret 0
+fn parse_file(tokens:Tokens) -> ASTFile
+    functions:Nodes = []
+    index:int = 0
+    while index < len(tokens)
+        current:Token = get_token(tokens, index)
+        if current.kind is "newline"
+            index := index + 1
+        else if current.text is "fn" and current.column is 0
+            parsed:Parsed = parse_function(tokens, index)
+            if parsed.node.kind is "error"
+                ret ast_file([], parsed.node.message)
+            end
+            functions = functions + [parsed.node]
+            index := parsed.next
+        else
+            ret ast_file([], "expected a top-level function declaration")
+        end
+    end
+ret ast_file(functions, "")
+
+fn skip_unsupported_block(tokens:Tokens, start:int) -> Parsed
+    depth:int = 0
+    index:int = start
+    previous:string = ""
+    while index < len(tokens)
+        current:Token = get_token(tokens, index)
+        if current.kind is "ident" and (current.text is "if" or current.text is "while" or current.text is "match") and previous != "else"
+            depth := depth + 1
+        else if current.kind is "ident" and current.text is "end"
+            depth := depth - 1
+            if depth is 0
+                ret ast_parsed(ast_error("self-hosted parser currently supports straight-line function bodies"), index + 1)
+            end
+        else if current.kind is "ident" and current.text is "fn" and current.column is 0
+            ret ast_parsed(ast_error("block is missing `end`"), index)
+        end
+        previous := current.text
+        index := index + 1
+    end
+ret ast_parsed(ast_error("block is missing `end`"), index)
+
+fn parse_function(tokens:Tokens, start:int) -> Parsed
+    name_token:Token = get_token(tokens, start + 1)
+    if name_token.kind != "ident"
+        ret ast_parsed(ast_error("expected function name"), start + 1)
+    end
+    open_paren:Token = get_token(tokens, start + 2)
+    if open_paren.text != "("
+        ret ast_parsed(ast_error("expected `(` after function name"), start + 2)
+    end
+
+    params:Nodes = []
+    index:int = start + 3
+    current:Token = get_token(tokens, index)
+    while current.kind != "eof" and current.text != ")"
+        parameter_name:Token = get_token(tokens, index)
+        if parameter_name.kind != "ident"
+            ret ast_parsed(ast_error("expected parameter name"), index)
+        end
+        index := index + 1
+        parameter_type:string = "any"
+        type_colon:Token = get_token(tokens, index)
+        if type_colon.text is ":"
+            parameter_type_token:Token = get_token(tokens, index + 1)
+            if parameter_type_token.kind != "ident"
+                ret ast_parsed(ast_error("expected parameter type"), index + 1)
+            end
+            parameter_type := parameter_type_token.text
+            index := index + 2
+        end
+        parameter:Node = ast_node("parameter", parameter_name.text, [ast_node("type", parameter_type, [])])
+        params = params + [parameter]
+        current := get_token(tokens, index)
+        if current.text is ","
+            index := index + 1
+            current := get_token(tokens, index)
+        else if current.text != ")"
+            ret ast_parsed(ast_error("expected `,` or `)` after parameter"), index)
+        end
+    end
+    if current.kind is "eof"
+        ret ast_parsed(ast_error("unterminated function parameter list"), index)
+    end
+    index := index + 1
+
+    return_type:string = "any"
+    arrow:Token = get_token(tokens, index)
+    if arrow.text is "->"
+        return_type_token:Token = get_token(tokens, index + 1)
+        if return_type_token.kind != "ident"
+            ret ast_parsed(ast_error("expected return type"), index + 1)
+        end
+        return_type := return_type_token.text
+        index := index + 2
+    end
+    while get_token(tokens, index).kind is "newline"
+        index := index + 1
+    end
+
+    body:Nodes = []
+    while index < len(tokens)
+        statement_token:Token = get_token(tokens, index)
+        if statement_token.kind is "newline"
+            index := index + 1
+        else if statement_token.text is "end" and statement_token.column is 0
+            index := index + 1
+            ret ast_parsed(ast_function(name_token.text, params, return_type, body), index)
+        else if statement_token.text is "fn" and statement_token.column is 0
+            ret ast_parsed(ast_function(name_token.text, params, return_type, body), index)
+        else if statement_token.text is "if" or statement_token.text is "while" or statement_token.text is "match"
+            ret skip_unsupported_block(tokens, index)
+        else
+            statement:Parsed = parse_statement(tokens, index)
+            if statement.node.kind is "error"
+                ret ast_parsed(statement.node, statement.next)
+            end
+            body = body + [statement.node]
+            index := statement.next
+        end
+    end
+ret ast_parsed(ast_function(name_token.text, params, return_type, body), index)
+
+fn parse_statement(tokens:Tokens, start:int) -> Parsed
+    first:Token = get_token(tokens, start)
+    line:int = first.line
+    if first.text is "ret"
+        expression:Parsed = parse_or(tokens, start + 1, line)
+        if expression.node.kind is "error"
+            ret expression
+        end
+        ret ast_parsed(ast_node("return", "", [expression.node]), expression.next)
+    end
+
+    name_token:Token = first
+    if name_token.kind != "ident"
+        ret ast_parsed(ast_error("expected a return, declaration, assignment, or expression"), start)
+    end
+    cursor:int = start + 1
+    declared_type:string = "any"
+    separator:Token = get_token(tokens, cursor)
+    declaration:bool = false
+    if separator.text is ":"
+        type_token:Token = get_token(tokens, cursor + 1)
+        if type_token.kind != "ident"
+            ret ast_parsed(ast_error("expected variable type"), cursor + 1)
+        end
+        declared_type := type_token.text
+        cursor := cursor + 2
+        declaration := true
+    end
+    assignment:Token = get_token(tokens, cursor)
+    if assignment.text is "="
+        value:Parsed = parse_or(tokens, cursor + 1, line)
+        if value.node.kind is "error"
+            ret value
+        end
+        if declaration
+            ret ast_parsed(ast_node("declare", name_token.text, [ast_node("type", declared_type, []), value.node]), value.next)
+        end
+        ret ast_parsed(ast_node("assign", name_token.text, [value.node]), value.next)
+    end
+    if declaration
+        ret ast_parsed(ast_error("declaration requires `=` and an initializer"), cursor)
+    end
+    expression:Parsed = parse_or(tokens, start, line)
+    if expression.node.kind is "error"
+        ret expression
+    end
+ret ast_parsed(ast_node("expression", "", [expression.node]), expression.next)
+
+fn parse_or(tokens:Tokens, start:int, line:int) -> Parsed
+    left:Parsed = parse_and(tokens, start, line)
+    if left.node.kind is "error"
+        ret left
+    end
+    index:int = left.next
+    current:Token = get_token(tokens, index)
+    while current.line is line and current.text is "or"
+        right:Parsed = parse_and(tokens, index + 1, line)
+        if right.node.kind is "error"
+            ret right
+        end
+        left := ast_parsed(ast_node("binary", "or", [left.node, right.node]), right.next)
+        index := right.next
+        current := get_token(tokens, index)
+    end
+ret left
+
+fn parse_and(tokens:Tokens, start:int, line:int) -> Parsed
+    left:Parsed = parse_compare(tokens, start, line)
+    if left.node.kind is "error"
+        ret left
+    end
+    index:int = left.next
+    current:Token = get_token(tokens, index)
+    while current.line is line and current.text is "and"
+        right:Parsed = parse_compare(tokens, index + 1, line)
+        if right.node.kind is "error"
+            ret right
+        end
+        left := ast_parsed(ast_node("binary", "and", [left.node, right.node]), right.next)
+        index := right.next
+        current := get_token(tokens, index)
+    end
+ret left
+
+fn is_compare_operator(operator:string) -> bool
+ret operator is "==" or operator is "!=" or operator is "<" or operator is "<=" or operator is ">" or operator is ">=" or operator is "is"
+
+fn is_add_operator(operator:string) -> bool
+ret operator is "+" or operator is "-"
+
+fn is_multiply_operator(operator:string) -> bool
+ret operator is "*" or operator is "/" or operator is "%"
+
+fn parse_compare(tokens:Tokens, start:int, line:int) -> Parsed
+    left:Parsed = parse_add(tokens, start, line)
+    if left.node.kind is "error"
+        ret left
+    end
+    index:int = left.next
+    current:Token = get_token(tokens, index)
+    while current.line is line and is_compare_operator(current.text)
+        right:Parsed = parse_add(tokens, index + 1, line)
+        if right.node.kind is "error"
+            ret right
+        end
+        left := ast_parsed(ast_node("binary", current.text, [left.node, right.node]), right.next)
+        index := right.next
+        current := get_token(tokens, index)
+    end
+ret left
+
+fn parse_add(tokens:Tokens, start:int, line:int) -> Parsed
+    left:Parsed = parse_multiply(tokens, start, line)
+    if left.node.kind is "error"
+        ret left
+    end
+    index:int = left.next
+    current:Token = get_token(tokens, index)
+    while current.line is line and is_add_operator(current.text)
+        right:Parsed = parse_multiply(tokens, index + 1, line)
+        if right.node.kind is "error"
+            ret right
+        end
+        left := ast_parsed(ast_node("binary", current.text, [left.node, right.node]), right.next)
+        index := right.next
+        current := get_token(tokens, index)
+    end
+ret left
+
+fn parse_multiply(tokens:Tokens, start:int, line:int) -> Parsed
+    left:Parsed = parse_atom(tokens, start, line)
+    if left.node.kind is "error"
+        ret left
+    end
+    index:int = left.next
+    current:Token = get_token(tokens, index)
+    while current.line is line and is_multiply_operator(current.text)
+        right:Parsed = parse_atom(tokens, index + 1, line)
+        if right.node.kind is "error"
+            ret right
+        end
+        left := ast_parsed(ast_node("binary", current.text, [left.node, right.node]), right.next)
+        index := right.next
+        current := get_token(tokens, index)
+    end
+ret left
+
+fn parse_atom(tokens:Tokens, start:int, line:int) -> Parsed
+    current:Token = get_token(tokens, start)
+    if current.line != line
+        ret ast_parsed(ast_error("expected expression"), start)
+    end
+    if current.kind is "int" or current.kind is "string"
+        ret ast_parsed(ast_node(current.kind, current.text, []), start + 1)
+    end
+    if current.text is "("
+        nested:Parsed = parse_or(tokens, start + 1, line)
+        if nested.node.kind is "error"
+            ret nested
+        end
+        closing:Token = get_token(tokens, nested.next)
+        if closing.text != ")"
+            ret ast_parsed(ast_error("expected `)`"), nested.next)
+        end
+        ret ast_parsed(nested.node, nested.next + 1)
+    end
+    if current.text is "-" or current.text is "not"
+        operand:Parsed = parse_atom(tokens, start + 1, line)
+        if operand.node.kind is "error"
+            ret operand
+        end
+        ret ast_parsed(ast_node("unary", current.text, [operand.node]), operand.next)
+    end
+    if current.kind is "ident"
+        if current.text is "true" or current.text is "false"
+            ret ast_parsed(ast_node("bool", current.text, []), start + 1)
+        end
+        opening:Token = get_token(tokens, start + 1)
+        if opening.text is "(" and opening.line is line
+            arguments:Nodes = []
+            index:int = start + 2
+            argument:Parsed = parse_or(tokens, index, line)
+            if argument.node.kind is "error"
+                closing_empty:Token = get_token(tokens, index)
+                if closing_empty.text is ")"
+                    ret ast_parsed(ast_node("call", current.text, []), index + 1)
+                end
+                ret argument
+            end
+            arguments = arguments + [argument.node]
+            index := argument.next
+            separator:Token = get_token(tokens, index)
+            while separator.text is ","
+                argument := parse_or(tokens, index + 1, line)
+                if argument.node.kind is "error"
+                    ret argument
+                end
+                arguments = arguments + [argument.node]
+                index := argument.next
+                separator := get_token(tokens, index)
+            end
+            if separator.text != ")"
+                ret ast_parsed(ast_error("expected `)` after call arguments"), index)
+            end
+            ret ast_parsed(ast_node("call", current.text, arguments), index + 1)
+        end
+        ret ast_parsed(ast_node("identifier", current.text, []), start + 1)
+    end
+ret ast_parsed(ast_error("unexpected token in expression"), start)

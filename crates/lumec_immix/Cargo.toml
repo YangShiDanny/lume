@@ -1,0 +1,8 @@
+[package]
+name = "lumec_immix"
+version = "0.1.0"
+edition = "2024"
+description = "Immix-style mark-region collector for LumeC"
+
+[lib]
+path = "src/lib.rs"

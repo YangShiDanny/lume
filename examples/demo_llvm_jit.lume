@@ -1,5 +1,11 @@
-fn twice(value:int) -> int
-ret value * 2
+fn sum_to(limit:int) -> int
+    total:int = 0
+    value:int = 1
+    while value <= limit
+        total := total + value
+        value := value + 1
+    end
+ret total
 
 fn main() -> int
-ret twice(21)
+ret sum_to(10)

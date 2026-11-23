@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（例如 v0.1.0）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            llvm-script: .github/scripts/setup-llvm-linux.sh
+            archive: tar.gz
+            exe: lume-bootstrap
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            llvm-script: .github/scripts/setup-llvm-macos.sh
+            archive: tar.gz
+            exe: lume-bootstrap
+          - name: windows-x64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            llvm-script: .github/scripts/setup-llvm-windows.ps1
+            archive: zip
+            exe: lume-bootstrap.exe
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 安装 LLVM 23 (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash "${{ matrix.llvm-script }}"
+
+      - name: 安装 LLVM 23 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\${{ matrix.llvm-script }}
+
+      - name: 构建 Release 二进制
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} --bin lume-bootstrap
+
+      - name: 打包产物 (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="lume-${{ matrix.name }}"
+          STAGE="$RUNNER_TEMP/$NAME"
+          mkdir -p "$STAGE/bin" "$STAGE/lib"
+          cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "$STAGE/bin/"
+          cp lume lume_launcher.py lume_repl.py README.md "$STAGE/"
+          cp -r lib/. "$STAGE/lib/"
+          cp docs/*.md "$STAGE/" 2>/dev/null || true
+          cd "$RUNNER_TEMP"
+          tar -czf "$GITHUB_WORKSPACE/$NAME.${{ matrix.archive }}" "$NAME"
+
+      - name: 打包产物 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Name = 'lume-${{ matrix.name }}'
+          $Stage = Join-Path $env:RUNNER_TEMP $Name
+          New-Item -ItemType Directory -Force -Path "$Stage\bin", "$Stage\lib" | Out-Null
+          Copy-Item (Join-Path 'target' '${{ matrix.target }}' 'release' '${{ matrix.exe }}') "$Stage\bin\"
+          Copy-Item @('lume.cmd', 'lume.ps1', 'lume_launcher.py', 'lume_repl.py', 'README.md') $Stage
+          Copy-Item -Path 'lib\*' -Destination "$Stage\lib" -Recurse
+          if (Test-Path 'docs') { Copy-Item -Path 'docs\*.md' -Destination $Stage }
+          Compress-Archive -Path $Stage -DestinationPath (Join-Path $env:GITHUB_WORKSPACE "$Name.zip")
+
+      - name: 生成校验和
+        shell: bash
+        run: |
+          for f in *.${{ matrix.archive }}; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+          done
+          cat *.sha256
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            *.${{ matrix.archive }}
+            *.sha256
+          if-no-files-found: error
+
+  publish:
+    name: 发布 Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 汇总产物
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -lh release/
+
+      - name: 生成发布说明
+        run: |
+          {
+            echo "## Lume 二进制发布"
+            echo
+            echo "包含 Linux x64、macOS arm64、Windows x64 三个平台的 \`lume-bootstrap\`。"
+            echo
+            echo "### 使用"
+            echo
+            echo "解压后把 \`bin/\` 加入 PATH，或直接用 \`./lume\` / \`lume.cmd\` 启动 REPL。"
+            echo "REPL 需要 Python 3.10+；语法高亮可选依赖 prompt_toolkit，未安装时自动降级。"
+            echo
+            echo "### 校验和"
+            echo
+            echo '```'
+            cat release/*.sha256
+            echo '```'
+          } > release/NOTES.md
+
+      - name: 创建 Release 并上传
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          body_path: release/NOTES.md
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.sha256
+          generate_release_notes: true

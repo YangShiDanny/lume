@@ -156,7 +156,7 @@ cargo run -p lumec_core -- check path/to/program.lume
 # 运行源文件
 cargo run -p lumec_core -- run path/to/program.lume
 
-# 用当前受支持的整数子集通过 LLVM JIT 编译并运行
+# 用当前受支持的整数与控制流子集通过 LLVM JIT 编译并运行
 cargo run -p lumec_core -- jit examples/demo_llvm_jit.lume
 
 # 输出 LLVM IR

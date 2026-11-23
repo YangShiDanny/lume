@@ -13,7 +13,18 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-BOOTSTRAP = ROOT / "target" / "release" / "lume-bootstrap"
+EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+BOOTSTRAP = ROOT / "target" / "release" / f"lume-bootstrap{EXE_SUFFIX}"
+if os.environ.get("LUME_BOOTSTRAP"):
+    BOOTSTRAP = Path(os.environ["LUME_BOOTSTRAP"]).expanduser()
+
+
+def _supports_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.name == "nt":
+        return os.environ.get("TERM") in {"xterm", "xterm-256color", "cygwin", "ansi"}
+    return sys.stderr.isatty()
 
 KEYWORDS = {"fn", "ret", "if", "else", "end", "while", "import", "is", "and", "or", "not"}
 BUILTINS = {
@@ -29,13 +40,22 @@ SIDE_EFFECT_RE = re.compile(
     r"^\s*(print|log_[a-z_]+|trace|debug|info|warn|error)\s*\("
 )
 
-if sys.stdin.isatty():
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.history import FileHistory
-    from prompt_toolkit.lexers import PygmentsLexer
-    from prompt_toolkit.styles import Style
-    from pygments.lexer import RegexLexer
-    from pygments.token import Comment, Keyword, Name, Number, Operator, Punctuation, String, Text
+HIGHLIGHT = False
+try:
+    if sys.stdin.isatty():
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.history import FileHistory
+        from prompt_toolkit.lexers import PygmentsLexer
+        from prompt_toolkit.styles import Style
+        from pygments.lexer import RegexLexer
+        from pygments.token import Comment, Keyword, Name, Number, Operator, Punctuation, String, Text
+
+        HIGHLIGHT = True
+except (ImportError, OSError):
+    # 没有 prompt_toolkit / Windows 控制台不兼容时退回纯 input()。
+    HIGHLIGHT = False
+
+if HIGHLIGHT:
 
     class LumeLexer(RegexLexer):
         name = "Lume"
@@ -266,7 +286,11 @@ def main() -> None:
         if out:
             print(out, end="" if out.endswith("\n") else "\n")
         if err:
-            print("\033[31m" + err.rstrip() + "\033[0m")
+            text = err.rstrip()
+            if _supports_color():
+                print("\033[31m" + text + "\033[0m")
+            else:
+                print("error: " + text)
 
 
 if __name__ == "__main__":
