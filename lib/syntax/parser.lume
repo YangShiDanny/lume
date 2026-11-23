@@ -138,11 +138,11 @@ fn parse_statement(tokens:Tokens, start:int) -> Parsed
     first:Token = get_token(tokens, start)
     line:int = first.line
     if first.text is "ret"
-        expression:Parsed = parse_or(tokens, start + 1, line)
-        if expression.node.kind is "error"
-            ret expression
+        return_value:Parsed = parse_or(tokens, start + 1, line)
+        if return_value.node.kind is "error"
+            ret return_value
         end
-        ret ast_parsed(ast_node("return", "", [expression.node]), expression.next)
+        ret ast_parsed(ast_node("return", "", [return_value.node]), return_value.next)
     end
 
     name_token:Token = first
@@ -176,11 +176,11 @@ fn parse_statement(tokens:Tokens, start:int) -> Parsed
     if declaration
         ret ast_parsed(ast_error("declaration requires `=` and an initializer"), cursor)
     end
-    expression:Parsed = parse_or(tokens, start, line)
-    if expression.node.kind is "error"
-        ret expression
+    statement_expr:Parsed = parse_or(tokens, start, line)
+    if statement_expr.node.kind is "error"
+        ret statement_expr
     end
-ret ast_parsed(ast_node("expression", "", [expression.node]), expression.next)
+ret ast_parsed(ast_node("expression", "", [statement_expr.node]), statement_expr.next)
 
 fn parse_or(tokens:Tokens, start:int, line:int) -> Parsed
     left:Parsed = parse_and(tokens, start, line)

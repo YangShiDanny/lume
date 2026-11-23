@@ -4,39 +4,83 @@
   "scopeName": "source.lume",
   "fileTypes": ["lume"],
   "patterns": [
-    {
-      "begin": "#",
-      "beginCaptures": {"0": {"name":"punctuation.definition.comment.lume"}},
-      "end": "$",
-      "name": "comment.line.number-sign.lume"
-    },
-    {
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#function-declaration" },
+    { "include": "#builtins" },
+    { "include": "#types" },
+    { "include": "#constants" },
+    { "include": "#control-keywords" },
+    { "include": "#operator-keywords" },
+    { "include": "#type-annotation" },
+    { "include": "#numbers" },
+    { "include": "#function-call" },
+    { "include": "#operators" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
       "match": "#.*$",
       "name": "comment.line.number-sign.lume"
     },
-    {
-      "match": "\\b(fn|ret|if|else|while|match|case|import|and|or|not|is|true|false|end)\\b",
+    "strings": {
+      "begin": "\"",
+      "end": "\"",
+      "name": "string.quoted.double.lume",
+      "patterns": [
+        { "match": "\\\\.", "name": "constant.character.escape.lume" }
+      ]
+    },
+    "function-declaration": {
+      "match": "\\b(fn)\\s+([A-Za-z_]\\w*(?:\\.[A-Za-z_]\\w*)?)(?:\\s*<[^>]*>)?\\s*\\(",
+      "captures": {
+        "1": { "name": "storage.type.function.lume" },
+        "2": { "name": "entity.name.function.lume" }
+      }
+    },
+    "builtins": {
+      "match": "\\b(print|len|sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|asinh|acosh|atanh|exp|exp2|expm1|ln|log|log2|log10|log1p|sqrt|cbrt|floor|ceil|round|trunc|abs|pow|atan2|hypot|fmod|remainder|copysign|trace|debug|info|warn|error|log_trace|log_debug|log_info|log_warn|log_error|log_at)\\b(?=\\s*\\()",
+      "name": "support.function.builtin.lume"
+    },
+    "types": {
+      "match": "\\b(int|i16|i32|i64|u8|u16|u32|u64|usize|float|f32|f64|string|bool|pointer|unit|void|any)\\b",
+      "name": "support.type.lume"
+    },
+    "constants": {
+      "match": "\\b(true|false|null|nil)\\b",
+      "name": "constant.language.lume"
+    },
+    "control-keywords": {
+      "match": "\\b(fn|ret|if|else|while|match|case|import|end)\\b",
       "name": "keyword.control.lume"
     },
-    {
-      "match": "(:=|=>|=|\\+|-|\\*|/|%|<|<=|>|>=|==|!=|\\.|:)",
-      "name": "keyword.operator.lume"
+    "operator-keywords": {
+      "match": "\\b(and|or|not|is)\\b",
+      "name": "keyword.operator.word.lume"
     },
-    {
-      "match": "\"(\\\\.|[^\"\\\\])*\"",
-      "name": "string.quoted.double.lume"
+    "type-annotation": {
+      "match": "\\b([A-Za-z_]\\w*)\\s*(:)\\s*([A-Za-z_]\\w*)",
+      "captures": {
+        "1": { "name": "variable.other.readwrite.lume" },
+        "2": { "name": "punctuation.separator.type-annotation.lume" },
+        "3": { "name": "support.type.lume" }
+      }
     },
-    {
-      "match": "\\b(-?\\d+(?:\\.\\d+)?)\\b",
+    "numbers": {
+      "match": "\\b(0[xX][0-9a-fA-F]+|0[bB][01]+|\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?)\\b",
       "name": "constant.numeric.lume"
     },
-    {
-      "match": "([a-zA-Z_][a-zA-Z0-9_]*)(:)([a-zA-Z0-9_]+)",
-      "captures": {
-        "1": {"name":"variable.other.lume"},
-        "2": {"name":"punctuation.separator.type-annotation.lume"},
-        "3": {"name":"storage.type.lume"}
-      }
+    "function-call": {
+      "match": "\\b([A-Za-z_]\\w*)(?=\\s*\\()",
+      "name": "entity.name.function.call.lume"
+    },
+    "operators": {
+      "match": "(:=|->|=>|==|!=|<=|>=|\\+|-|\\*|/|%|<|>|\\^|\\||&|=)",
+      "name": "keyword.operator.lume"
+    },
+    "punctuation": {
+      "match": "([(){}\\[\\],.;:])",
+      "name": "punctuation.lume"
     }
-  ]
+  }
 }

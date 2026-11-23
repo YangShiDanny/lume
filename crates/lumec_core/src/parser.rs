@@ -1227,6 +1227,31 @@ ret add_base(5)
     }
 
     #[test]
+    fn self_hosted_parser_does_not_confuse_nested_end_with_function_end() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lib/syntax/parser.lume");
+        let functions = crate::modules::load_source_graph(path).unwrap();
+        let value = Evaluator::new(functions)
+            .call(
+                "parse",
+                vec![Value::String(
+                    "fn main()\n    if true\n        if true\n            ret 1\n        end\n    end\nfn after()\nret 0\n"
+                        .into(),
+                )],
+            )
+            .unwrap();
+        assert!(matches!(
+            value,
+            Value::Struct { fields, .. }
+                if matches!(
+                    fields.get("error"),
+                    Some(Value::String(message))
+                        if message.contains("straight-line function bodies")
+                )
+        ));
+    }
+
+    #[test]
     fn evaluates_sum_with_walrus_and_while() {
         let funcs = parse_source(
             r#"

@@ -1,0 +1,13 @@
+{
+  "iconDefinitions": {
+    "_file_lume": {
+      "iconPath": "./images/lume.svg"
+    }
+  },
+  "fileExtensions": {
+    "lume": "_file_lume"
+  },
+  "fileNames": {
+    "bootstrap.lume": "_file_lume"
+  }
+}

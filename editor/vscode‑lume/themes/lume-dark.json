@@ -1,0 +1,39 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vscode/main/extensions/theme-defaults/schemas/theme.schema.json",
+  "name": "Lume Night",
+  "type": "dark",
+  "include": "vscode-dark",
+  "colors": {
+    "editor.background": "#0a0a0d",
+    "editor.foreground": "#e8e8ec",
+    "editorLineNumber.foreground": "#42424a",
+    "editorLineNumber.activeForeground": "#8b8b96",
+    "editorCursor.foreground": "#ffffff",
+    "editor.selectionBackground": "#2a2a38",
+    "editor.inactiveSelectionBackground": "#202028",
+    "editor.lineHighlightBackground": "#101015",
+    "editorIndentGuide.background1": "#1c1c22",
+    "editorIndentGuide.activeBackground1": "#383846",
+    "editorBracketMatch.background": "#2a2a38",
+    "editorBracketMatch.border": "#5b5b6e",
+    "editorGutter.background": "#0a0a0d"
+  },
+  "tokenColors": [
+    { "name": "Comment", "scope": ["comment.line.number-sign.lume", "comment"], "settings": { "foreground": "#5a5a68", "fontStyle": "italic" } },
+    { "name": "Keyword control", "scope": ["keyword.control.lume"], "settings": { "foreground": "#c792ea", "fontStyle": "bold" } },
+    { "name": "Keyword operator word", "scope": ["keyword.operator.word.lume"], "settings": { "foreground": "#89ddff" } },
+    { "name": "Storage / function keyword", "scope": ["storage.type.function.lume"], "settings": { "foreground": "#c792ea", "fontStyle": "bold" } },
+    { "name": "Function definition", "scope": ["entity.name.function.lume"], "settings": { "foreground": "#82aaff", "fontStyle": "bold" } },
+    { "name": "Function call", "scope": ["entity.name.function.call.lume"], "settings": { "foreground": "#82aaff" } },
+    { "name": "Builtin function", "scope": ["support.function.builtin.lume"], "settings": { "foreground": "#7fdbca", "fontStyle": "bold" } },
+    { "name": "Type", "scope": ["support.type.lume", "storage.type.lume"], "settings": { "foreground": "#ffcb6b" } },
+    { "name": "Constant language", "scope": ["constant.language.lume"], "settings": { "foreground": "#f07178", "fontStyle": "bold" } },
+    { "name": "Number", "scope": ["constant.numeric.lume"], "settings": { "foreground": "#f78c6c" } },
+    { "name": "String", "scope": ["string.quoted.double.lume"], "settings": { "foreground": "#c3e88d" } },
+    { "name": "String escape", "scope": ["constant.character.escape.lume"], "settings": { "foreground": "#ff9cac" } },
+    { "name": "Variable", "scope": ["variable.other.readwrite.lume", "variable.other.lume"], "settings": { "foreground": "#e8e8ec" } },
+    { "name": "Type annotation separator", "scope": ["punctuation.separator.type-annotation.lume"], "settings": { "foreground": "#89ddff" } },
+    { "name": "Operator", "scope": ["keyword.operator.lume"], "settings": { "foreground": "#89ddff", "fontStyle": "bold" } },
+    { "name": "Punctuation", "scope": ["punctuation.lume"], "settings": { "foreground": "#a6a6b0" } }
+  ]
+}

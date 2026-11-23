@@ -4,8 +4,9 @@
   "description": "Syntax highlighting and language tools for Lume",
   "version": "0.1.0",
   "publisher": "lumec",
+  "icon": "images/lume-icon.png",
   "engines": {"vscode": "^1.85.0"},
-  "categories": ["Programming Languages"],
+  "categories": ["Programming Languages", "Themes"],
   "activationEvents": ["onLanguage:lume"],
   "main": "./out/extension.js",
   "contributes": {
@@ -24,10 +25,33 @@
       "language": "lume",
       "path": "./snippets/lume.code-snippets.json"
     }],
+    "themes": [
+      {"label": "Lume Night", "uiTheme": "vs-dark", "path": "./themes/lume-dark.json"},
+      {"label": "Lume Day", "uiTheme": "vs", "path": "./themes/lume-light.json"}
+    ],
+    "iconThemes": [
+      {"id": "lume-icons", "label": "Lume Icons", "path": "./icons/lume-file-icons.json"}
+    ],
     "commands": [
       {"command":"lume.runFile","title":"Lume: Run Current File"},
-      {"command":"lume.checkFile","title":"Lume: Check Current File"}
-    ]
+      {"command":"lume.checkFile","title":"Lume: Check Current File"},
+      {"command":"lume.openRepl","title":"Lume: Open REPL"}
+    ],
+    "configuration": {
+      "title": "Lume",
+      "properties": {
+        "lume.bootstrapPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to lume-bootstrap. Overrides workspace detection."
+        },
+        "lume.replCommand": {
+          "type": "string",
+          "default": "lume",
+          "description": "Command used by 'Lume: Open REPL'."
+        }
+      }
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",

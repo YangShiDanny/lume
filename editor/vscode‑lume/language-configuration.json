@@ -6,15 +6,25 @@
     ["{", "}"]
   ],
   "autoClosingPairs": [
-    ["\"", "\""],
-    ["(", ")"],
-    ["[", "]"],
-    ["{", "}"]
+    {"open": "\"", "close": "\""},
+    {"open": "(", "close": ")"},
+    {"open": "[", "close": "]"},
+    {"open": "{", "close": "}"}
   ],
   "surroundingPairs": [
     ["\"", "\""],
     ["(", ")"],
     ["[", "]"]
   ],
-  "wordPattern": "[A-Za-z_][A-Za-z0-9_]*"
+  "wordPattern": "[A-Za-z_][A-Za-z0-9_]*",
+  "indentationRules": {
+    "increaseIndentPattern": "^\\s*(fn\\b|if\\b|while\\b|match\\b|case\\b|else\\b|.*(?::=|=)\\s*(?:if|while|match)\\b).*$",
+    "decreaseIndentPattern": "^\\s*(end|else)\\b.*$"
+  },
+  "folding": {
+    "markers": {
+      "start": "^\\s*(fn\\b|if\\b|while\\b|match\\b)",
+      "end": "^\\s*end\\b"
+    }
+  }
 }
