@@ -224,6 +224,28 @@ ret result
 
 如果没有模式匹配且没有通配/绑定分支，运行时会返回明确的非穷尽匹配错误。
 
+## 动态 C FFI
+
+解释器支持显式类型签名的动态 C 共享库调用和 C 回调。加载、调用入口使用
+`ffi_unsafe_*` 命名，因为库初始化和不匹配的 C ABI 签名可能执行任意本机代码、
+破坏内存或终止进程。签名格式、GPU SDK 常用库名、回调保活要求及 GC pin 示例
+见[动态 C FFI 文档](./ffi.md)。
+
+```lume
+fn main() -> int
+    c_runtime:any = ffi_unsafe_load("libc.so.6")
+    abs_fn:any = ffi_symbol(c_runtime, "abs")
+    result:any = ffi_unsafe_call(abs_fn, "i32(i32)", [-42])
+    print(result)
+ret 0
+```
+
+签名支持 C 默认 ABI 的整数、浮点数、指针和 `void` 返回类型。通过 FFI 可调用
+CUDA、Level Zero、HIP、Vulkan loader 的宿主 API；当前没有 GPU 加速，也不支持
+变参、按值结构体/union 或非默认 calling convention。LLVM JIT 的 IR 目前不支持
+通用动态符号调用。`ffi_buffer` 可创建有界本机缓冲区，以便读写 C 输出参数和
+按目标头文件布局访问结构体指针。
+
 ## LLVM JIT 编译路径
 
 除解释执行的 `run` 外，`jit` 和 `llvm-ir` 命令可将受支持的整数函数、

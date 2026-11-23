@@ -5,44 +5,79 @@
 # 同时 zig/zlib/xml2 的 .lib 名字与官方包不一致。
 #
 # 本脚本：
-#   1. 从 GitHub Releases 下载官方 clang+llvm win64 MSVC 压缩包；
-#   2. 解压到 $env:RUNNER_TEMP/llvm-23；
-#   3. 用 PowerShell 模块写一个 llvm-config.bat 垫片，重写 --system-libs 输出；
+#   1. 用 curl.exe（流式下载，远快于 Invoke-WebRequest）从 GitHub Releases
+#      （或 LLVM_BASE_URL / LLVM_DOWNLOAD_URL 指定的镜像）下载官方 clang+llvm win64 MSVC 包；
+#      已解压过则直接复用；
+#   2. 优先用 7z 解压（比 bsdtar 快很多），没有 7z 时回退到 tar；
+#   3. 写一个 llvm-config-23.bat 垫片，重写 --system-libs 输出；
 #   4. 设置 LLVM_SYS_231_PREFIX / PATH 供后续 cargo build 使用。
 #
-# 不修改仓库源码；只在 CI 环境运行。
+# 不修改仓库源码；只在 CI 环境运行。Windows runner 不预装 LLVM 23，全靠本脚本准备。
 
 $ErrorActionPreference = 'Stop'
 
 $Version = $env:LLVM_VERSION
 if (-not $Version) { $Version = '23.1.6' }
 $Prefix = Join-Path $env:RUNNER_TEMP 'llvm-23'
-$Archive = Join-Path $env:RUNNER_TEMP 'llvm-23.7z'
-$Url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$Version/clang+llvm-$Version-x86_64-pc-windows-msvc.tar.xz"
+$Archive = Join-Path $env:RUNNER_TEMP 'llvm-23.tar.xz'
+$RealConfig = Join-Path $Prefix 'bin\llvm-config.exe'
+
+# 默认从官方 GitHub Release 下载；网络不通时可用 LLVM_BASE_URL 指向镜像，
+# 或用 LLVM_DOWNLOAD_URL 直接指定完整的 .tar.xz 地址。
+$BaseUrl = $env:LLVM_BASE_URL
+if (-not $BaseUrl) { $BaseUrl = 'https://github.com/llvm/llvm-project/releases/download' }
+$BaseUrl = $BaseUrl.TrimEnd('/')
+if ($env:LLVM_DOWNLOAD_URL) {
+    $Url = $env:LLVM_DOWNLOAD_URL
+} else {
+    $Url = "$BaseUrl/llvmorg-$Version/clang+llvm-$Version-x86_64-pc-windows-msvc.tar.xz"
+}
 
 function Get-WithRetry {
     param([string]$Uri, [string]$Out, [int]$Tries = 5)
     for ($i = 1; $i -le $Tries; $i++) {
-        try {
-            Invoke-WebRequest -Uri $Uri -OutFile $Out -UseBasicParsing
-            return
-        } catch {
-            if ($i -eq $Tries) { throw }
-            Start-Sleep -Seconds (2 * $i)
-        }
+        # Invoke-WebRequest 会把几百 MB 全部缓进内存，在 CI 上极慢；curl.exe 是流式的。
+        & curl.exe -L --fail --show-error --retry 3 --connect-timeout 30 --max-time 1800 -o $Out $Uri
+        if ($LASTEXITCODE -eq 0) { return }
+        if ($i -eq $Tries) { throw "curl download failed with exit code $LASTEXITCODE" }
+        Start-Sleep -Seconds (2 * $i)
     }
 }
 
-Write-Host "Downloading $Url"
-Get-WithRetry -Uri $Url -Out $Archive
+if (Test-Path $RealConfig) {
+    $ExistingVersion = & $RealConfig --version
+    Write-Host "Reusing LLVM at $Prefix (version $ExistingVersion)"
+} else {
+    if (Test-Path $Archive) {
+        Write-Host "Reusing downloaded archive $Archive"
+    } else {
+        Write-Host "Downloading $Url"
+        Get-WithRetry -Uri $Url -Out $Archive
+    }
 
-Write-Host "Extracting LLVM to $Prefix"
-New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
-tar -xf $Archive -C $Prefix --strip-components=1
-if ($LASTEXITCODE -ne 0) { throw 'tar extraction failed' }
-
-$RealConfig = Join-Path $Prefix 'bin\llvm-config.exe'
-if (-not (Test-Path $RealConfig)) { throw "llvm-config.exe not found at $RealConfig" }
+    Write-Host "Extracting LLVM to $Prefix"
+    New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
+    $SevenZip = Get-Command 7z.exe -ErrorAction SilentlyContinue
+    if ($SevenZip) {
+        # 7z 解压几万个文件的速度明显快于 Windows 自带 bsdtar。
+        & 7z x $Archive "-o$Prefix" -y | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw '7z xz extraction failed' }
+        $InnerTar = Get-ChildItem -Path $Prefix -Filter '*.tar' -File | Select-Object -First 1
+        if (-not $InnerTar) { throw 'inner LLVM tar not found' }
+        & 7z x $InnerTar.FullName "-o$Prefix" -y | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw '7z tar extraction failed' }
+        Remove-Item -Path $InnerTar.FullName -Force
+        $Nested = Join-Path $Prefix "clang+llvm-$Version-x86_64-pc-windows-msvc"
+        if (Test-Path $Nested) {
+            Get-ChildItem -Force -Path $Nested | Move-Item -Destination $Prefix -Force
+            Remove-Item -Path $Nested -Recurse -Force
+        }
+    } else {
+        tar -xf $Archive -C $Prefix --strip-components=1
+        if ($LASTEXITCODE -ne 0) { throw 'tar extraction failed' }
+    }
+    if (-not (Test-Path $RealConfig)) { throw "llvm-config.exe not found at $RealConfig" }
+}
 
 # llvm-config 垫片：把 --system-libs 中带绝对路径的 *.lib 改写为纯文件名，
 # 并把已知缺失的 zstd/zlib/xml2 库名映射到官方包里的名字。

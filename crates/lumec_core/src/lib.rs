@@ -1,6 +1,9 @@
+pub mod buffer;
 pub mod builtin;
+pub mod clock;
 pub mod codegen;
 pub mod evaluator;
+pub mod ffi;
 pub mod gc;
 pub mod ir;
 mod jit;

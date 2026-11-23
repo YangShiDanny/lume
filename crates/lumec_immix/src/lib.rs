@@ -14,8 +14,8 @@
 //! 不做的事：并发/增量标记、写屏障、跨代引用、保守栈扫描。这些需要 core
 //! 侧配合；当前 core 只登记显式根，不做保守栈扫描。
 
-use std::error::Error;
 use std::collections::HashMap;
+use std::error::Error;
 use std::fmt;
 use std::mem::size_of;
 use std::ptr;
@@ -384,16 +384,7 @@ impl ImmixHeap {
         for root in roots {
             self.mark_object(root, &mut worklist);
         }
-        let pinned = self
-            .blocks
-            .iter()
-            .flat_map(|block| block.objects.iter().copied())
-            .filter(|&object| unsafe {
-                let header = Self::header(object);
-                header.magic == MAGIC && header.pinned != 0
-            })
-            .collect::<Vec<_>>();
-        for object in pinned {
+        for object in self.pinned_objects() {
             self.mark_object(object, &mut worklist);
         }
         while let Some(object) = worklist.pop() {
@@ -501,6 +492,9 @@ impl ImmixHeap {
         for root in roots {
             self.mark_object(root, &mut worklist);
         }
+        for object in self.pinned_objects() {
+            self.mark_object(object, &mut worklist);
+        }
         while let Some(object) = worklist.pop() {
             let mut children = Vec::new();
             trace(object, &mut |slot| {
@@ -568,6 +562,29 @@ impl ImmixHeap {
         stats
     }
 
+    /// Like [`collect_with`], but exposes payload pointers and payload pointer slots.
+    pub fn collect_with_payloads<F>(&mut self, mut trace: F) -> CollectStats
+    where
+        F: FnMut(*mut u8, &mut dyn FnMut(&mut *mut u8)),
+    {
+        self.collect_with(|object, visit| {
+            let payload = unsafe { Self::payload::<u8>(object) };
+            trace(payload, &mut |payload_slot| {
+                let mut object_slot = if payload_slot.is_null() {
+                    ptr::null_mut()
+                } else {
+                    payload_slot.wrapping_sub(size_of::<Header>())
+                };
+                visit(&mut object_slot);
+                *payload_slot = if object_slot.is_null() {
+                    ptr::null_mut()
+                } else {
+                    object_slot.wrapping_add(size_of::<Header>())
+                };
+            });
+        })
+    }
+
     /// 取对象负载指针。
     ///
     /// # Safety
@@ -585,7 +602,7 @@ impl ImmixHeap {
         if payload.is_null() {
             return ptr::null_mut();
         }
-        (payload as *mut u8).sub(size_of::<Header>())
+        unsafe { (payload as *mut u8).sub(size_of::<Header>()) }
     }
 
     /// 取对象 header 的共享引用。
@@ -632,11 +649,12 @@ impl ImmixHeap {
             return None;
         }
         let address = payload as usize;
-        let object = self.blocks.iter().find_map(|block| {
-            block.objects.iter().copied().find(|&object| {
-                (object as usize).checked_add(size_of::<Header>()) == Some(address)
-            })
-        });
+        let object =
+            self.blocks.iter().find_map(|block| {
+                block.objects.iter().copied().find(|&object| {
+                    (object as usize).checked_add(size_of::<Header>()) == Some(address)
+                })
+            });
         if let Some(object) = object {
             return Some(self.resolve_known(object));
         }
@@ -831,6 +849,17 @@ impl ImmixHeap {
         }
         worklist.push(object);
         true
+    }
+
+    fn pinned_objects(&self) -> Vec<*mut u8> {
+        self.blocks
+            .iter()
+            .flat_map(|block| block.objects.iter().copied())
+            .filter(|&object| unsafe {
+                let header = Self::header(object);
+                header.magic == MAGIC && header.pinned != 0
+            })
+            .collect()
     }
 
     unsafe fn is_live(object: *mut u8) -> bool {

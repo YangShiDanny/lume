@@ -151,12 +151,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         match evaluator.call(entry, vec![]) {
             Ok(Value::Int(value)) => println!("{}", value),
+            Ok(Value::UInt(value)) => println!("{}", value),
             Ok(Value::Float(value)) => println!("{}", value),
             Ok(Value::Bool(value)) => println!("{}", value),
             Ok(Value::String(value)) => println!("{}", value),
             Ok(Value::Array(values)) => println!("{:?}", values),
             Ok(Value::Struct { name, .. }) => println!("<{name}>"),
             Ok(Value::Closure { .. }) => println!("<closure>"),
+            Ok(Value::FfiLibrary(_)) => println!("<ffi library>"),
+            Ok(Value::FfiSymbol(_)) => println!("<ffi symbol>"),
+            Ok(Value::FfiCallback(_)) => println!("<ffi callback>"),
+            Ok(Value::FfiBuffer(buffer)) => println!("<ffi buffer {} bytes>", buffer.size()),
+            Ok(Value::FfiPointer(pointer)) => println!("ptr({pointer:p})"),
+            Ok(Value::GcBuffer(buffer)) => println!("<gc buffer {} bytes>", buffer.len()),
             Ok(Value::Unit) => {}
             Err(error) => {
                 eprintln!("{}: {}", resolved, error);
@@ -197,12 +204,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     match evaluator.call(entry, vec![]) {
         Ok(Value::Int(value)) => println!("{}", value),
+        Ok(Value::UInt(value)) => println!("{}", value),
         Ok(Value::Float(value)) => println!("{}", value),
         Ok(Value::Bool(value)) => println!("{}", value),
         Ok(Value::String(value)) => println!("{}", value),
         Ok(Value::Array(values)) => println!("{:?}", values),
         Ok(Value::Struct { name, .. }) => println!("<{name}>"),
         Ok(Value::Closure { .. }) => println!("<closure>"),
+        Ok(Value::FfiLibrary(_)) => println!("<ffi library>"),
+        Ok(Value::FfiSymbol(_)) => println!("<ffi symbol>"),
+        Ok(Value::FfiCallback(_)) => println!("<ffi callback>"),
+        Ok(Value::FfiBuffer(buffer)) => println!("<ffi buffer {} bytes>", buffer.size()),
+        Ok(Value::FfiPointer(pointer)) => println!("ptr({pointer:p})"),
+        Ok(Value::GcBuffer(buffer)) => println!("<gc buffer {} bytes>", buffer.len()),
         Ok(Value::Unit) => {}
         Err(error) => {
             eprintln!("{}: {}", path, error);

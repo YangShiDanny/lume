@@ -1,0 +1,6 @@
+fn main() -> int
+    c_runtime:any = ffi_unsafe_load("libc.so.6")
+    strlen_fn:any = ffi_symbol(c_runtime, "strlen")
+    length:any = ffi_unsafe_call(strlen_fn, "usize(pointer)", ["Lume FFI"])
+    print(length)
+ret 0

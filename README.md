@@ -196,4 +196,6 @@ GitHub Actions 会在推送和 Pull Request 时安装 LLVM 23，并执行 Rust �
 
 - [Lume 语言说明](docs/lume_spec.md)
 - [数学与日志内置函数](docs/math-and-logging.md)
+- [动态 C FFI、回调与 GC pin](docs/ffi.md)
+- [Immix 垃圾回收器](docs/immix-gc.md)
 - [VS Code 扩展说明](editor/vscode‑lume/README.md)

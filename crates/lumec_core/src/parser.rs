@@ -1251,6 +1251,94 @@ ret add_base(5)
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lume_can_load_and_call_native_c_symbols() {
+        let funcs = parse_source(
+            r#"
+fn main() -> int
+    library:any = ffi_unsafe_load("libc.so.6")
+    absolute:any = ffi_symbol(library, "abs")
+    ret ffi_unsafe_call(absolute, "i32(i32)", [-42])
+"#,
+        )
+        .unwrap();
+        crate::typecheck::check_program(&funcs).unwrap();
+        assert!(matches!(
+            Evaluator::new(funcs).call("main", vec![]),
+            Ok(Value::Int(42))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lume_preserves_unsigned_ffi_results_for_comparison() {
+        let funcs = parse_source(
+            r#"
+fn main() -> bool
+    c_runtime:any = ffi_unsafe_load("libc.so.6")
+    strlen_fn:any = ffi_symbol(c_runtime, "strlen")
+    length:any = ffi_unsafe_call(strlen_fn, "usize(pointer)", ["Lume"])
+ret length > 0 and length == 4
+"#,
+        )
+        .unwrap();
+        crate::typecheck::check_program(&funcs).unwrap();
+        assert!(matches!(
+            Evaluator::new(funcs).call("main", vec![]),
+            Ok(Value::Bool(true))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lume_can_pass_mutable_memory_to_c_and_read_its_output() {
+        let funcs = parse_source(
+            r#"
+fn main() -> bool
+    c_runtime:any = ffi_unsafe_load("libc.so.6")
+    getcwd_fn:any = ffi_symbol(c_runtime, "getcwd")
+    cwd_buffer:any = ffi_buffer(4096, 8)
+    ffi_unsafe_call(getcwd_fn, "pointer(pointer, usize)", [cwd_buffer, 4096])
+    cwd:string = ffi_buffer_read_cstr(cwd_buffer, 0, 4096)
+ret len(cwd) > 0
+"#,
+        )
+        .unwrap();
+        crate::typecheck::check_program(&funcs).unwrap();
+        assert!(matches!(
+            Evaluator::new(funcs).call("main", vec![]),
+            Ok(Value::Bool(true))
+        ));
+    }
+
+    #[test]
+    fn lume_closures_can_be_exported_as_c_callbacks() {
+        let funcs = parse_source(
+            r#"
+fn make_callback()
+    ret ffi_callback("i32(i32)", fn(value:int) -> int => value + 1)
+"#,
+        )
+        .unwrap();
+        crate::typecheck::check_program(&funcs).unwrap();
+        let value = Evaluator::new(funcs).call("make_callback", vec![]).unwrap();
+        let Value::FfiCallback(callback) = value else {
+            panic!("expected C callback value");
+        };
+        let function = unsafe { callback.code_ptr() };
+        let cif =
+            libffi::middle::Cif::new([libffi::middle::Type::i32()], libffi::middle::Type::i32());
+        let input = 41i32;
+        let output = unsafe {
+            cif.call::<i32>(
+                libffi::middle::CodePtr(function),
+                &[libffi::middle::arg(&input)],
+            )
+        };
+        assert_eq!(output, 42);
+    }
+
     #[test]
     fn evaluates_sum_with_walrus_and_while() {
         let funcs = parse_source(

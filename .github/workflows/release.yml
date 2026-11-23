@@ -29,7 +29,7 @@ jobs:
             archive: tar.gz
             exe: lume-bootstrap
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             llvm-script: .github/scripts/setup-llvm-macos.sh
             archive: tar.gz
@@ -56,9 +56,20 @@ jobs:
         shell: bash
         run: bash "${{ matrix.llvm-script }}"
 
+      - name: 缓存 LLVM 23 安装包 (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/llvm-23.tar.xz
+          key: llvm-23-archive-${{ vars.LLVM_VERSION || '23.1.6' }}-v1
+
       - name: 安装 LLVM 23 (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          LLVM_VERSION: ${{ vars.LLVM_VERSION || '23.1.6' }}
+          LLVM_BASE_URL: ${{ vars.LLVM_BASE_URL || '' }}
+          LLVM_DOWNLOAD_URL: ${{ vars.LLVM_DOWNLOAD_URL || '' }}
         run: .\${{ matrix.llvm-script }}
 
       - name: 构建 Release 二进制

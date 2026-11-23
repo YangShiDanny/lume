@@ -1,11 +1,21 @@
+use crate::buffer::{GcBuffer, GcBufferHeap};
+use crate::clock;
+use crate::ffi::{
+    FfiSignature, FfiType, FfiValue, ForeignBuffer, ForeignCallback, ForeignLibrary, ForeignSymbol,
+};
 use crate::parser::{Expr, FuncDef, Param, Pattern, Stmt};
 #[cfg(feature = "system-sleef")]
 use crate::sleef;
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ffi::c_void;
+use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
+    UInt(u64),
     Float(f64),
     Bool(bool),
     String(String),
@@ -19,6 +29,12 @@ pub enum Value {
         body: Expr,
         captured: HashMap<String, Value>,
     },
+    FfiLibrary(Arc<ForeignLibrary>),
+    FfiSymbol(Rc<ForeignSymbol>),
+    FfiCallback(Rc<ForeignCallback>),
+    FfiBuffer(Rc<ForeignBuffer>),
+    FfiPointer(*mut c_void),
+    GcBuffer(Rc<GcBuffer>),
     Unit,
 }
 
@@ -45,12 +61,19 @@ impl Value {
     fn truthy(&self) -> bool {
         match self {
             Value::Int(v) => *v != 0,
+            Value::UInt(v) => *v != 0,
             Value::Float(v) => *v != 0.0 && !v.is_nan(),
             Value::Bool(v) => *v,
             Value::String(v) => !v.is_empty(),
             Value::Array(v) => !v.is_empty(),
             Value::Struct { .. } => true,
             Value::Closure { .. } => true,
+            Value::FfiLibrary(_)
+            | Value::FfiSymbol(_)
+            | Value::FfiCallback(_)
+            | Value::FfiBuffer(_)
+            | Value::FfiPointer(_) => true,
+            Value::GcBuffer(buffer) => buffer.len() > 0,
             Value::Unit => false,
         }
     }
@@ -62,14 +85,19 @@ pub enum EvalResult {
     Return(Value),
 }
 
+#[derive(Clone)]
 pub struct Evaluator {
     funcs: HashMap<String, FuncDef>,
+    heap: GcBufferHeap,
 }
 
 impl Evaluator {
     pub fn new(funcs: Vec<FuncDef>) -> Self {
         let funcs = funcs.into_iter().map(|f| (f.name.clone(), f)).collect();
-        Self { funcs }
+        Self {
+            funcs,
+            heap: GcBufferHeap::default(),
+        }
     }
 
     pub fn call(&self, name: &str, args: Vec<Value>) -> Result<Value, String> {
@@ -112,11 +140,271 @@ impl Evaluator {
                 args.len()
             ));
         }
+
         let mut env = captured.clone();
         for (param, value) in params.iter().zip(args) {
             env.insert(param.name.clone(), value);
         }
         self.eval(body, &mut env)
+    }
+
+    fn ffi_builtin(&self, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+        match name {
+            "ffi_unsafe_load" => {
+                require_arity(name, args, 1)?;
+                let Value::String(path) = &args[0] else {
+                    return Err("ffi_unsafe_load expects a library path string".into());
+                };
+                let library =
+                    unsafe { ForeignLibrary::open(path) }.map_err(|error| error.to_string())?;
+                Ok(Some(Value::FfiLibrary(library)))
+            }
+            "ffi_symbol" => {
+                require_arity(name, args, 2)?;
+                let (Value::FfiLibrary(library), Value::String(symbol)) = (&args[0], &args[1])
+                else {
+                    return Err("ffi_symbol expects a library and symbol name".into());
+                };
+                Ok(Some(Value::FfiSymbol(Rc::new(
+                    library.symbol(symbol).map_err(|error| error.to_string())?,
+                ))))
+            }
+            "ffi_unsafe_call" => {
+                require_arity(name, args, 3)?;
+                let (Value::FfiSymbol(symbol), Value::String(spec), Value::Array(values)) =
+                    (&args[0], &args[1], &args[2])
+                else {
+                    return Err(
+                        "ffi_unsafe_call expects a symbol, signature string, and argument array"
+                            .into(),
+                    );
+                };
+                let signature = FfiSignature::parse(spec).map_err(|error| error.to_string())?;
+                if values.len() != signature.args.len() {
+                    return Err(format!(
+                        "C function expects {} arguments, received {}",
+                        signature.args.len(),
+                        values.len()
+                    ));
+                }
+                let ffi_args = signature
+                    .args
+                    .iter()
+                    .copied()
+                    .zip(values)
+                    .map(|(ty, value)| ffi_value_from_lume(ty, value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = unsafe { symbol.call(&signature, &ffi_args) }
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(lume_value_from_ffi(result)))
+            }
+            "ffi_callback" => {
+                require_arity(name, args, 2)?;
+                let (
+                    Value::String(spec),
+                    Value::Closure {
+                        params,
+                        body,
+                        captured,
+                    },
+                ) = (&args[0], &args[1])
+                else {
+                    return Err("ffi_callback expects a signature string and a Lume closure".into());
+                };
+                let signature = FfiSignature::parse(spec).map_err(|error| error.to_string())?;
+                let callback_signature = signature.clone();
+                let evaluator = self.clone();
+                let params = params.clone();
+                let body = body.clone();
+                let captured = captured.clone();
+                let callback = ForeignCallback::new(signature, move |values| {
+                    if values.len() != params.len() {
+                        return Err(format!(
+                            "Lume callback expects {} arguments, received {}",
+                            params.len(),
+                            values.len()
+                        ));
+                    }
+                    let lume_args = values.iter().cloned().map(lume_value_from_ffi).collect();
+                    let result = evaluator.invoke_closure(&params, &body, &captured, lume_args)?;
+                    ffi_value_from_lume(callback_signature.result, &result)
+                })
+                .map_err(|error| error.to_string())?;
+                Ok(Some(Value::FfiCallback(callback)))
+            }
+            "ffi_callback_error" => {
+                require_arity(name, args, 1)?;
+                let Value::FfiCallback(callback) = &args[0] else {
+                    return Err("ffi_callback_error expects an FFI callback".into());
+                };
+                Ok(Some(Value::String(
+                    callback
+                        .take_error()
+                        .map_err(|error| error.to_string())?
+                        .unwrap_or_default(),
+                )))
+            }
+            "ffi_null" => {
+                require_arity(name, args, 0)?;
+                Ok(Some(Value::FfiPointer(std::ptr::null_mut())))
+            }
+            "ffi_buffer" => {
+                require_arity(name, args, 2)?;
+                let size = usize::try_from(value_int(&args[0], name)?)
+                    .map_err(|_| "FFI buffer size must be non-negative")?;
+                let alignment = usize::try_from(value_int(&args[1], name)?)
+                    .map_err(|_| "FFI buffer alignment must be positive")?;
+                let buffer =
+                    ForeignBuffer::new(size, alignment).map_err(|error| error.to_string())?;
+                Ok(Some(Value::FfiBuffer(buffer)))
+            }
+            "ffi_buffer_read" => {
+                require_arity(name, args, 3)?;
+                let (Value::FfiBuffer(buffer), Value::String(type_name)) = (&args[0], &args[2])
+                else {
+                    return Err("ffi_buffer_read expects a buffer, offset, and type name".into());
+                };
+                let offset = usize::try_from(value_int(&args[1], name)?)
+                    .map_err(|_| "FFI buffer offset must be non-negative")?;
+                let ty = FfiType::parse(type_name).map_err(|error| error.to_string())?;
+                let value = buffer.read(offset, ty).map_err(|error| error.to_string())?;
+                Ok(Some(lume_value_from_ffi(value)))
+            }
+            "ffi_buffer_write" => {
+                require_arity(name, args, 4)?;
+                let (Value::FfiBuffer(buffer), Value::String(type_name)) = (&args[0], &args[2])
+                else {
+                    return Err(
+                        "ffi_buffer_write expects a buffer, offset, type name, and value".into(),
+                    );
+                };
+                let offset = usize::try_from(value_int(&args[1], name)?)
+                    .map_err(|_| "FFI buffer offset must be non-negative")?;
+                let ty = FfiType::parse(type_name).map_err(|error| error.to_string())?;
+                let value = ffi_value_from_lume(ty, &args[3])?;
+                buffer
+                    .write(offset, ty, &value)
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(Value::Unit))
+            }
+            "ffi_buffer_write_cstr" => {
+                require_arity(name, args, 3)?;
+                let (Value::FfiBuffer(buffer), Value::String(value)) = (&args[0], &args[2]) else {
+                    return Err("ffi_buffer_write_cstr expects a buffer, offset, and string".into());
+                };
+                let offset = usize::try_from(value_int(&args[1], name)?)
+                    .map_err(|_| "FFI buffer offset must be non-negative")?;
+                buffer
+                    .write_c_string(offset, value)
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(Value::Unit))
+            }
+            "ffi_buffer_read_cstr" => {
+                require_arity(name, args, 3)?;
+                let (Value::FfiBuffer(buffer), Value::Int(max_len)) = (&args[0], &args[2]) else {
+                    return Err(
+                        "ffi_buffer_read_cstr expects a buffer, offset, and max length".into(),
+                    );
+                };
+                let offset = usize::try_from(value_int(&args[1], name)?)
+                    .map_err(|_| "FFI buffer offset must be non-negative")?;
+                let max_len = usize::try_from(*max_len)
+                    .map_err(|_| "FFI string max length must be non-negative")?;
+                let value = buffer
+                    .read_c_string(offset, max_len)
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(Value::String(value)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn gc_buffer_builtin(&self, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+        match name {
+            "buf_new" => {
+                require_arity(name, args, 1)?;
+                let len = usize_arg(&args[0], name)?;
+                let buffer = GcBuffer::new(&self.heap, len).map_err(|error| error.to_string())?;
+                Ok(Some(Value::GcBuffer(Rc::new(buffer))))
+            }
+            "buf_len" => {
+                require_arity(name, args, 1)?;
+                let buffer = gc_buffer_arg(&args[0], name)?;
+                Ok(Some(Value::Int(buffer.len() as i64)))
+            }
+            "buf_get_u8" => {
+                require_arity(name, args, 2)?;
+                let buffer = gc_buffer_arg(&args[0], name)?;
+                let offset = usize_arg(&args[1], name)?;
+                let value = buffer.read_u8(offset).map_err(|error| error.to_string())?;
+                Ok(Some(Value::UInt(value as u64)))
+            }
+            "buf_set_u8" => {
+                require_arity(name, args, 3)?;
+                let buffer = gc_buffer_arg(&args[0], name)?;
+                let offset = usize_arg(&args[1], name)?;
+                let value = unsigned_arg(&args[2], name, u8::MAX as u64)? as u8;
+                buffer
+                    .write_u8(offset, value)
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(Value::Unit))
+            }
+            "buf_get_u32" => {
+                require_arity(name, args, 2)?;
+                let buffer = gc_buffer_arg(&args[0], name)?;
+                let offset = usize_arg(&args[1], name)?;
+                let value = buffer.read_u32(offset).map_err(|error| error.to_string())?;
+                Ok(Some(Value::UInt(value as u64)))
+            }
+            "buf_set_u32" => {
+                require_arity(name, args, 3)?;
+                let buffer = gc_buffer_arg(&args[0], name)?;
+                let offset = usize_arg(&args[1], name)?;
+                let value = unsigned_arg(&args[2], name, u32::MAX as u64)? as u32;
+                buffer
+                    .write_u32(offset, value)
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(Value::Unit))
+            }
+            "memcpy" => {
+                let (dst, dst_offset, src, src_offset, count) = match args.len() {
+                    3 => (&args[0], 0usize, &args[1], 0usize, usize_arg(&args[2], name)?),
+                    5 => (
+                        &args[0],
+                        usize_arg(&args[1], name)?,
+                        &args[2],
+                        usize_arg(&args[3], name)?,
+                        usize_arg(&args[4], name)?,
+                    ),
+                    _ => return Err(format!("`{name}` expects 3 or 5 arguments, received {}", args.len())),
+                };
+                let destination = gc_buffer_arg(dst, name)?;
+                let source = gc_buffer_arg(src, name)?;
+                destination
+                    .memcpy(dst_offset, &source, src_offset, count)
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(Value::Unit))
+            }
+            "str_to_buf" => {
+                require_arity(name, args, 1)?;
+                let Value::String(text) = &args[0] else {
+                    return Err("str_to_buf expects a string".into());
+                };
+                let buffer = GcBuffer::new(&self.heap, text.len()).map_err(|error| error.to_string())?;
+                buffer
+                    .write_bytes(0, text.as_bytes())
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(Value::GcBuffer(Rc::new(buffer))))
+            }
+            "buf_to_str" => {
+                require_arity(name, args, 1)?;
+                let buffer = gc_buffer_arg(&args[0], name)?;
+                let text = String::from_utf8(buffer.read_bytes())
+                    .map_err(|error| format!("buf_to_str: invalid UTF-8: {error}"))?;
+                Ok(Some(Value::String(text)))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn exec_block(
@@ -311,6 +599,12 @@ impl Evaluator {
                 if let Some(value) = builtin(name, &values)? {
                     return Ok(value);
                 }
+                if let Some(value) = self.gc_buffer_builtin(name, &values)? {
+                    return Ok(value);
+                }
+                if let Some(value) = self.ffi_builtin(name, &values)? {
+                    return Ok(value);
+                }
                 self.call(name, values)
             }
             Expr::Apply(callee, args) => {
@@ -473,6 +767,33 @@ fn binary_numeric(op: &str, lhs: Value, rhs: Value) -> Result<Value, String> {
         "!=" => Ok(Value::Bool(!values_equal(&lhs, &rhs))),
         "is" => Ok(Value::Bool(values_equal(&lhs, &rhs))),
         "+" | "-" | "*" | "/" | "%" | "<" | "<=" | ">" | ">=" => {
+            if matches!(lhs, Value::Int(_) | Value::UInt(_))
+                && matches!(rhs, Value::Int(_) | Value::UInt(_))
+            {
+                if matches!(op, "<" | "<=" | ">" | ">=") {
+                    let ordering = compare_integer_values(&lhs, &rhs)?;
+                    return Ok(Value::Bool(match op {
+                        "<" => ordering == Ordering::Less,
+                        "<=" => ordering != Ordering::Greater,
+                        ">" => ordering == Ordering::Greater,
+                        ">=" => ordering != Ordering::Less,
+                        _ => unreachable!(),
+                    }));
+                }
+                if matches!(lhs, Value::UInt(_)) || matches!(rhs, Value::UInt(_)) {
+                    let lhs = nonnegative_integer(&lhs, op)?;
+                    let rhs = nonnegative_integer(&rhs, op)?;
+                    return Ok(match op {
+                        "+" => Value::UInt(lhs.saturating_add(rhs)),
+                        "-" => Value::UInt(lhs.saturating_sub(rhs)),
+                        "*" => Value::UInt(lhs.saturating_mul(rhs)),
+                        "/" if rhs != 0 => Value::UInt(lhs / rhs),
+                        "%" if rhs != 0 => Value::UInt(lhs % rhs),
+                        "/" | "%" => return Err("division by zero".into()),
+                        _ => unreachable!(),
+                    });
+                }
+            }
             if matches!(&lhs, Value::Float(_)) || matches!(&rhs, Value::Float(_)) {
                 let lhs = value_float(&lhs, op)?;
                 let rhs = value_float(&rhs, op)?;
@@ -518,6 +839,33 @@ fn binary_numeric(op: &str, lhs: Value, rhs: Value) -> Result<Value, String> {
     }
 }
 
+fn compare_integer_values(lhs: &Value, rhs: &Value) -> Result<Ordering, String> {
+    match (lhs, rhs) {
+        (Value::Int(lhs), Value::Int(rhs)) => Ok(lhs.cmp(rhs)),
+        (Value::UInt(lhs), Value::UInt(rhs)) => Ok(lhs.cmp(rhs)),
+        (Value::Int(lhs), Value::UInt(rhs)) => Ok(if *lhs < 0 {
+            Ordering::Less
+        } else {
+            (*lhs as u64).cmp(rhs)
+        }),
+        (Value::UInt(lhs), Value::Int(rhs)) => Ok(if *rhs < 0 {
+            Ordering::Greater
+        } else {
+            lhs.cmp(&(*rhs as u64))
+        }),
+        _ => Err("integer comparison requires integer operands".into()),
+    }
+}
+
+fn nonnegative_integer(value: &Value, op: &str) -> Result<u64, String> {
+    match value {
+        Value::Int(value) => u64::try_from(*value)
+            .map_err(|_| format!("operator `{op}` requires non-negative integers")),
+        Value::UInt(value) => Ok(*value),
+        _ => Err(format!("operator `{op}` requires integers")),
+    }
+}
+
 fn assign_index(
     env: &mut HashMap<String, Value>,
     name: &str,
@@ -526,6 +874,7 @@ fn assign_index(
 ) -> Result<(), String> {
     let index = match index {
         Value::Int(index) => usize::try_from(index).map_err(|_| "negative array index")?,
+        Value::UInt(index) => usize::try_from(index).map_err(|_| "array index is out of range")?,
         _ => return Err("array index must be an integer".into()),
     };
     match env.get_mut(name) {
@@ -545,6 +894,9 @@ fn assign_index(
 fn value_int(value: &Value, op: &str) -> Result<i64, String> {
     match value {
         Value::Int(v) => Ok(*v),
+        Value::UInt(v) => {
+            i64::try_from(*v).map_err(|_| format!("operator `{op}` integer is out of range"))
+        }
         _ => Err(format!("operator `{op}` requires integers")),
     }
 }
@@ -552,6 +904,7 @@ fn value_int(value: &Value, op: &str) -> Result<i64, String> {
 fn value_float(value: &Value, op: &str) -> Result<f64, String> {
     match value {
         Value::Int(v) => Ok(*v as f64),
+        Value::UInt(v) => Ok(*v as f64),
         Value::Float(v) => Ok(*v),
         _ => Err(format!("operator `{op}` requires numbers")),
     }
@@ -560,9 +913,15 @@ fn value_float(value: &Value, op: &str) -> Result<f64, String> {
 fn values_equal(lhs: &Value, rhs: &Value) -> bool {
     match (lhs, rhs) {
         (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::UInt(a), Value::UInt(b)) => a == b,
+        (Value::Int(a), Value::UInt(b)) | (Value::UInt(b), Value::Int(a)) => {
+            *a >= 0 && *a as u64 == *b
+        }
         (Value::Float(a), Value::Float(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::String(a), Value::String(b)) => a == b,
+        (Value::FfiPointer(a), Value::FfiPointer(b)) => a == b,
+        (Value::GcBuffer(a), Value::GcBuffer(b)) => Rc::ptr_eq(a, b),
         (Value::Unit, Value::Unit) => true,
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(a, b)| values_equal(a, b))
@@ -589,6 +948,59 @@ fn values_equal(lhs: &Value, rhs: &Value) -> bool {
     }
 }
 
+fn ffi_value_from_lume(ty: FfiType, value: &Value) -> Result<FfiValue, String> {
+    let mismatch = || {
+        format!(
+            "value {} does not match C type {ty:?}",
+            value_to_string(value)
+        )
+    };
+    Ok(match (ty, value) {
+        (FfiType::Void, Value::Unit) => FfiValue::Void,
+        (FfiType::I8 | FfiType::I16 | FfiType::I32 | FfiType::I64, Value::Int(value)) => {
+            FfiValue::Signed(*value)
+        }
+        (FfiType::I8 | FfiType::I16 | FfiType::I32 | FfiType::I64, Value::UInt(value)) => {
+            FfiValue::Signed(
+                i64::try_from(*value).map_err(|_| "signed C argument is out of range")?,
+            )
+        }
+        (FfiType::U8 | FfiType::U16 | FfiType::U32 | FfiType::U64, Value::UInt(value)) => {
+            FfiValue::Unsigned(*value)
+        }
+        (FfiType::U8 | FfiType::U16 | FfiType::U32 | FfiType::U64, Value::Int(value)) => {
+            FfiValue::Unsigned(
+                u64::try_from(*value).map_err(|_| "unsigned C argument must be non-negative")?,
+            )
+        }
+        (FfiType::U8, Value::Bool(value)) => FfiValue::Unsigned(u64::from(*value)),
+        (FfiType::F32 | FfiType::F64, Value::Float(value)) => FfiValue::Float(*value),
+        (FfiType::F32 | FfiType::F64, Value::Int(value)) => FfiValue::Float(*value as f64),
+        (FfiType::F32 | FfiType::F64, Value::UInt(value)) => FfiValue::Float(*value as f64),
+        (FfiType::Pointer, Value::FfiPointer(pointer)) => FfiValue::Pointer(*pointer),
+        (FfiType::Pointer, Value::String(value)) => FfiValue::String(value.clone()),
+        (FfiType::Pointer, Value::FfiCallback(callback)) => FfiValue::Callback(Rc::clone(callback)),
+        (FfiType::Pointer, Value::FfiBuffer(buffer)) => FfiValue::Buffer(Rc::clone(buffer)),
+        (FfiType::Pointer, Value::GcBuffer(buffer)) => {
+            FfiValue::Pointer(buffer.as_ptr() as *mut c_void)
+        }
+        _ => return Err(mismatch()),
+    })
+}
+
+fn lume_value_from_ffi(value: FfiValue) -> Value {
+    match value {
+        FfiValue::Void => Value::Unit,
+        FfiValue::Signed(value) => Value::Int(value),
+        FfiValue::Unsigned(value) => Value::UInt(value),
+        FfiValue::Float(value) => Value::Float(value),
+        FfiValue::Pointer(value) => Value::FfiPointer(value),
+        FfiValue::String(value) => Value::String(value),
+        FfiValue::Callback(callback) => Value::FfiCallback(callback),
+        FfiValue::Buffer(buffer) => Value::FfiBuffer(buffer),
+    }
+}
+
 fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
     match name {
         "print" => {
@@ -607,6 +1019,24 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
                 Value::String(text) => Ok(Some(Value::Int(text.chars().count() as i64))),
                 _ => Err("len expects string or array".into()),
             }
+        }
+        "now_ms" => {
+            require_arity(name, args, 0)?;
+            Ok(Some(Value::Int(clock::wall_ms())))
+        }
+        "mono_ms" => {
+            require_arity(name, args, 0)?;
+            Ok(Some(Value::Int(clock::monotonic_ms())))
+        }
+        "u8" => {
+            require_arity(name, args, 1)?;
+            let value = unsigned_arg(&args[0], name, u8::MAX as u64)? as u8;
+            Ok(Some(Value::UInt(value as u64)))
+        }
+        "u32" => {
+            require_arity(name, args, 1)?;
+            let value = unsigned_arg(&args[0], name, u32::MAX as u64)? as u32;
+            Ok(Some(Value::UInt(value as u64)))
         }
         "is_alpha"
         | "is_digit"
@@ -708,6 +1138,30 @@ fn require_arity(name: &str, args: &[Value], expected: usize) -> Result<(), Stri
     }
 }
 
+fn gc_buffer_arg<'a>(value: &'a Value, op: &str) -> Result<&'a Rc<GcBuffer>, String> {
+    match value {
+        Value::GcBuffer(buffer) => Ok(buffer),
+        _ => Err(format!("`{op}` expects a GC byte buffer")),
+    }
+}
+
+fn usize_arg(value: &Value, op: &str) -> Result<usize, String> {
+    let number = value_int(value, op)?;
+    usize::try_from(number).map_err(|_| format!("`{op}` expects a non-negative size"))
+}
+
+fn unsigned_arg(value: &Value, op: &str, max: u64) -> Result<u64, String> {
+    let number = value_int(value, op)?;
+    if number < 0 {
+        return Err(format!("`{op}` expects a non-negative integer"));
+    }
+    let number = number as u64;
+    if number > max {
+        return Err(format!("`{op}` value {number} is out of range 0..={max}"));
+    }
+    Ok(number)
+}
+
 fn unary_math(name: &str, x: f64) -> Result<f64, String> {
     #[cfg(feature = "system-sleef")]
     {
@@ -778,6 +1232,7 @@ fn binary_math(name: &str, x: f64, y: f64) -> f64 {
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::Int(v) => v.to_string(),
+        Value::UInt(v) => v.to_string(),
         Value::Float(v) => v.to_string(),
         Value::Bool(v) => v.to_string(),
         Value::String(v) => v.clone(),
@@ -798,6 +1253,133 @@ fn value_to_string(value: &Value) -> String {
             format!("{name}{{{fields}}}")
         }
         Value::Closure { .. } => "<closure>".into(),
+        Value::FfiLibrary(_) => "<ffi library>".into(),
+        Value::FfiSymbol(_) => "<ffi symbol>".into(),
+        Value::FfiCallback(_) => "<ffi callback>".into(),
+        Value::FfiBuffer(buffer) => format!("<ffi buffer {} bytes>", buffer.size()),
+        Value::FfiPointer(pointer) => format!("ptr({pointer:p})"),
+        Value::GcBuffer(buffer) => format!("<gc buffer {} bytes>", buffer.len()),
         Value::Unit => "()".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::Clock;
+
+    struct FakeClock;
+
+    impl Clock for FakeClock {
+        fn wall_ms(&self) -> i64 {
+            1_700_000_000_999
+        }
+
+        fn monotonic_ms(&self) -> i64 {
+            1234
+        }
+    }
+
+    #[test]
+    fn fixed_width_constructors_check_ranges() {
+        assert_eq!(builtin("u8", &[Value::Int(255)]).unwrap(), Some(Value::UInt(255)));
+        assert!(builtin("u8", &[Value::Int(256)]).is_err());
+        assert_eq!(
+            builtin("u32", &[Value::Int(4_294_967_295)]).unwrap(),
+            Some(Value::UInt(4_294_967_295))
+        );
+        assert!(builtin("u32", &[Value::Int(-1)]).is_err());
+    }
+
+    #[test]
+    fn gc_buffer_builtins_round_trip() {
+        let evaluator = Evaluator::new(vec![]);
+        let buffer = evaluator
+            .gc_buffer_builtin("buf_new", &[Value::Int(8)])
+            .unwrap()
+            .unwrap();
+
+        evaluator
+            .gc_buffer_builtin("buf_set_u8", &[buffer.clone(), Value::Int(0), Value::Int(255)])
+            .unwrap();
+        evaluator
+            .gc_buffer_builtin(
+                "buf_set_u32",
+                &[buffer.clone(), Value::Int(4), Value::Int(0x0102_0304)],
+            )
+            .unwrap();
+
+        assert_eq!(
+            evaluator
+                .gc_buffer_builtin("buf_get_u8", &[buffer.clone(), Value::Int(0)])
+                .unwrap(),
+            Some(Value::UInt(255))
+        );
+        assert_eq!(
+            evaluator
+                .gc_buffer_builtin("buf_get_u32", &[buffer.clone(), Value::Int(4)])
+                .unwrap(),
+            Some(Value::UInt(0x0102_0304))
+        );
+        assert!(evaluator
+            .gc_buffer_builtin("buf_get_u32", &[buffer.clone(), Value::Int(5)])
+            .is_err());
+
+        let text = evaluator
+            .gc_buffer_builtin("str_to_buf", &[Value::String("lume".into())])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            evaluator
+                .gc_buffer_builtin("buf_to_str", &[text])
+                .unwrap(),
+            Some(Value::String("lume".into()))
+        );
+    }
+
+    #[test]
+    fn memcpy_supports_offsets() {
+        let evaluator = Evaluator::new(vec![]);
+        let source = evaluator
+            .gc_buffer_builtin("buf_new", &[Value::Int(4)])
+            .unwrap()
+            .unwrap();
+        let destination = evaluator
+            .gc_buffer_builtin("buf_new", &[Value::Int(8)])
+            .unwrap()
+            .unwrap();
+        evaluator
+            .gc_buffer_builtin(
+                "buf_set_u32",
+                &[source.clone(), Value::Int(0), Value::Int(0xdead_beef)],
+            )
+            .unwrap();
+        evaluator
+            .gc_buffer_builtin(
+                "memcpy",
+                &[
+                    destination.clone(),
+                    Value::Int(4),
+                    source,
+                    Value::Int(0),
+                    Value::Int(4),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            evaluator
+                .gc_buffer_builtin("buf_get_u32", &[destination, Value::Int(4)])
+                .unwrap(),
+            Some(Value::UInt(0xdead_beef))
+        );
+    }
+
+    #[test]
+    fn time_builtins_use_the_injected_clock() {
+        clock::with_clock(Arc::new(FakeClock), || {
+            assert_eq!(builtin("now_ms", &[]).unwrap(), Some(Value::Int(1_700_000_000_999)));
+            assert_eq!(builtin("mono_ms", &[]).unwrap(), Some(Value::Int(1234)));
+            assert!(builtin("now_ms", &[Value::Int(1)]).is_err());
+        });
     }
 }

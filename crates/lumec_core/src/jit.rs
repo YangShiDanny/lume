@@ -1,3 +1,4 @@
+use crate::clock::{mono_ms_builtin, now_ms_builtin};
 use crate::gc::GcHeap;
 use crate::ir::{IrFunc, IrOp, ValueId};
 use inkwell::AddressSpace;
@@ -64,13 +65,18 @@ impl LumeCore {
     /// additional definitions are rejected. Hot reload can be implemented by
     /// replacing this runtime with a newly compiled one.
     pub fn new() -> Self {
-        Self {
+        let mut core = Self {
             functions: HashMap::new(),
             builtins: HashMap::new(),
             compiled: None,
             bitcodes: Vec::new(),
             gc: GcHeap::new(),
-        }
+        };
+        core.register_builtin("now_ms", now_ms_builtin)
+            .expect("default time builtins must register successfully");
+        core.register_builtin("mono_ms", mono_ms_builtin)
+            .expect("default time builtins must register successfully");
+        core
     }
 
     /// Adds an IR function. All definitions must be registered before the first call.
@@ -169,21 +175,37 @@ impl LumeCore {
             })
     }
 
-    /// Pins a GC-managed pointer for the duration of an FFI call.
+    /// Registers a GC-managed pointer as an explicit root.
     pub fn gc_push_root(&mut self, ptr: i64) -> Result<(), CoreError> {
         if ptr == 0 {
             return Err(CoreError::new("cannot use a null pointer as a GC root"));
         }
-        self.gc.push_root(ptr as *mut u8);
-        Ok(())
+        self.gc.push_root(ptr as *mut u8).map_err(CoreError::new)
     }
 
     pub fn gc_pop_root(&mut self) -> Result<(), CoreError> {
-        if self.gc.roots().is_empty() {
-            return Err(CoreError::new("GC root stack is empty"));
+        self.gc.pop_root().map_err(CoreError::new)
+    }
+
+    /// Pins a GC object so it stays live and cannot move while native code holds it.
+    pub fn gc_pin(&mut self, ptr: i64) -> Result<(), CoreError> {
+        if ptr == 0 {
+            return Err(CoreError::new("cannot pin a null pointer"));
         }
-        self.gc.pop_root();
-        Ok(())
+        self.gc.try_pin(ptr as *mut u8).map_err(CoreError::new)
+    }
+
+    /// Releases one pin previously acquired with [`LumeCore::gc_pin`].
+    pub fn gc_unpin(&mut self, ptr: i64) -> Result<(), CoreError> {
+        if ptr == 0 {
+            return Err(CoreError::new("cannot unpin a null pointer"));
+        }
+        self.gc.try_unpin(ptr as *mut u8).map_err(CoreError::new)
+    }
+
+    /// Resolves a GC pointer after collection may have moved its object.
+    pub fn gc_resolve(&self, ptr: i64) -> i64 {
+        self.gc.resolve(ptr as *mut u8) as i64
     }
 
     /// Compiles all registered IR functions on the first invocation and reuses the JIT code.
@@ -812,6 +834,36 @@ mod tests {
 
         assert_eq!(core.call("arithmetic", &[]).unwrap(), 4);
         assert_eq!(core.call("comparisons", &[]).unwrap(), 3);
+    }
+
+    struct FakeClock;
+
+    impl crate::clock::Clock for FakeClock {
+        fn wall_ms(&self) -> i64 {
+            9001
+        }
+
+        fn monotonic_ms(&self) -> i64 {
+            17
+        }
+    }
+
+    #[test]
+    fn default_time_builtins_can_be_called_from_ir() {
+        let mut core = LumeCore::new();
+        core.define_function(IrFunc {
+            name: "read_monotonic".into(),
+            n_params: 0,
+            blocks: vec![block(vec![
+                IrOp::Call("mono_ms".into(), vec![]),
+                IrOp::Return(0),
+            ])],
+        })
+        .unwrap();
+
+        crate::clock::with_clock(std::sync::Arc::new(FakeClock), || {
+            assert_eq!(core.call("read_monotonic", &[]).unwrap(), 17);
+        });
     }
 
     unsafe extern "C" fn add_builtin(args: *const i64, count: u64) -> i64 {

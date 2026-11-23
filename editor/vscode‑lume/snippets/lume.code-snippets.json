@@ -63,5 +63,15 @@
     "prefix": "log",
     "body": "log_${1|trace,debug,info,warn,error|}(${0})",
     "description": "Log at a chosen level"
+  },
+  "Wall clock": {
+    "prefix": "nowms",
+    "body": "now_ms()",
+    "description": "Unix epoch time in milliseconds"
+  },
+  "Monotonic clock": {
+    "prefix": "monoms",
+    "body": "mono_ms()",
+    "description": "Monotonic time in milliseconds for timeouts"
   }
 }

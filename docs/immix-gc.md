@@ -12,7 +12,9 @@
 - 搬迁后自动改写根和对象字段中的指针，因此对象地址可能变化。
 - 超过一个 block 容量的对象使用 **专用 block**，死亡时整块释放，不参与搬迁。
 
-不做的事：并发 / 增量标记、写屏障、跨代引用、保守栈扫描、弱引用和 finalizer。这些需要 core 侧配合，留到接入时处理。当前实现不做碎片整理以外的压缩，所以不需要写屏障。
+不做的事：并发 / 增量标记、写屏障、跨代引用、保守栈扫描、弱引用和 finalizer。
+收集器使用显式 roots 和 `collect_with` 遍历对象图；core 适配层已接入此实现，
+但不会扫描宿主或 JIT 的本机栈。
 
 ## 配置常量与类型
 
@@ -41,7 +43,7 @@ heap.push_root(obj).unwrap();
 
 - `alloc(payload_size, type_id) -> Result<*mut u8, ImmixError>`：返回**对象起始指针（header 地址）**，不是负载地址。负载用 `ImmixHeap::payload::<T>(obj)` 取得。
 - `alloc_value::<T>(value, type_id)`：把 Rust 值写入负载，返回对象指针。
-- `push_root(ptr)` / `pop_root()`：登记 / 弹出 GC 根；`pop_root()` 返回的是**已解析的当前有效地址**。
+- `push_root(ptr)` / `pop_root()`：登记 / 弹出 GC 根；`pop_root()` 返回的是**已解析的当前有效地址**。core 适配层拒绝不属于该堆的负载指针。
 - `roots()`：返回根切片，内容是原始指针；收集后应通过 `resolve()` 解析再用。
 - `should_collect()`：`bytes_since_gc >= 阈值` 时为 `true`。`set_collection_threshold(bytes)` 可调整，设为 0 可禁用自动触发判断。
 - `bytes_allocated()` / `bytes_since_gc()` / `block_count()` / `line_size()` / `lines_per_block()` / `block_size()`：状态查询。
@@ -77,18 +79,19 @@ println!("reclaimed {} lines, moved {} objects", stats.reclaimed_lines, stats.ev
 let current = unsafe { ImmixHeap::resolve(old_ptr) };
 ```
 
-- `pin(obj)` / `unpin(obj)` / `is_pinned(obj)`：固定对象，避免 FFI 持有的对象被搬迁。被固定的对象仍参与标记，但不会被移动。
+- `pin(obj)` / `unpin(obj)` / `is_pinned(obj)`：固定对象，避免 FFI 持有的对象被搬迁。pin 是引用计数；pinned 对象会作为 GC 根保活，并继续遍历其子对象，但不会被移动。
 - `payload::<T>(obj)` / `header(obj)` / `header_mut(obj)`：访问负载和元数据，均为 `unsafe`，调用者需保证对象仍存活且类型正确。
 
 注意：专用大对象 block 里的对象也不参与搬迁，但死亡时整块释放，不要把长期指针指向其中的对象。
 
-## 接入 `lumec_core` 时的待办
+core 侧的 `GcHeap::pin_guard(payload)` 提供作用域 pin guard；guard 持有堆的独占借用，
+避免作用域内触发同一堆的收集。传入 C 前要确保 pin 生命周期覆盖 C 持有指针的
+整个期间。若 GC 对象被传给 C，单纯 `push_root` 不够，因为 root 仍可能被搬迁。
 
-1. 用 `ImmixHeap` 替换 `lumec_core::gc::GcHeap`，或做一层适配保持现有调用点不变。
-2. 所有读取 GC 指针的地方统一走 `resolve()`；`collect_with` 的 visitor 传真实字段槽位。
-3. 接上 JIT / builtin 的分配接口：`alloc` 返回 header 地址，core 侧需要按约定偏移取负载。
-4. 把 core 的根集合（局部变量、栈、全局）完整登记到 `push_root`，否则会被误回收。
-5. 若需要并发 / 增量或搬运跨 line 对象，再补写屏障与读屏障；目前未实现。
+底层 `ImmixHeap::collect_with` visitor 使用 header 对象指针槽；core 的
+`GcHeap::collect_with` 使用 payload 指针槽，并会原地改写搬迁后的地址。传给
+core root 注册会对非堆指针返回错误；字段槽中的非堆指针会原样保留，不会被
+当作 GC 对象解引用。
 
 ## 构建与测试
 

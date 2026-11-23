@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 inkwell = { version = "0.11.0", features = ["llvm23-1"] }
+libffi = "5.2.0"
+libloading = "0.8.9"
 self_cell = "1.2"
 lumec_immix = { path = "../lumec_immix" }
 

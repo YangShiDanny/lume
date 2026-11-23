@@ -534,11 +534,126 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
             }
             Ok(Type::Int)
         }
+        "now_ms" | "mono_ms" => {
+            require_builtin_arity(name, args, 0)?;
+            Ok(Type::Int)
+        }
+        "u8" | "u32" => {
+            require_builtin_arity(name, args, 1)?;
+            if !matches!(args[0], Type::Int | Type::Any) {
+                return Err(format!("builtin `{name}` expects an integer"));
+            }
+            Ok(Type::Int)
+        }
+        "buf_new" => {
+            require_builtin_arity(name, args, 1)?;
+            if !matches!(args[0], Type::Int | Type::Any) {
+                return Err("buf_new expects an integer length".into());
+            }
+            Ok(Type::Any)
+        }
+        "buf_len" => {
+            require_builtin_arity(name, args, 1)?;
+            Ok(Type::Int)
+        }
+        "buf_get_u8" | "buf_get_u32" => {
+            require_builtin_arity(name, args, 2)?;
+            Ok(Type::Int)
+        }
+        "buf_set_u8" | "buf_set_u32" => {
+            require_builtin_arity(name, args, 3)?;
+            Ok(Type::Unit)
+        }
+        "memcpy" => {
+            if args.len() != 3 && args.len() != 5 {
+                return Err(format!(
+                    "builtin `memcpy` expects 3 or 5 arguments, received {}",
+                    args.len()
+                ));
+            }
+            Ok(Type::Unit)
+        }
+        "str_to_buf" => {
+            require_builtin_arity(name, args, 1)?;
+            if !matches!(args[0], Type::String | Type::Any) {
+                return Err("str_to_buf expects a string".into());
+            }
+            Ok(Type::Any)
+        }
+        "buf_to_str" => {
+            require_builtin_arity(name, args, 1)?;
+            Ok(Type::String)
+        }
         "c_matmul" => {
             if args.is_empty() {
                 return Err("c_matmul expects at least 1 argument".into());
             }
             Ok(Type::Int)
+        }
+        "ffi_unsafe_load" => {
+            require_builtin_arity(name, args, 1)?;
+            if !matches!(args[0], Type::String | Type::Any) {
+                return Err("ffi_unsafe_load expects a library path string".into());
+            }
+            Ok(Type::Any)
+        }
+        "ffi_symbol" => {
+            require_builtin_arity(name, args, 2)?;
+            if !matches!(args[1], Type::String | Type::Any) {
+                return Err("ffi_symbol expects a symbol name string".into());
+            }
+            Ok(Type::Any)
+        }
+        "ffi_unsafe_call" => {
+            require_builtin_arity(name, args, 3)?;
+            if !matches!(args[1], Type::String | Type::Any)
+                || !matches!(args[2], Type::Array | Type::Any)
+            {
+                return Err("ffi_unsafe_call expects a signature string and argument array".into());
+            }
+            Ok(Type::Any)
+        }
+        "ffi_callback" => {
+            require_builtin_arity(name, args, 2)?;
+            if !matches!(args[0], Type::String | Type::Any)
+                || !matches!(args[1], Type::Function(_, _) | Type::Any)
+            {
+                return Err("ffi_callback expects a signature string and function".into());
+            }
+            Ok(Type::Any)
+        }
+        "ffi_callback_error" => {
+            require_builtin_arity(name, args, 1)?;
+            Ok(Type::String)
+        }
+        "ffi_null" => {
+            require_builtin_arity(name, args, 0)?;
+            Ok(Type::Any)
+        }
+        "ffi_buffer" => {
+            require_builtin_arity(name, args, 2)?;
+            if !matches!(args[0], Type::Int | Type::Any)
+                || !matches!(args[1], Type::Int | Type::Any)
+            {
+                return Err("ffi_buffer expects integer size and alignment".into());
+            }
+            Ok(Type::Any)
+        }
+        "ffi_buffer_read" => {
+            require_builtin_arity(name, args, 3)?;
+            Ok(Type::Any)
+        }
+        "ffi_buffer_write" => {
+            require_builtin_arity(name, args, 4)?;
+            Ok(Type::Unit)
+        }
+        "ffi_buffer_write_cstr" => {
+            require_builtin_arity(name, args, 3)?;
+            Ok(Type::Unit)
+        }
+        "ffi_buffer_read_cstr" => {
+            require_builtin_arity(name, args, 3)?;
+            Ok(Type::String)
         }
         "log_at" => {
             require_builtin_arity(name, args, 2)?;
@@ -590,6 +705,65 @@ fn require_builtin_arity(name: &str, args: &[Type], expected: usize) -> Result<(
 mod tests {
     use super::*;
     use crate::parser::parse_source;
+
+    #[test]
+    fn checks_time_builtins() {
+        let funcs = parse_source(
+            r#"
+fn main() -> int
+    wall:int = now_ms()
+    monotonic:int = mono_ms()
+ret wall + monotonic
+"#,
+        )
+        .unwrap();
+        assert!(check_program(&funcs).is_ok());
+
+        let invalid = parse_source(
+            r#"
+fn main()
+    mono_ms(1)
+end
+"#,
+        )
+        .unwrap();
+        assert!(
+            check_program(&invalid)
+                .unwrap_err()
+                .contains("expects 0 arguments")
+        );
+    }
+
+    #[test]
+    fn checks_fixed_width_and_buffer_builtins() {
+        let funcs = parse_source(
+            r#"
+fn main() -> int
+    data:any = buf_new(8)
+    buf_set_u8(data, 0, u8(255))
+    buf_set_u32(data, 4, u32(1024))
+    copied:any = buf_new(8)
+    memcpy(copied, 0, data, 0, 8)
+ret buf_get_u32(copied, 4)
+"#,
+        )
+        .unwrap();
+        assert!(check_program(&funcs).is_ok());
+
+        let invalid = parse_source(
+            r#"
+fn main()
+    memcpy(buf_new(1))
+end
+"#,
+        )
+        .unwrap();
+        assert!(
+            check_program(&invalid)
+                .unwrap_err()
+                .contains("expects 3 or 5 arguments")
+        );
+    }
 
     #[test]
     fn catches_initializer_and_call_type_errors() {

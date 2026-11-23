@@ -1,7 +1,7 @@
 //! Core 的 GC 门面：底层使用 `lumec_immix` 的 mark-region 收集器。
 //!
-//! 兼容旧接口：`alloc` / `push_root` / `pop_root` / `roots` / `collect` 保持不变，
-//! 因此 `BuiltinTypes`、`LumeCore::gc_push_root` 等调用点无需修改。
+//! 保留 `alloc` / `roots` / `collect` 等旧门面，同时对 root 注册和弹出显式报告
+//! 错误，防止非堆指针或 root 栈下溢被静默忽略。
 //!
 //! 指针约定：本模块对外暴露与接收的都是**负载指针**（对象 header 之后的起始地址），
 //! 而 Immix 内部使用对象起始地址（header）。转换由本模块完成。
@@ -47,6 +47,25 @@ pub trait GcTrace {
 /// Immix 堆的 core 适配层。
 pub struct GcHeap {
     heap: ImmixHeap,
+}
+
+pub struct GcPin<'heap> {
+    heap: &'heap mut GcHeap,
+    payload: *mut u8,
+}
+
+impl GcPin<'_> {
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.payload
+    }
+}
+
+impl Drop for GcPin<'_> {
+    fn drop(&mut self) {
+        if let Some(object) = self.heap.heap.object_from_payload(self.payload) {
+            unsafe { ImmixHeap::unpin(object) };
+        }
+    }
 }
 
 impl Default for GcHeap {
@@ -98,12 +117,8 @@ impl GcHeap {
         unsafe { ImmixHeap::payload::<u8>(object) }
     }
 
-    /// 登记负载指针为 GC 根。空指针会被忽略。
-    pub fn push_root(&mut self, ptr: *mut u8) {
-        let _ = self.try_push_root(ptr);
-    }
-
-    pub fn try_push_root(&mut self, ptr: *mut u8) -> Result<(), String> {
+    /// 登记负载指针为 GC 根。
+    pub fn push_root(&mut self, ptr: *mut u8) -> Result<(), String> {
         if ptr.is_null() {
             return Err("null pointer cannot be used as a GC root".into());
         }
@@ -117,8 +132,11 @@ impl GcHeap {
     }
 
     /// 弹出最近登记的根。
-    pub fn pop_root(&mut self) {
-        let _ = self.heap.pop_root();
+    pub fn pop_root(&mut self) -> Result<(), String> {
+        self.heap
+            .pop_root()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     /// 弹出根并返回解析后的有效负载指针。
@@ -156,14 +174,8 @@ impl GcHeap {
     where
         F: FnMut(*mut u8, &mut dyn FnMut(&mut *mut u8)),
     {
-        self.heap.collect_with(|object, visit| {
-            let payload = unsafe { ImmixHeap::payload::<u8>(object) };
-            trace(payload, &mut |slot: &mut *mut u8| {
-                let mut header = unsafe { ImmixHeap::header_from_payload(*slot) };
-                visit(&mut header);
-                *slot = unsafe { ImmixHeap::payload::<u8>(header) };
-            });
-        })
+        self.heap
+            .collect_with_payloads(|payload, visit| trace(payload, visit))
     }
 
     pub fn should_collect(&self) -> bool {
@@ -195,12 +207,42 @@ impl GcHeap {
         self.heap.resolve_payload(ptr)
     }
 
+    pub fn try_pin(&mut self, payload: *mut u8) -> Result<(), String> {
+        let object = self
+            .heap
+            .object_from_payload(payload)
+            .ok_or_else(|| "pointer is not an object payload owned by this GC heap".to_string())?;
+        unsafe { ImmixHeap::pin(object) };
+        Ok(())
+    }
+
+    /// Pins an object for a lexical scope and releases the pin when the guard drops.
+    pub fn pin_guard(&mut self, payload: *mut u8) -> Result<GcPin<'_>, String> {
+        self.try_pin(payload)?;
+        Ok(GcPin {
+            heap: self,
+            payload,
+        })
+    }
+
+    pub fn try_unpin(&mut self, payload: *mut u8) -> Result<(), String> {
+        let object = self
+            .heap
+            .object_from_payload(payload)
+            .ok_or_else(|| "pointer is not an object payload owned by this GC heap".to_string())?;
+        if !unsafe { ImmixHeap::is_pinned(object) } {
+            return Err("GC object is not pinned".into());
+        }
+        unsafe { ImmixHeap::unpin(object) };
+        Ok(())
+    }
+
     /// 读取负载对应对象的 Immix header。
     ///
     /// # Safety
     /// `payload` 必须是本堆分配且仍然存活的对象负载起始地址。
     pub unsafe fn header<'a>(&self, payload: *mut u8) -> &'a ImmixHeader {
-        ImmixHeap::header(ImmixHeap::header_from_payload(payload))
+        unsafe { ImmixHeap::header(ImmixHeap::header_from_payload(payload)) }
     }
 
     /// 固定对象，防止收集时搬迁。
@@ -259,13 +301,12 @@ mod tests {
         let mut heap = GcHeap::new();
         let rooted = heap.alloc_value(11u64, TypeId(1));
         let unrooted = heap.alloc_value(22u64, TypeId(1));
-        heap.push_root(rooted);
-        eprintln!("DEBUG rooted={rooted:p} roots={:p?} hdr={:?}", heap.roots(), unsafe { ImmixHeap::header(ImmixHeap::header_from_payload(rooted)) });
+        heap.push_root(rooted).unwrap();
 
         let stats = heap.collect();
-        eprintln!("DEBUG stats={stats:?} resolved={:p} val={}", heap.resolve(rooted), unsafe { *ImmixHeap::payload::<u64>(heap.resolve(rooted)) });
         assert!(stats.objects_after >= 1);
-        assert_eq!(unsafe { *ImmixHeap::payload::<u64>(heap.resolve(rooted)) }, 11);
+        assert_eq!(heap.bytes_allocated(), stats.bytes_after);
+        assert_eq!(unsafe { *heap.resolve(rooted).cast::<u64>() }, 11);
         assert_eq!(heap.roots().len(), 1);
         // 未登记为根的对象会被回收；不读取它的负载。
         assert!(!unrooted.is_null());
@@ -277,7 +318,7 @@ mod tests {
         let mut heap = GcHeap::new();
         let child = heap.alloc_value(7u64, TypeId(1));
         let parent = heap.alloc_value(child, PARENT);
-        heap.push_root(parent);
+        heap.push_root(parent).unwrap();
 
         let stats = heap.collect_with(|payload, visit| unsafe {
             let object = ImmixHeap::header_from_payload(payload);
@@ -288,16 +329,77 @@ mod tests {
 
         assert!(stats.objects_after >= 2);
         let current_child = heap.resolve(child);
-        assert_eq!(unsafe { *ImmixHeap::payload::<u64>(current_child) }, 7);
-        let stored = unsafe { *ImmixHeap::payload::<*mut u8>(heap.resolve(parent)) };
+        assert_eq!(unsafe { *current_child.cast::<u64>() }, 7);
+        let stored = unsafe { *heap.resolve(parent).cast::<*mut u8>() };
         assert_eq!(heap.resolve(stored), current_child);
     }
 
     #[test]
     fn threshold_can_be_configured() {
         let mut heap = GcHeap::new();
+        heap.alloc(1);
         assert!(!heap.should_collect());
         heap.set_collection_threshold(1);
         assert!(heap.should_collect());
+    }
+
+    #[test]
+    fn pinned_objects_remain_live_and_stationary_until_unpinned() {
+        let mut heap = GcHeap::new();
+        let pinned = heap.alloc_value(73u64, TypeId(1));
+        let unrooted = heap.alloc_value(91u64, TypeId(1));
+        unsafe { heap.pin(pinned) };
+
+        let first = heap.collect();
+        assert_eq!(heap.resolve(pinned), pinned);
+        assert_eq!(unsafe { *pinned.cast::<u64>() }, 73);
+        assert!(first.objects_after >= 1);
+
+        unsafe {
+            heap.pin(pinned);
+            heap.unpin(pinned);
+        }
+        assert!(unsafe { heap.is_pinned(pinned) });
+        unsafe { heap.unpin(pinned) };
+        assert!(!unsafe { heap.is_pinned(pinned) });
+
+        let second = heap.collect();
+        assert_eq!(second.objects_after, 0);
+        assert!(!unrooted.is_null());
+    }
+
+    #[test]
+    fn rejects_non_heap_pointer_roots_without_dereferencing_them() {
+        let mut heap = GcHeap::new();
+        assert!(heap.push_root(std::ptr::dangling_mut::<u8>()).is_err());
+    }
+
+    #[test]
+    fn preserves_non_gc_child_pointers_during_collection() {
+        const PARENT: TypeId = TypeId(2);
+        let mut heap = GcHeap::new();
+        let parent = heap.alloc_value(std::ptr::dangling_mut::<u8>(), PARENT);
+        heap.push_root(parent).unwrap();
+        heap.collect_with(|payload, visit| unsafe {
+            let object = ImmixHeap::header_from_payload(payload);
+            if ImmixHeap::header(object).type_id() == PARENT.0 {
+                visit(&mut *ImmixHeap::payload::<*mut u8>(object));
+            }
+        });
+        assert_eq!(
+            unsafe { *heap.resolve(parent).cast::<*mut u8>() },
+            std::ptr::dangling_mut::<u8>()
+        );
+    }
+
+    #[test]
+    fn pin_guard_releases_its_pin_on_drop() {
+        let mut heap = GcHeap::new();
+        let payload = heap.alloc_value(5u64, TypeId(1));
+        {
+            let guard = heap.pin_guard(payload).unwrap();
+            assert_eq!(guard.as_ptr(), payload);
+        }
+        assert!(!unsafe { heap.is_pinned(payload) });
     }
 }
