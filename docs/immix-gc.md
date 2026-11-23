@@ -1,6 +1,6 @@
 # Immix 垃圾回收器（`lumec_immix`）
 
-`crates/lumec_immix` 是一个独立的 Immix 风格 mark-region 收集器 crate。它已经在根 `Cargo.toml` 的 workspace 中，但**尚未接入 `lumec_core`**：现有 `lumec_core::gc::GcHeap` 仍保持原样。本文描述它当前提供的能力、API 语义，以及后续接进 core 时的注意事项。
+`crates/lumec_immix` 是 Immix 风格 mark-region 收集器 crate。它已加入根 `Cargo.toml` workspace，并**通过 `lumec_core::gc::GcHeap` 接入 core**：旧接口保持不变，底层分配、标记、搬迁与回收全部由 Immix 完成。本文描述底层能力、API 语义，以及 core 适配层的指针约定。
 
 ## 设计概览
 

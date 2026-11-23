@@ -1,0 +1,66 @@
+name: Wiki 文档同步
+
+# main 分支的 docs/*.md 变动后，单向同步到本仓库的 GitHub Wiki。
+# 令牌优先级: secrets.WIKI_TOKEN > secrets.PAGES_TOKEN > GITHUB_TOKEN。
+# 若 Wiki 尚未初始化，请先在 GitHub 网页创建首页；若 GITHUB_TOKEN 无权推送，
+# 请添加具有 repo 权限的 secrets.WIKI_TOKEN。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lume-wiki-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 同步 docs/ 到 GitHub Wiki
+    runs-on: ubuntu-24.04
+    env:
+      WIKI_TOKEN: ${{ secrets.WIKI_TOKEN || secrets.PAGES_TOKEN || github.token }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 克隆 Wiki 仓库
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${WIKI_TOKEN:-}" ]; then
+            echo "::error::没有可用的 Wiki 令牌，请配置 secrets.WIKI_TOKEN。"
+            exit 1
+          fi
+          if ! git -c http.extraheader="AUTHORIZATION: bearer ${WIKI_TOKEN}" clone --depth 1 \
+              "https://github.com/${GITHUB_REPOSITORY}.wiki.git" "$RUNNER_TEMP/lume.wiki"; then
+            echo "::error::克隆 Wiki 失败：请确认 Wiki 已初始化，且令牌具备 repo 写权限。"
+            exit 1
+          fi
+
+      - name: 同步文档
+        shell: bash
+        run: bash .github/scripts/sync-wiki.sh docs "$RUNNER_TEMP/lume.wiki"
+
+      - name: 提交并推送
+        shell: bash
+        run: |
+          set -euo pipefail
+          WIKI="$RUNNER_TEMP/lume.wiki"
+          git -C "$WIKI" config user.name "github-actions[bot]"
+          git -C "$WIKI" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -z "$(git -C "$WIKI" status --porcelain)" ]; then
+            echo "Wiki 已是最新，无需提交。"
+            exit 0
+          fi
+          git -C "$WIKI" diff --stat
+          git -C "$WIKI" add -A
+          git -C "$WIKI" commit -m "docs: 同步 docs/ 文档 (${GITHUB_SHA::7})"
+          if ! git -C "$WIKI" -c http.extraheader="AUTHORIZATION: bearer ${WIKI_TOKEN}" push origin HEAD; then
+            echo "::error::推送 Wiki 失败：请为 secrets.WIKI_TOKEN 配置 repo 写权限。"
+            exit 1
+          fi

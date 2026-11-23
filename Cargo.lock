@@ -85,6 +85,7 @@ name = "lumec_core"
 version = "0.1.0"
 dependencies = [
  "inkwell",
+ "lumec_immix",
  "self_cell",
 ]
 

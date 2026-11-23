@@ -1,6 +1,6 @@
 //! Immix 风格的标记-区域（mark-region）收集器。
 //!
-//! 这是 `lumec_core` 之外的新 crate，不会自动替换现有 `GcHeap`。
+//! 该 crate 已通过 `lumec_core::gc::GcHeap` 接入 Lume 核心，也可独立使用。
 //! 它提供完整的 Immix 基础能力：
 //! - line/block 分块与 bump 分配；
 //! - 精确的标记阶段，支持用户自定义对象图遍历；
@@ -12,9 +12,10 @@
 //! - 收集统计与分配阈值触发。
 //!
 //! 不做的事：并发/增量标记、写屏障、跨代引用、保守栈扫描。这些需要 core
-//! 侧配合，留到接入 `lumec_core` 时再做。
+//! 侧配合；当前 core 只登记显式根，不做保守栈扫描。
 
 use std::error::Error;
+use std::collections::HashMap;
 use std::fmt;
 use std::mem::size_of;
 use std::ptr;
@@ -188,6 +189,7 @@ pub struct ImmixHeap {
     lines_per_block: usize,
     blocks: Vec<Block>,
     roots: Vec<*mut u8>,
+    forwarding: HashMap<usize, usize>,
     bytes_allocated: usize,
     bytes_since_gc: usize,
     collection_threshold: usize,
@@ -196,6 +198,21 @@ pub struct ImmixHeap {
 impl Default for ImmixHeap {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl fmt::Debug for ImmixHeap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImmixHeap")
+            .field("line_size", &self.line_size)
+            .field("lines_per_block", &self.lines_per_block)
+            .field("blocks", &self.blocks.len())
+            .field("roots", &self.roots.len())
+            .field("forwarding", &self.forwarding.len())
+            .field("bytes_allocated", &self.bytes_allocated)
+            .field("bytes_since_gc", &self.bytes_since_gc)
+            .field("collection_threshold", &self.collection_threshold)
+            .finish()
     }
 }
 
@@ -215,6 +232,7 @@ impl ImmixHeap {
             lines_per_block,
             blocks: Vec::new(),
             roots: Vec::new(),
+            forwarding: HashMap::new(),
             bytes_allocated: 0,
             bytes_since_gc: 0,
             collection_threshold: DEFAULT_COLLECTION_THRESHOLD,
@@ -270,6 +288,7 @@ impl ImmixHeap {
                 Self::alloc_in_block(&mut block, total, lines_needed, type_id, self.line_size)
                     .expect("dedicated block always has enough free lines");
             self.blocks.push(block);
+            self.forwarding.remove(&(ptr as usize));
             self.bytes_allocated += total;
             self.bytes_since_gc += total;
             return Ok(ptr);
@@ -282,6 +301,7 @@ impl ImmixHeap {
             if let Some(ptr) =
                 Self::alloc_in_block(block, total, lines_needed, type_id, self.line_size)
             {
+                self.forwarding.remove(&(ptr as usize));
                 self.bytes_allocated += total;
                 self.bytes_since_gc += total;
                 return Ok(ptr);
@@ -292,6 +312,7 @@ impl ImmixHeap {
         let ptr = Self::alloc_in_block(&mut block, total, lines_needed, type_id, self.line_size)
             .expect("fresh block always has enough free lines");
         self.blocks.push(block);
+        self.forwarding.remove(&(ptr as usize));
         self.bytes_allocated += total;
         self.bytes_since_gc += total;
         Ok(ptr)
@@ -316,7 +337,7 @@ impl ImmixHeap {
     /// 弹出最近登记的根。返回的是当前有效地址（可能已被搬迁改写）。
     pub fn pop_root(&mut self) -> Result<*mut u8, ImmixError> {
         let root = self.roots.pop().ok_or(ImmixError::RootStackUnderflow)?;
-        Ok(unsafe { Self::resolve(root) })
+        Ok(self.resolve_known(root))
     }
 
     pub fn roots(&self) -> &[*mut u8] {
@@ -363,10 +384,22 @@ impl ImmixHeap {
         for root in roots {
             self.mark_object(root, &mut worklist);
         }
+        let pinned = self
+            .blocks
+            .iter()
+            .flat_map(|block| block.objects.iter().copied())
+            .filter(|&object| unsafe {
+                let header = Self::header(object);
+                header.magic == MAGIC && header.pinned != 0
+            })
+            .collect::<Vec<_>>();
+        for object in pinned {
+            self.mark_object(object, &mut worklist);
+        }
         while let Some(object) = worklist.pop() {
             let mut children = Vec::new();
             trace(object, &mut |child| {
-                children.push(unsafe { Self::resolve(*child) });
+                children.push(self.resolve_known(*child));
             });
             for child in children {
                 self.mark_object(child, &mut worklist);
@@ -441,6 +474,7 @@ impl ImmixHeap {
                 header.total_size = new as usize as u64;
                 header.marked = 0;
             }
+            self.forwarding.insert(old as usize, new as usize);
             stats.evacuated_objects += 1;
         }
 
@@ -459,8 +493,8 @@ impl ImmixHeap {
         }
 
         // 5. 改写根与对象内指针，并补标搬迁后新发现的子对象。
-        for root in &mut self.roots {
-            *root = unsafe { Self::resolve(*root) };
+        for root_index in 0..self.roots.len() {
+            self.roots[root_index] = self.resolve_known(self.roots[root_index]);
         }
         let roots = self.roots.clone();
         let mut worklist = Vec::new();
@@ -470,7 +504,7 @@ impl ImmixHeap {
         while let Some(object) = worklist.pop() {
             let mut children = Vec::new();
             trace(object, &mut |slot| {
-                *slot = unsafe { Self::resolve(*slot) };
+                *slot = self.resolve_known(*slot);
                 children.push(*slot);
             });
             for child in children {
@@ -530,6 +564,7 @@ impl ImmixHeap {
         }
 
         self.bytes_since_gc = 0;
+        self.bytes_allocated = stats.bytes_after;
         stats
     }
 
@@ -540,6 +575,17 @@ impl ImmixHeap {
     /// 必须与分配时写入的类型一致。
     pub unsafe fn payload<T>(object: *mut u8) -> *mut T {
         unsafe { object.add(size_of::<Header>()) as *mut T }
+    }
+
+    /// 由负载指针反推对象起始地址（header）。
+    ///
+    /// # Safety
+    /// `payload` 必须正好是本堆某个对象的负载起始地址，且该对象尚未被回收。
+    pub unsafe fn header_from_payload<T>(payload: *mut T) -> *mut u8 {
+        if payload.is_null() {
+            return ptr::null_mut();
+        }
+        (payload as *mut u8).sub(size_of::<Header>())
     }
 
     /// 取对象 header 的共享引用。
@@ -580,13 +626,76 @@ impl ImmixHeap {
         current
     }
 
+    /// Returns the header address for an exact object payload pointer.
+    pub fn object_from_payload(&self, payload: *mut u8) -> Option<*mut u8> {
+        if payload.is_null() {
+            return None;
+        }
+        let address = payload as usize;
+        let object = self.blocks.iter().find_map(|block| {
+            block.objects.iter().copied().find(|&object| {
+                (object as usize).checked_add(size_of::<Header>()) == Some(address)
+            })
+        });
+        if let Some(object) = object {
+            return Some(self.resolve_known(object));
+        }
+        let object_address = address.checked_sub(size_of::<Header>())?;
+        self.forwarding
+            .contains_key(&object_address)
+            .then(|| self.resolve_known(object_address as *mut u8))
+    }
+
+    fn contains_object(&self, object: *mut u8) -> bool {
+        !object.is_null()
+            && self
+                .blocks
+                .iter()
+                .any(|block| block.objects.contains(&object))
+    }
+
+    fn resolve_known(&self, object: *mut u8) -> *mut u8 {
+        let mut current = object;
+        for _ in 0..MAX_FORWARD_HOPS {
+            if let Some(&next) = self.forwarding.get(&(current as usize)) {
+                current = next as *mut u8;
+                continue;
+            }
+            if !self.contains_object(current) {
+                return current;
+            }
+            let header = unsafe { Self::header(current) };
+            if header.magic != FORWARD_MAGIC {
+                return current;
+            }
+            current = header.total_size as usize as *mut u8;
+        }
+        current
+    }
+
+    /// Resolves an object pointer without dereferencing addresses not owned by this heap.
+    pub fn resolve_object(&self, object: *mut u8) -> *mut u8 {
+        self.resolve_known(object)
+    }
+
+    /// Resolves an object payload pointer, including recently evacuated addresses.
+    pub fn resolve_payload(&self, payload: *mut u8) -> *mut u8 {
+        if payload.is_null() {
+            return payload;
+        }
+        self.object_from_payload(payload)
+            .map(|object| unsafe { Self::payload::<u8>(object) })
+            .unwrap_or(payload)
+    }
+
     /// 固定对象：后续收集不会搬迁它。
     ///
     /// # Safety
     /// `object` 必须是本堆分配且仍然存活的对象起始地址。
     pub unsafe fn pin(object: *mut u8) {
         let object = unsafe { Self::resolve(object) };
-        unsafe { Self::header_mut(object).pinned = 1 };
+        let header = unsafe { Self::header_mut(object) };
+        header.pinned = header.pinned.saturating_add(1);
     }
 
     /// 取消固定。
@@ -595,7 +704,8 @@ impl ImmixHeap {
     /// `object` 必须是本堆分配且仍然存活的对象起始地址。
     pub unsafe fn unpin(object: *mut u8) {
         let object = unsafe { Self::resolve(object) };
-        unsafe { Self::header_mut(object).pinned = 0 };
+        let header = unsafe { Self::header_mut(object) };
+        header.pinned = header.pinned.saturating_sub(1);
     }
 
     /// 对象是否已被固定。
@@ -691,8 +801,8 @@ impl ImmixHeap {
     }
 
     fn mark_object(&mut self, object: *mut u8, worklist: &mut Vec<*mut u8>) -> bool {
-        let object = unsafe { Self::resolve(object) };
-        if object.is_null() {
+        let object = self.resolve_known(object);
+        if !self.contains_object(object) {
             return false;
         }
         let Some(index) = self.block_index_of(object) else {
