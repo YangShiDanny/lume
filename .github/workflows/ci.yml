@@ -63,3 +63,58 @@ jobs:
         run: |
           npm ci
           npm run compile
+
+  build-web:
+    name: 构建并部署积木编辑器
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: lume-pages-deploy
+      cancel-in-progress: true
+    permissions:
+      contents: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editor/blockly-lume/package-lock.json
+
+      - name: 安装依赖
+        working-directory: editor/blockly-lume
+        run: npm ci
+
+      - name: 构建网页
+        working-directory: editor/blockly-lume
+        env:
+          VITE_BASE_URL: ${{ vars.PAGES_BASE_URL || '/LumeC/' }}
+        run: npm run build
+
+      - name: 检查 Pages 令牌
+        id: pages_token
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          PAGES_TOKEN: ${{ secrets.PAGES_TOKEN }}
+        run: |
+          if [ -n "$PAGES_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 secrets.PAGES_TOKEN，跳过 Pages 部署。"
+          fi
+
+      - name: 部署到 <用户名>.github.io/LumeC/
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.pages_token.outputs.has_token == 'true'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          personal_token: ${{ secrets.PAGES_TOKEN }}
+          external_repository: ${{ vars.PAGES_REPO || format('{0}/{0}.github.io', github.repository_owner) }}
+          publish_branch: ${{ vars.PAGES_BRANCH || 'main' }}
+          publish_dir: ./editor/blockly-lume/dist
+          destination_dir: ${{ vars.PAGES_DEST_DIR || 'LumeC' }}
+          keep_files: true
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com

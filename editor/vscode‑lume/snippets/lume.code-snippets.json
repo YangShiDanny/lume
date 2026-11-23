@@ -19,6 +19,21 @@
     "body": ["while ${1:cond}", "    ${0}", "end"],
     "description": "While loop"
   },
+  "Match": {
+    "prefix": "match",
+    "body": ["${1:result}:int = match ${2:value}", "    case ${3:pattern}", "        ${0}", "    case _", "        0", "end"],
+    "description": "Match expression"
+  },
+  "Closure": {
+    "prefix": "closure",
+    "body": ["fn(${1:value}:${2:int}) -> ${3:int} => ${0}"],
+    "description": "Single-expression closure"
+  },
+  "Import": {
+    "prefix": "import",
+    "body": ["import \"${1:module.lume}\""],
+    "description": "Import a relative Lume module"
+  },
   "Walrus": {
     "prefix": ":=",
     "body": "${1:value} := ${2:expr}",

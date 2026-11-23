@@ -1,12 +1,43 @@
 use lumec_core::LumeCore;
 use lumec_core::evaluator::{Evaluator, Value};
-use lumec_core::parser::parse_source;
 
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  lume-bootstrap [run] <file.lume>");
     eprintln!("  lume-bootstrap check <file.lume>");
+    eprintln!("  lume-bootstrap jit <file.lume>");
+    eprintln!("  lume-bootstrap llvm-ir <file.lume>");
     eprintln!("  lume-bootstrap --lsp");
+}
+
+fn run_llvm(
+    functions: &[lumec_core::parser::FuncDef],
+    emit_ir: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compiled = lumec_core::codegen::compile_program(functions)?;
+    let mut core = LumeCore::new();
+    for function in compiled {
+        core.define_function(function)?;
+    }
+    if emit_ir {
+        print!("{}", core.llvm_ir()?);
+        return Ok(());
+    }
+    let entry = if core_function_exists(functions, "main") {
+        "main"
+    } else if core_function_exists(functions, "entry") {
+        "entry"
+    } else if core_function_exists(functions, "boot") {
+        "boot"
+    } else {
+        return Err("no main, entry, or boot function".into());
+    };
+    println!("{}", core.call(entry, &[])?);
+    Ok(())
+}
+
+fn core_function_exists(functions: &[lumec_core::parser::FuncDef], name: &str) -> bool {
+    functions.iter().any(|function| function.name == name)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -90,15 +121,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         };
         let resolved = lume_source.to_str().unwrap_or_default();
-        let source = core.read_file(resolved)?;
-        let source = String::from_utf8_lossy(&source);
-        let funcs = match parse_source(&source) {
+        let funcs = match lumec_core::modules::load_source_graph(&lume_source) {
             Ok(funcs) => funcs,
             Err(error) => {
-                eprintln!("{}: {}", resolved, error);
+                eprintln!("{}", error);
                 std::process::exit(1);
             }
         };
+        if let Err(error) = lumec_core::typecheck::check_program(&funcs) {
+            eprintln!("{}: {}", resolved, error);
+            std::process::exit(1);
+        }
+        if command == "jit" || command == "llvm-ir" {
+            run_llvm(&funcs, command == "llvm-ir")?;
+            return Ok(());
+        }
         if command == "check" {
             println!("{}: OK ({} functions)", resolved, funcs.len());
             return Ok(());
@@ -118,6 +155,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(Value::Bool(value)) => println!("{}", value),
             Ok(Value::String(value)) => println!("{}", value),
             Ok(Value::Array(values)) => println!("{:?}", values),
+            Ok(Value::Struct { name, .. }) => println!("<{name}>"),
+            Ok(Value::Closure { .. }) => println!("<closure>"),
             Ok(Value::Unit) => {}
             Err(error) => {
                 eprintln!("{}: {}", resolved, error);
@@ -126,15 +165,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    let source = core.read_file(path)?;
-    let source = String::from_utf8_lossy(&source);
-    let funcs = match parse_source(&source) {
+    let funcs = match lumec_core::modules::load_source_graph(path) {
         Ok(funcs) => funcs,
         Err(error) => {
-            eprintln!("{}: {}", path, error);
+            eprintln!("{}", error);
             std::process::exit(1);
         }
     };
+    if let Err(error) = lumec_core::typecheck::check_program(&funcs) {
+        eprintln!("{}: {}", path, error);
+        std::process::exit(1);
+    }
+    if command == "jit" || command == "llvm-ir" {
+        run_llvm(&funcs, command == "llvm-ir")?;
+        return Ok(());
+    }
     if command == "check" {
         println!("{}: OK ({} functions)", path, funcs.len());
         return Ok(());
@@ -156,6 +201,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(Value::Bool(value)) => println!("{}", value),
         Ok(Value::String(value)) => println!("{}", value),
         Ok(Value::Array(values)) => println!("{:?}", values),
+        Ok(Value::Struct { name, .. }) => println!("<{name}>"),
+        Ok(Value::Closure { .. }) => println!("<closure>"),
         Ok(Value::Unit) => {}
         Err(error) => {
             eprintln!("{}: {}", path, error);

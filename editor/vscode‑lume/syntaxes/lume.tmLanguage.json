@@ -15,11 +15,11 @@
       "name": "comment.line.number-sign.lume"
     },
     {
-      "match": "\\b(fn|ret|if|else|while|and|or|not|is|true|false|end)\\b",
+      "match": "\\b(fn|ret|if|else|while|match|case|import|and|or|not|is|true|false|end)\\b",
       "name": "keyword.control.lume"
     },
     {
-      "match": "(:=|=|\\+|-|\\*|/|%|<|<=|>|>=|==|!=)",
+      "match": "(:=|=>|=|\\+|-|\\*|/|%|<|<=|>|>=|==|!=|\\.|:)",
       "name": "keyword.operator.lume"
     },
     {

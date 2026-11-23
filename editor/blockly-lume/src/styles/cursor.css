@@ -1,0 +1,122 @@
+/* LumeOS 风格自绘光标 —— 与 assets/custom-cursor.js 配套
+   直接复制进项目；项目已有同名变量时本文件的 :root 覆盖可删。
+   设计语言来源：public/LumeOS/css/styles.css 105-110、363-506、3126-3135。 */
+
+:root {
+  --cursor: #ffffff;
+  --cursor-soft: rgba(255, 255, 255, 0.5);
+}
+[data-theme='light'] {
+  --cursor: #0a0a0a;
+  --cursor-soft: rgba(0, 0, 0, 0.45);
+}
+
+/* !important：任何 cursor:pointer/default 都不许把系统指针放出来 */
+* { box-sizing: border-box; cursor: none !important; }
+
+#cursor,
+#cursor-ring {
+  position: fixed;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  /* 压过 IME 候选栏 99999 / 虚拟键盘 99990 */
+  z-index: 999999;
+  border-radius: 999px;
+  transform: translate(-50%, -50%) rotate(var(--angle, 0deg))
+    scale(var(--stretch, 1), var(--shrink, 1));
+  will-change: transform, width, height, opacity;
+}
+
+/* 内芯：9px 实心白点。20px 会压掉半个字 —— 指针是找位置的，不是抢戏的 */
+#cursor {
+  width: 9px;
+  height: 9px;
+  background: var(--cursor);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.16),
+    0 1px 4px rgba(0, 0, 0, 0.28);
+  transition:
+    width 0.24s cubic-bezier(0.2, 0.8, 0.2, 1),
+    height 0.24s cubic-bezier(0.2, 0.8, 0.2, 1),
+    border-radius 0.24s cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 0.2s ease;
+}
+
+/* 外环：只服务链接态 */
+#cursor-ring {
+  width: 34px;
+  height: 34px;
+  border: 1.5px solid var(--cursor-soft);
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.4);
+  transition:
+    opacity 0.2s ease,
+    transform 0.26s cubic-bezier(0.2, 0.8, 0.2, 1),
+    border-color 0.2s ease;
+}
+
+/* 文本态：竖线高度由 JS 写进 --bar-h；刻意覆盖 transform 避免被拉伸成针 */
+#cursor.is-text {
+  width: 2px;
+  height: var(--bar-h, 24px);
+  border-radius: 1px;
+  transform: translate(-50%, -50%);
+  box-shadow:
+    0 0 0 0.5px rgba(0, 0, 0, 0.2),
+    0 0 10px rgba(255, 255, 255, 0.35);
+}
+
+/* 链接态：点隐去、环亮起。只用外阴影 —— inset 观感是凹进去的 */
+#cursor.is-link { opacity: 0; transform: translate(-50%, -50%); }
+#cursor-ring.is-link {
+  opacity: 1;
+  transform: translate(-50%, -50%) rotate(var(--angle, 0deg))
+    scale(var(--stretch, 1), var(--shrink, 1)) scale(1.12);
+  border-color: rgba(255, 255, 255, 0.9);
+  box-shadow:
+    0 0 6px rgba(255, 255, 255, 0.55),
+    0 0 16px rgba(255, 255, 255, 0.32),
+    0 0 32px rgba(255, 255, 255, 0.16);
+}
+
+#cursor.is-hidden,
+#cursor-ring.is-hidden { opacity: 0 !important; transition: opacity 0.16s ease; }
+
+/* iframe 内画系统光标，自绘光标让位，否则两个光标同时在场 */
+#cursor.is-away,
+#cursor-ring.is-away { opacity: 0 !important; }
+
+/* 拖拽中：略收一点，不做拉伸（白点拉长会变成一颗花生） */
+#cursor.is-dragging {
+  width: 8px;
+  height: 8px;
+  opacity: 1 !important;
+  transform: translate(-50%, -50%);
+}
+#cursor-ring.is-dragging { opacity: 0 !important; }
+
+[data-theme='light'] #cursor {
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.55),
+    0 1px 4px rgba(0, 0, 0, 0.22);
+}
+
+/* 系统关机 / 停机后恢复系统指针 */
+.system-halted,
+.system-halted * { cursor: auto !important; }
+.system-halted #cursor,
+.system-halted #cursor-ring { display: none; }
+
+/* 减少动效：不要过渡，也不要拉伸 */
+@media (prefers-reduced-motion: reduce) {
+  #cursor, #cursor-ring, #cursor.is-text { transition: none; }
+  #cursor, #cursor.is-text, #cursor-ring.is-link { transform: translate(-50%, -50%); }
+  #cursor-ring.is-link { transform: translate(-50%, -50%) scale(1.12); }
+}
+
+/* 触屏：恢复原生指针、隐藏自绘层 */
+@media (hover: none) and (pointer: coarse) {
+  * { cursor: auto !important; }
+  #cursor, #cursor-ring { display: none; }
+}

@@ -1,0 +1,5 @@
+fn twice(value:int) -> int
+ret value * 2
+
+fn main() -> int
+ret twice(21)

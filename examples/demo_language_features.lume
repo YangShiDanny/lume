@@ -1,0 +1,17 @@
+fn Point.total(self:Point) -> int
+ret self.x + self.y
+
+fn identity<T>(value:T) -> T
+ret value
+
+fn main() -> int
+    point:Point = Point{x: 20, y: 22}
+    point.x = identity(21)
+    add_total:fn = fn(value:int) -> int => value + point.total()
+    result:int = match point.x
+        case 21
+            add_total(0)
+        case _
+            0
+    end
+ret result

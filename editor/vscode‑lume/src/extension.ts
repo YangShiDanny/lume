@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 
-const keywords = ["fn", "ret", "if", "else", "while", "and", "or", "not", "is", "true", "false", "end"];
+const keywords = ["fn", "ret", "if", "else", "while", "match", "case", "import", "and", "or", "not", "is", "true", "false", "end"];
 const types = ["int", "i16", "i32", "i64", "float", "string", "bool", "pointer"];
 const builtins = ["print", "len"];
 
@@ -31,7 +31,7 @@ function diagnose(document: vscode.TextDocument): vscode.Diagnostic[] {
     if (!line) continue;
     if (line.startsWith("fn ")) {
       functions++;
-      if (!/^fn\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)(?:\s*->\s*[A-Za-z0-9_*]+)?\s*$/.test(line)) {
+      if (!/^fn\s+[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?(?:<[A-Za-z0-9_,\s]+>)?\s*\([^)]*\)(?:\s*->\s*[A-Za-z0-9_*]+)?\s*$/.test(line)) {
         diagnostics.push(new vscode.Diagnostic(
           new vscode.Range(i, 0, i, raw.length),
           "Invalid function declaration",
@@ -39,10 +39,9 @@ function diagnose(document: vscode.TextDocument): vscode.Diagnostic[] {
         ));
       }
     }
-    if (/^(?:if|while)\b/.test(line)) blockDepth++;
-    if (/^else(?:\s+if\b|$)/.test(line)) blockDepth++;
-    if (/^res:\w+\s*=/.test(line)) {
-      if (/=\s*(?:if|while)\b/.test(line)) blockDepth++;
+    if (/^(?:if|while|match)\b/.test(line)) blockDepth++;
+    if (/=\s*(?:if|while|match)\b/.test(line)) {
+      blockDepth++;
     }
     if (line === "end") blockDepth--;
   }
@@ -171,6 +170,9 @@ function wordDescription(word: string): string {
     if: "conditional block or block expression",
     else: "alternate conditional branch",
     while: "loop block or block expression",
+    match: "match expression",
+    case: "match arm pattern",
+    import: "import a relative Lume module",
     and: "short-circuit boolean and",
     or: "short-circuit boolean or",
     not: "boolean negation",

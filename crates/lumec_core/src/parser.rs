@@ -8,11 +8,24 @@ pub enum Expr {
     Unary(String, Box<Expr>),
     Binary(String, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
+    Apply(Box<Expr>, Vec<Expr>),
+    Lambda(Vec<Param>, Option<String>, Box<Expr>),
+    MethodCall(Box<Expr>, String, Vec<Expr>),
+    Field(Box<Expr>, String),
+    StructLiteral(String, Vec<(String, Expr)>),
     Index(Box<Expr>, Box<Expr>),
     Array(Vec<Expr>),
     Walrus(String, Box<Expr>),
     If(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
     While(Box<Expr>, Vec<Stmt>),
+    Match(Box<Expr>, Vec<(Pattern, Vec<Stmt>)>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Wildcard,
+    Bind(String),
+    Literal(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +42,11 @@ pub enum Stmt {
     IndexAssign {
         name: String,
         index: Expr,
+        expr: Expr,
+    },
+    FieldAssign {
+        name: String,
+        field: String,
         expr: Expr,
     },
     Walrus {
@@ -189,7 +207,7 @@ fn expression_tokens(source: &str) -> Vec<LexToken> {
             } else {
                 String::new()
             };
-            if ["==", "!=", "<=", ">=", ":=", "->"]
+            if ["==", "!=", "<=", ">=", ":=", "->", "=>"]
                 .iter()
                 .any(|op| *op == two)
             {
@@ -337,6 +355,7 @@ impl ExprParser {
                     .map_err(|_| "invalid float".to_string())?,
             ),
             LexTokenKind::String => Expr::String(token.text),
+            LexTokenKind::Ident if token.text == "fn" => self.parse_lambda()?,
             LexTokenKind::Ident => match token.text.as_str() {
                 "true" => Expr::Bool(true),
                 "false" => Expr::Bool(false),
@@ -374,10 +393,45 @@ impl ExprParser {
         loop {
             if self.peek().map(|t| t.text.as_str()) == Some("(") {
                 self.take();
-                let mut args = Vec::new();
-                if self.peek().map(|t| t.text.as_str()) != Some(")") {
+                let args = self.parse_arguments(")")?;
+                expr = match expr {
+                    Expr::Ident(name) => Expr::Call(name, args),
+                    callee => Expr::Apply(Box::new(callee), args),
+                };
+            } else if self.peek().map(|t| t.text.as_str()) == Some(".") {
+                self.take();
+                let member = self
+                    .take()
+                    .filter(|token| token.kind == LexTokenKind::Ident)
+                    .ok_or("expected field or method name after `.`")?
+                    .text;
+                if self.peek().map(|t| t.text.as_str()) == Some("(") {
+                    self.take();
+                    expr = Expr::MethodCall(Box::new(expr), member, self.parse_arguments(")")?);
+                } else {
+                    expr = Expr::Field(Box::new(expr), member);
+                }
+            } else if self.peek().map(|t| t.text.as_str()) == Some("{") {
+                let name = match expr {
+                    Expr::Ident(name) => name,
+                    _ => return Err("struct literal name must be an identifier".into()),
+                };
+                self.take();
+                let mut fields = Vec::new();
+                if self.peek().map(|t| t.text.as_str()) != Some("}") {
                     loop {
-                        args.push(self.parse_or()?);
+                        let field = self
+                            .take()
+                            .filter(|token| token.kind == LexTokenKind::Ident)
+                            .ok_or("expected field name in struct literal")?
+                            .text;
+                        if self.take().map(|token| token.text).as_deref() != Some(":") {
+                            return Err("expected `:` after struct field name".into());
+                        }
+                        if fields.iter().any(|(name, _)| name == &field) {
+                            return Err(format!("duplicate struct field `{field}`"));
+                        }
+                        fields.push((field, self.parse_or()?));
                         if self.peek().map(|t| t.text.as_str()) == Some(",") {
                             self.take();
                         } else {
@@ -385,14 +439,10 @@ impl ExprParser {
                         }
                     }
                 }
-                if self.take().map(|t| t.text).as_deref() != Some(")") {
-                    return Err("missing )".into());
+                if self.take().map(|t| t.text).as_deref() != Some("}") {
+                    return Err("missing }".into());
                 }
-                let name = match expr {
-                    Expr::Ident(name) => name,
-                    _ => return Err("only named calls are supported".into()),
-                };
-                expr = Expr::Call(name, args);
+                expr = Expr::StructLiteral(name, fields);
             } else if self.peek().map(|t| t.text.as_str()) == Some("[") {
                 self.take();
                 let index = self.parse_or()?;
@@ -415,6 +465,79 @@ impl ExprParser {
         Ok(expr)
     }
 
+    fn parse_arguments(&mut self, closing: &str) -> Result<Vec<Expr>, String> {
+        let mut args = Vec::new();
+        if self.peek().map(|token| token.text.as_str()) != Some(closing) {
+            loop {
+                args.push(self.parse_or()?);
+                if self.peek().map(|token| token.text.as_str()) == Some(",") {
+                    self.take();
+                } else {
+                    break;
+                }
+            }
+        }
+        if self.take().map(|token| token.text).as_deref() != Some(closing) {
+            return Err(format!("missing {closing}"));
+        }
+        Ok(args)
+    }
+
+    fn parse_lambda(&mut self) -> Result<Expr, String> {
+        if self.take().map(|token| token.text).as_deref() != Some("(") {
+            return Err("lambda parameters must start with `(`".into());
+        }
+        let mut params = Vec::new();
+        if self.peek().map(|token| token.text.as_str()) != Some(")") {
+            loop {
+                let name = self
+                    .take()
+                    .filter(|token| token.kind == LexTokenKind::Ident)
+                    .ok_or("expected lambda parameter name")?
+                    .text;
+                let ty = if self.peek().map(|token| token.text.as_str()) == Some(":") {
+                    self.take();
+                    Some(
+                        self.take()
+                            .filter(|token| token.kind == LexTokenKind::Ident)
+                            .ok_or("expected lambda parameter type")?
+                            .text,
+                    )
+                } else {
+                    None
+                };
+                params.push(Param { name, ty });
+                if self.peek().map(|token| token.text.as_str()) == Some(",") {
+                    self.take();
+                } else {
+                    break;
+                }
+            }
+        }
+        if self.take().map(|token| token.text).as_deref() != Some(")") {
+            return Err("missing ) in lambda parameters".into());
+        }
+        let return_type = if self.peek().map(|token| token.text.as_str()) == Some("->") {
+            self.take();
+            Some(
+                self.take()
+                    .filter(|token| token.kind == LexTokenKind::Ident)
+                    .ok_or("expected lambda return type")?
+                    .text,
+            )
+        } else {
+            None
+        };
+        if self.take().map(|token| token.text).as_deref() != Some("=>") {
+            return Err("expected `=>` before lambda body".into());
+        }
+        Ok(Expr::Lambda(
+            params,
+            return_type,
+            Box::new(self.parse_or()?),
+        ))
+    }
+
     fn is_keyword(&self, keyword: &str) -> bool {
         self.peek()
             .map(|t| t.kind == LexTokenKind::Ident && t.text == keyword)
@@ -434,6 +557,19 @@ pub fn parse_source(source: &str) -> Result<Vec<FuncDef>, ParseError> {
             continue;
         }
         let indent = raw.len() - raw.trim_start().len();
+        if text.trim_start().starts_with("import ") {
+            if indent != 0 {
+                return Err(ParseError {
+                    line: index + 1,
+                    message: "imports are only allowed at module scope".into(),
+                });
+            }
+            parse_import_path(text.trim()).map_err(|message| ParseError {
+                line: index + 1,
+                message,
+            })?;
+            continue;
+        }
         lines.push(Line {
             indent,
             text: text.trim().to_string(),
@@ -483,11 +619,75 @@ pub fn parse_source(source: &str) -> Result<Vec<FuncDef>, ParseError> {
     Ok(funcs)
 }
 
+pub fn parse_imports(source: &str) -> Result<Vec<String>, ParseError> {
+    let mut imports = Vec::new();
+    for (index, raw) in source.lines().enumerate() {
+        let text = strip_comment(raw);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let indent = raw.len() - raw.trim_start().len();
+        if text.trim_start().starts_with("import ") {
+            if indent != 0 {
+                return Err(ParseError {
+                    line: index + 1,
+                    message: "imports are only allowed at module scope".into(),
+                });
+            }
+            imports.push(
+                parse_import_path(text.trim()).map_err(|message| ParseError {
+                    line: index + 1,
+                    message,
+                })?,
+            );
+        }
+    }
+    Ok(imports)
+}
+
+fn parse_import_path(text: &str) -> Result<String, String> {
+    let path = text
+        .strip_prefix("import ")
+        .ok_or("invalid import declaration")?
+        .trim();
+    let path = if let Some(path) = path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+    {
+        path
+    } else {
+        path
+    };
+    if path.is_empty() || path.chars().any(char::is_whitespace) {
+        return Err("import expects one module path".into());
+    }
+    Ok(path.to_string())
+}
+
 fn parse_func_header(text: &str) -> Result<(String, Vec<Param>, Option<String>), String> {
     let rest = text.strip_prefix("fn ").ok_or("invalid function")?;
     let open = rest.find('(').ok_or("missing ( in function header")?;
     let close = rest.rfind(')').ok_or("missing ) in function header")?;
-    let name = rest[..open].trim();
+    let raw_name = rest[..open].trim();
+    let name = if let Some(generic_start) = raw_name.find('<') {
+        let generic_end = raw_name
+            .strip_suffix('>')
+            .map(str::len)
+            .ok_or("generic parameter list must end with `>`")?;
+        if generic_start == 0 || generic_start >= generic_end {
+            return Err("invalid generic function name".into());
+        }
+        let generic_names = &raw_name[generic_start + 1..generic_end];
+        if generic_names
+            .split(',')
+            .any(|param| !is_identifier(param.trim()))
+        {
+            return Err("generic parameters must be identifiers".into());
+        }
+        raw_name[..generic_start].trim()
+    } else {
+        raw_name
+    };
     if name.is_empty() {
         return Err("missing function name".into());
     }
@@ -514,6 +714,12 @@ fn parse_func_header(text: &str) -> Result<(String, Vec<Param>, Option<String>),
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
     Ok((name.into(), params, ret_ty))
+}
+
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn split_assignment(text: &str) -> Option<(String, Option<String>, String)> {
@@ -615,6 +821,54 @@ fn parse_if_chain(lines: &[Line], index: usize, condition: &str) -> Result<(Stmt
     ))
 }
 
+fn parse_match_expression(
+    lines: &[Line],
+    index: usize,
+    value_source: &str,
+) -> Result<(Expr, usize), String> {
+    let indent = lines[index].indent;
+    let value = parse_expr(value_source)?;
+    let mut next = index + 1;
+    let mut arms = Vec::new();
+    while next < lines.len() && lines[next].indent > indent {
+        let line = &lines[next];
+        let pattern_source = line
+            .text
+            .strip_prefix("case ")
+            .ok_or("expected `case` in match expression")?;
+        let pattern_expr = parse_expr(pattern_source)?;
+        let pattern = match pattern_expr {
+            Expr::Ident(name) if name == "_" => Pattern::Wildcard,
+            Expr::Ident(name) => Pattern::Bind(name),
+            literal @ (Expr::Int(_) | Expr::Float(_) | Expr::String(_) | Expr::Bool(_)) => {
+                Pattern::Literal(literal)
+            }
+            Expr::Unary(op, inner)
+                if op == "-" && matches!(*inner, Expr::Int(_) | Expr::Float(_)) =>
+            {
+                Pattern::Literal(Expr::Unary(op, inner))
+            }
+            _ => return Err("match pattern must be a literal, name, or `_`".into()),
+        };
+        let case_indent = line.indent;
+        next += 1;
+        let mut body = Vec::new();
+        while next < lines.len() && lines[next].indent > case_indent {
+            let (statement, following) = parse_stmt(lines, next)?;
+            body.push(statement);
+            next = following;
+        }
+        arms.push((pattern, body));
+    }
+    if arms.is_empty() {
+        return Err("match expression must contain at least one `case`".into());
+    }
+    if next >= lines.len() || lines[next].indent != indent || lines[next].text != "end" {
+        return Err("match expression is missing `end`".into());
+    }
+    Ok((Expr::Match(Box::new(value), arms), next + 1))
+}
+
 fn parse_stmt(lines: &[Line], index: usize) -> Result<(Stmt, usize), String> {
     let line = &lines[index];
     let text = line.text.as_str();
@@ -654,6 +908,11 @@ fn parse_stmt(lines: &[Line], index: usize) -> Result<(Stmt, usize), String> {
 
     if let Some(rest) = text.strip_prefix("if ") {
         return parse_if_statement(lines, index, rest);
+    }
+
+    if let Some(rest) = text.strip_prefix("match ") {
+        let (expr, next) = parse_match_expression(lines, index, rest)?;
+        return Ok((Stmt::Expr(expr), next));
     }
 
     if let Some(assign) = split_assignment(text) {
@@ -707,6 +966,21 @@ fn parse_stmt(lines: &[Line], index: usize) -> Result<(Stmt, usize), String> {
             }
             return Ok((Stmt::Assign { name, expr }, next));
         }
+        if rhs.starts_with("match ") {
+            let (expr, next) =
+                parse_match_expression(lines, index, rhs.strip_prefix("match ").unwrap())?;
+            if let Some(ty) = ty {
+                return Ok((
+                    Stmt::VarDecl {
+                        name,
+                        ty: Some(ty),
+                        init: expr,
+                    },
+                    next,
+                ));
+            }
+            return Ok((Stmt::Assign { name, expr }, next));
+        }
         if let Some(open) = name.find('[')
             && let Some(close) = name.rfind(']')
             && close > open
@@ -723,6 +997,19 @@ fn parse_stmt(lines: &[Line], index: usize) -> Result<(Stmt, usize), String> {
                     name: target,
                     index: index_expr,
                     expr: value_expr,
+                },
+                index + 1,
+            ));
+        }
+        if let Some((target, field)) = name.split_once('.') {
+            if !is_identifier(target.trim()) || !is_identifier(field.trim()) {
+                return Err("field assignment target must be `name.field`".into());
+            }
+            return Ok((
+                Stmt::FieldAssign {
+                    name: target.trim().into(),
+                    field: field.trim().into(),
+                    expr: parse_expr(&rhs)?,
                 },
                 index + 1,
             ));
@@ -775,6 +1062,82 @@ ret c
         assert_eq!(funcs.len(), 1);
         assert_eq!(funcs[0].name, "add");
         assert_eq!(funcs[0].params.len(), 2);
+    }
+
+    #[test]
+    fn parses_and_executes_erased_generic_functions() {
+        let funcs = parse_source(
+            r#"
+fn identity<T>(value:T) -> T
+ret value
+fn main() -> int
+ret identity(42)
+"#,
+        )
+        .unwrap();
+        let value = Evaluator::new(funcs).call("main", vec![]).unwrap();
+        assert!(matches!(value, Value::Int(42)));
+    }
+
+    #[test]
+    fn evaluates_struct_fields_and_methods() {
+        let funcs = parse_source(
+            r#"
+fn Point.sum(self:Point) -> int
+ret self.x + self.y
+fn main() -> int
+    point:Point = Point{x: 3, y: 4}
+    point.x = 8
+ret point.sum()
+"#,
+        )
+        .unwrap();
+        crate::typecheck::check_program(&funcs).unwrap();
+        let value = Evaluator::new(funcs).call("main", vec![]).unwrap();
+        assert!(matches!(value, Value::Int(12)));
+    }
+
+    #[test]
+    fn evaluates_match_literal_and_binding_patterns() {
+        let funcs = parse_source(
+            r#"
+fn classify(value:int) -> int
+    result:int = match value
+        case 0
+            12
+        case other
+            other + 10
+    end
+ret result
+"#,
+        )
+        .unwrap();
+        crate::typecheck::check_program(&funcs).unwrap();
+        let evaluator = Evaluator::new(funcs);
+        assert!(matches!(
+            evaluator.call("classify", vec![Value::Int(0)]).unwrap(),
+            Value::Int(12)
+        ));
+        assert!(matches!(
+            evaluator.call("classify", vec![Value::Int(3)]).unwrap(),
+            Value::Int(13)
+        ));
+    }
+
+    #[test]
+    fn evaluates_lexically_captured_closures() {
+        let funcs = parse_source(
+            r#"
+fn main() -> int
+    base:int = 37
+    add_base:fn = fn(value:int) -> int => value + base
+ret add_base(5)
+"#,
+        )
+        .unwrap();
+        crate::typecheck::check_program(&funcs).unwrap();
+        let value = Evaluator::new(funcs).call("main", vec![]).unwrap();
+        assert!(matches!(value, Value::Int(42)));
     }
 
     #[test]

@@ -3,6 +3,7 @@
     "target": "es2023",
     "module": "esnext",
     "lib": ["ES2023", "DOM"],
+    "jsx": "react-jsx",
     "types": ["vite/client"],
     "allowArbitraryExtensions": true,
     "skipLibCheck": true,

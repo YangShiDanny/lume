@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Lume CLI 入口：
+#   lume                 进入 REPL（逐行执行）
+#   lume -i / --repl     同上（Python 驱动，带语法高亮）
+#   其余参数交给 lume-bootstrap（run / check / --lsp）
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "$SOURCE")")" && pwd)"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  printf 'Usage:\n  lume                 进入 REPL（逐行执行）\n  lume [run] <file.lume>\n  lume check <file.lume>\n  lume --lsp\n'
+  exit 0
+fi
+
+if [[ $# -eq 0 || "${1:-}" == "-i" || "${1:-}" == "--repl" ]]; then
+  PY=/home/myth/.local/share/lume-repl-venv/bin/python
+  exec env -u PYTHONPATH -u LD_LIBRARY_PATH "$PY" "$ROOT/lume_repl.py"
+fi
+
+BIN="$ROOT/target/release/lume-bootstrap"
+if [[ ! -x "$BIN" ]]; then
+  echo "[lume] 未找到 $BIN，正在构建..." >&2
+  cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin lume-bootstrap
+fi
+
+# 文件模式保持调用者的相对路径。
+exec "$BIN" "$@"

@@ -11,3 +11,5 @@ editor/vscode‑lume/out/
 crates/*/src/all_src.md
 crates/*/src/pack.sh
 usr
+.Trash-0/
+.workbuddy/

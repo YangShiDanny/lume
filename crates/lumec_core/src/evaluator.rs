@@ -1,4 +1,4 @@
-use crate::parser::{Expr, FuncDef, Stmt};
+use crate::parser::{Expr, FuncDef, Param, Pattern, Stmt};
 #[cfg(feature = "system-sleef")]
 use crate::sleef;
 use std::collections::HashMap;
@@ -10,7 +10,35 @@ pub enum Value {
     Bool(bool),
     String(String),
     Array(Vec<Value>),
+    Struct {
+        name: String,
+        fields: HashMap<String, Value>,
+    },
+    Closure {
+        params: Vec<Param>,
+        body: Expr,
+        captured: HashMap<String, Value>,
+    },
     Unit,
+}
+
+fn assign_field(
+    env: &mut HashMap<String, Value>,
+    name: &str,
+    field: &str,
+    value: Value,
+) -> Result<(), String> {
+    match env.get_mut(name) {
+        Some(Value::Struct { fields, .. }) => {
+            let slot = fields
+                .get_mut(field)
+                .ok_or_else(|| format!("struct has no field `{field}`"))?;
+            *slot = value;
+            Ok(())
+        }
+        Some(_) => Err(format!("`{name}` is not a struct")),
+        None => Err(format!("undefined variable `{name}`")),
+    }
 }
 
 impl Value {
@@ -21,6 +49,8 @@ impl Value {
             Value::Bool(v) => *v,
             Value::String(v) => !v.is_empty(),
             Value::Array(v) => !v.is_empty(),
+            Value::Struct { .. } => true,
+            Value::Closure { .. } => true,
             Value::Unit => false,
         }
     }
@@ -68,6 +98,27 @@ impl Evaluator {
         self.funcs.contains_key(name)
     }
 
+    fn invoke_closure(
+        &self,
+        params: &[Param],
+        body: &Expr,
+        captured: &HashMap<String, Value>,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        if args.len() != params.len() {
+            return Err(format!(
+                "closure expects {} arguments, received {}",
+                params.len(),
+                args.len()
+            ));
+        }
+        let mut env = captured.clone();
+        for (param, value) in params.iter().zip(args) {
+            env.insert(param.name.clone(), value);
+        }
+        self.eval(body, &mut env)
+    }
+
     fn exec_block(
         &self,
         block: &[Stmt],
@@ -90,6 +141,10 @@ impl Evaluator {
                     let index = self.eval(index, env)?;
                     let value = self.eval(expr, env)?;
                     assign_index(env, name, index, value)?;
+                }
+                Stmt::FieldAssign { name, field, expr } => {
+                    let value = self.eval(expr, env)?;
+                    assign_field(env, name, field, value)?;
                 }
                 Stmt::Walrus { name, expr } => {
                     if !env.contains_key(name) {
@@ -167,6 +222,10 @@ impl Evaluator {
                     let value = self.eval(expr, env)?;
                     assign_index(env, name, index, value)?;
                 }
+                Stmt::FieldAssign { name, field, expr } => {
+                    let value = self.eval(expr, env)?;
+                    assign_field(env, name, field, value)?;
+                }
                 Stmt::Walrus { name, expr } => {
                     let value = self.eval(expr, env)?;
                     env.insert(name.clone(), value.clone());
@@ -238,10 +297,68 @@ impl Evaluator {
                 for arg in args {
                     values.push(self.eval(arg, env)?);
                 }
+                if let Some(Value::Closure {
+                    params,
+                    body,
+                    captured,
+                }) = env.get(name).cloned()
+                {
+                    return self.invoke_closure(&params, &body, &captured, values);
+                }
                 if let Some(value) = builtin(name, &values)? {
                     return Ok(value);
                 }
                 self.call(name, values)
+            }
+            Expr::Apply(callee, args) => {
+                let callee = self.eval(callee, env)?;
+                let mut values = Vec::new();
+                for arg in args {
+                    values.push(self.eval(arg, env)?);
+                }
+                match callee {
+                    Value::Closure {
+                        params,
+                        body,
+                        captured,
+                    } => self.invoke_closure(&params, &body, &captured, values),
+                    _ => Err("value is not callable".into()),
+                }
+            }
+            Expr::Lambda(params, _, body) => Ok(Value::Closure {
+                params: params.clone(),
+                body: (**body).clone(),
+                captured: env.clone(),
+            }),
+            Expr::MethodCall(receiver, method, args) => {
+                let receiver = self.eval(receiver, env)?;
+                let type_name = match &receiver {
+                    Value::Struct { name, .. } => name,
+                    _ => return Err("method receiver must be a struct value".into()),
+                };
+                let function = format!("{type_name}.{method}");
+                let mut values = vec![receiver];
+                for arg in args {
+                    values.push(self.eval(arg, env)?);
+                }
+                self.call(&function, values)
+            }
+            Expr::Field(receiver, field) => match self.eval(receiver, env)? {
+                Value::Struct { fields, .. } => fields
+                    .get(field)
+                    .cloned()
+                    .ok_or_else(|| format!("struct has no field `{field}`")),
+                _ => Err("field access requires a struct value".into()),
+            },
+            Expr::StructLiteral(name, fields) => {
+                let mut values = HashMap::new();
+                for (field, expr) in fields {
+                    values.insert(field.clone(), self.eval(expr, env)?);
+                }
+                Ok(Value::Struct {
+                    name: name.clone(),
+                    fields: values,
+                })
             }
             Expr::Index(base, index) => {
                 let base = self.eval(base, env)?;
@@ -290,6 +407,38 @@ impl Evaluator {
                     last = self.eval_block_value(body, env)?;
                 }
                 Ok(last)
+            }
+            Expr::Match(value, arms) => {
+                let value = self.eval(value, env)?;
+                for (pattern, body) in arms {
+                    let binding = match pattern {
+                        Pattern::Wildcard => None,
+                        Pattern::Bind(name) => Some((name.as_str(), value.clone())),
+                        Pattern::Literal(literal) => {
+                            let literal = self.eval(literal, env)?;
+                            if !values_equal(&value, &literal) {
+                                continue;
+                            }
+                            None
+                        }
+                    };
+                    let previous = binding
+                        .as_ref()
+                        .map(|(name, _)| ((*name).to_string(), env.get(*name).cloned()));
+                    if let Some((name, bound_value)) = binding {
+                        env.insert(name.to_string(), bound_value);
+                    }
+                    let result = self.eval_block_value(body, env);
+                    if let Some((name, previous_value)) = previous {
+                        if let Some(previous_value) = previous_value {
+                            env.insert(name, previous_value);
+                        } else {
+                            env.remove(&name);
+                        }
+                    }
+                    return result;
+                }
+                Err("non-exhaustive match: no pattern matched the value".into())
             }
         }
     }
@@ -394,6 +543,24 @@ fn values_equal(lhs: &Value, rhs: &Value) -> bool {
         (Value::Unit, Value::Unit) => true,
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(a, b)| values_equal(a, b))
+        }
+        (
+            Value::Struct {
+                name: name_a,
+                fields: fields_a,
+            },
+            Value::Struct {
+                name: name_b,
+                fields: fields_b,
+            },
+        ) => {
+            name_a == name_b
+                && fields_a.len() == fields_b.len()
+                && fields_a.iter().all(|(field, value)| {
+                    fields_b
+                        .get(field)
+                        .is_some_and(|other| values_equal(value, other))
+                })
         }
         _ => false,
     }
@@ -566,6 +733,15 @@ fn value_to_string(value: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Value::Struct { name, fields } => {
+            let fields = fields
+                .iter()
+                .map(|(field, value)| format!("{field}: {}", value_to_string(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name}{{{fields}}}")
+        }
+        Value::Closure { .. } => "<closure>".into(),
         Value::Unit => "()".into(),
     }
 }
