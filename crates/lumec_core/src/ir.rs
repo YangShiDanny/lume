@@ -20,6 +20,14 @@ pub enum IrOp {
     Gt(ValueId, ValueId),
     Le(ValueId, ValueId),
     Ge(ValueId, ValueId),
+    /// Zero-extends a narrow unsigned value represented in the i64 JIT ABI.
+    CastUInt(ValueId, u32),
+    /// Materializes a C callback function pointer from its Lume-side name and
+    /// FFI signature. Lowered into a builtin call with a stable slot id.
+    FfiExportPtr {
+        name: String,
+        signature: String,
+    },
     Phi(Vec<(BlockId, ValueId)>),
     If(ValueId, BlockId, BlockId),
     Jump(BlockId),
@@ -43,6 +51,8 @@ impl IrOp {
                 | Self::Gt(_, _)
                 | Self::Le(_, _)
                 | Self::Ge(_, _)
+                | Self::CastUInt(_, _)
+                | Self::FfiExportPtr { .. }
                 | Self::Phi(_)
                 | Self::Call(_, _)
         )
@@ -179,6 +189,16 @@ impl IrFunc {
                     IrOp::Call(_, args) => {
                         for arg in args {
                             check_value(*arg, value_count, &self.name)?;
+                        }
+                    }
+                    IrOp::CastUInt(value, _) => {
+                        check_value(*value, value_count, &self.name)?;
+                    }
+                    IrOp::FfiExportPtr { name, .. } => {
+                        if name.is_empty() {
+                            return Err(IrValidationError(
+                                "ffi_export_ptr target name must not be empty".into(),
+                            ));
                         }
                     }
                     IrOp::Phi(incoming) => {

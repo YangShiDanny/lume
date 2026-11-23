@@ -1,0 +1,16 @@
+fn main() -> int
+    data:any = buf_new(8)
+    buf_set_u8(data, 0, u8(255))
+    buf_set_u32(data, 4, u32(16909060))
+
+    first:int = buf_get_u8(data, 0)
+    word:int = buf_get_u32(data, 4)
+
+    copy:any = buf_new(8)
+    memcpy(copy, 0, data, 0, 8)
+    copied:int = buf_get_u32(copy, 4)
+
+    moved:any = buf_new(8)
+    memmove(moved, 0, data, 0, 8)
+    shifted:int = buf_get_u32(moved, 4)
+ret first + word + copied + shifted

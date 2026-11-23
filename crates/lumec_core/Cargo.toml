@@ -9,6 +9,7 @@ libffi = "5.2.0"
 libloading = "0.8.9"
 self_cell = "1.2"
 lumec_immix = { path = "../lumec_immix" }
+serde_json = "1"
 
 [features]
 default = []

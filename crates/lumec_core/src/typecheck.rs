@@ -1,3 +1,5 @@
+use crate::ffi::{FfiSignature, FfiType};
+use crate::manifest::lume_c_type;
 use crate::parser::{Expr, FuncDef, Pattern, Stmt};
 use std::collections::HashMap;
 
@@ -5,6 +7,13 @@ use std::collections::HashMap;
 enum Type {
     Any,
     Int,
+    I8,
+    I16,
+    I32,
+    U8,
+    U16,
+    U32,
+    U64,
     Float,
     Bool,
     String,
@@ -14,10 +23,34 @@ enum Type {
     Unit,
 }
 
+fn ffi_ty_to_type(ty: FfiType) -> Type {
+    match ty {
+        FfiType::Void => Type::Unit,
+        FfiType::I8 => Type::I8,
+        FfiType::I16 => Type::I16,
+        FfiType::I32 => Type::I32,
+        FfiType::I64 => Type::Int,
+        FfiType::U8 => Type::U8,
+        FfiType::U16 => Type::U16,
+        FfiType::U32 => Type::U32,
+        FfiType::U64 => Type::U64,
+        FfiType::F32 | FfiType::F64 => Type::Float,
+        FfiType::Pointer => Type::Any,
+        FfiType::Struct(_) | FfiType::Union(_) => Type::Any,
+    }
+}
+
 impl Type {
     fn from_annotation(annotation: &str) -> Self {
         match annotation {
-            "int" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => Self::Int,
+            "int" | "i64" => Self::Int,
+            "i8" => Self::I8,
+            "i16" => Self::I16,
+            "i32" => Self::I32,
+            "u8" => Self::U8,
+            "u16" => Self::U16,
+            "u32" => Self::U32,
+            "u64" => Self::U64,
             "float" | "f32" | "f64" => Self::Float,
             "bool" => Self::Bool,
             "string" | "str" => Self::String,
@@ -30,6 +63,13 @@ impl Type {
         match self {
             Self::Any => "any",
             Self::Int => "int",
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+            Self::U8 => "u8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
             Self::Float => "float",
             Self::Bool => "bool",
             Self::String => "string",
@@ -40,9 +80,62 @@ impl Type {
         }
     }
 
-    fn compatible_with(&self, other: &Self) -> bool {
-        self == other || matches!(self, Self::Any) || matches!(other, Self::Any)
+    fn is_integer(&self) -> bool {
+        matches!(
+            self,
+            Self::Int
+                | Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::U8
+                | Self::U16
+                | Self::U32
+                | Self::U64
+        )
     }
+
+    fn integer_rank(&self) -> u8 {
+        match self {
+            Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::I32 | Self::U32 => 3,
+            Self::U64 | Self::Int => 4,
+            _ => 0,
+        }
+    }
+
+    fn promotes_to(&self, other: &Self) -> bool {
+        if !self.is_integer() || !other.is_integer() {
+            return false;
+        }
+        self.integer_rank() <= other.integer_rank()
+    }
+
+    fn compatible_with(&self, other: &Self) -> bool {
+        self == other
+            || matches!(self, Self::Any)
+            || matches!(other, Self::Any)
+            || other.promotes_to(self)
+    }
+}
+
+fn common_numeric_type(lhs: &Type, rhs: &Type) -> Type {
+    if lhs == &Type::Float || rhs == &Type::Float {
+        return Type::Float;
+    }
+    if lhs == &Type::Any || rhs == &Type::Any {
+        return Type::Any;
+    }
+    if !lhs.is_integer() || !rhs.is_integer() {
+        return Type::Any;
+    }
+    if lhs.integer_rank() > rhs.integer_rank() {
+        return lhs.clone();
+    }
+    if rhs.integer_rank() > lhs.integer_rank() {
+        return rhs.clone();
+    }
+    if lhs == rhs { lhs.clone() } else { Type::Int }
 }
 
 #[derive(Debug, Clone)]
@@ -52,13 +145,45 @@ struct FunctionType {
 }
 
 pub fn check_program(functions: &[FuncDef]) -> Result<(), String> {
+    check_program_with_externs(functions, &HashMap::new())
+}
+
+pub fn check_program_with_externs(
+    functions: &[FuncDef],
+    externs: &HashMap<String, FfiSignature>,
+) -> Result<(), String> {
     let mut signatures = HashMap::new();
+    for (name, signature) in externs {
+        signatures.insert(
+            name.clone(),
+            FunctionType {
+                params: signature.args.iter().cloned().map(ffi_ty_to_type).collect(),
+                result: ffi_ty_to_type(signature.result.clone()),
+            },
+        );
+    }
     for function in functions {
         if signatures.contains_key(&function.name) {
             return Err(format!(
                 "function `{}` is defined more than once",
                 function.name
             ));
+        }
+        if function.attrs.iter().any(|attr| attr == "ffi_export") {
+            for param in &function.params {
+                lume_c_type(param.ty.as_deref()).map_err(|error| {
+                    format!(
+                        "function `{}` cannot be exported to C: {error}",
+                        function.name
+                    )
+                })?;
+            }
+            lume_c_type(function.ret_ty.as_deref()).map_err(|error| {
+                format!(
+                    "function `{}` cannot be exported to C: {error}",
+                    function.name
+                )
+            })?;
         }
         signatures.insert(
             function.name.clone(),
@@ -242,7 +367,7 @@ impl Checker<'_> {
                     }
                     Ok(Type::Bool)
                 } else {
-                    if !matches!(inner, Type::Int | Type::Float | Type::Any) {
+                    if !is_numeric(&inner) {
                         return Err(self.error("unary `-` requires a number"));
                     }
                     Ok(inner)
@@ -270,11 +395,7 @@ impl Checker<'_> {
                         if !is_numeric(&lhs) || !is_numeric(&rhs) {
                             return Err(self.error(format!("operator `{op}` requires numbers")));
                         }
-                        Ok(if lhs == Type::Float || rhs == Type::Float {
-                            Type::Float
-                        } else {
-                            lhs
-                        })
+                        Ok(common_numeric_type(&lhs, &rhs))
                     }
                     _ => Err(self.error(format!("unsupported operator `{op}`"))),
                 }
@@ -540,14 +661,14 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
         }
         "u8" | "u32" => {
             require_builtin_arity(name, args, 1)?;
-            if !matches!(args[0], Type::Int | Type::Any) {
+            if !args[0].is_integer() && args[0] != Type::Any {
                 return Err(format!("builtin `{name}` expects an integer"));
             }
-            Ok(Type::Int)
+            Ok(if name == "u8" { Type::U8 } else { Type::U32 })
         }
         "buf_new" => {
             require_builtin_arity(name, args, 1)?;
-            if !matches!(args[0], Type::Int | Type::Any) {
+            if !args[0].is_integer() && args[0] != Type::Any {
                 return Err("buf_new expects an integer length".into());
             }
             Ok(Type::Any)
@@ -558,16 +679,20 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
         }
         "buf_get_u8" | "buf_get_u32" => {
             require_builtin_arity(name, args, 2)?;
-            Ok(Type::Int)
+            Ok(if name == "buf_get_u8" {
+                Type::U8
+            } else {
+                Type::U32
+            })
         }
         "buf_set_u8" | "buf_set_u32" => {
             require_builtin_arity(name, args, 3)?;
             Ok(Type::Unit)
         }
-        "memcpy" => {
+        "memcpy" | "memmove" => {
             if args.len() != 3 && args.len() != 5 {
                 return Err(format!(
-                    "builtin `memcpy` expects 3 or 5 arguments, received {}",
+                    "builtin `{name}` expects 3 or 5 arguments, received {}",
                     args.len()
                 ));
             }
@@ -583,12 +708,6 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
         "buf_to_str" => {
             require_builtin_arity(name, args, 1)?;
             Ok(Type::String)
-        }
-        "c_matmul" => {
-            if args.is_empty() {
-                return Err("c_matmul expects at least 1 argument".into());
-            }
-            Ok(Type::Int)
         }
         "ffi_unsafe_load" => {
             require_builtin_arity(name, args, 1)?;
@@ -622,6 +741,15 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
             }
             Ok(Type::Any)
         }
+        "ffi_export_ptr" => {
+            require_builtin_arity(name, args, 2)?;
+            if !matches!(args[0], Type::String | Type::Any)
+                || !matches!(args[1], Type::String | Type::Any)
+            {
+                return Err("ffi_export_ptr expects a function name and signature".into());
+            }
+            Ok(Type::Any)
+        }
         "ffi_callback_error" => {
             require_builtin_arity(name, args, 1)?;
             Ok(Type::String)
@@ -632,8 +760,8 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
         }
         "ffi_buffer" => {
             require_builtin_arity(name, args, 2)?;
-            if !matches!(args[0], Type::Int | Type::Any)
-                || !matches!(args[1], Type::Int | Type::Any)
+            if (!args[0].is_integer() && args[0] != Type::Any)
+                || (!args[1].is_integer() && args[1] != Type::Any)
             {
                 return Err("ffi_buffer expects integer size and alignment".into());
             }
@@ -655,6 +783,22 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
             require_builtin_arity(name, args, 3)?;
             Ok(Type::String)
         }
+        "ffi_struct" => {
+            require_builtin_arity(name, args, 2)?;
+            if !matches!(args[0], Type::String | Type::Any)
+                || !matches!(args[1], Type::Array | Type::Any)
+            {
+                return Err("ffi_struct expects a type string and field array".into());
+            }
+            Ok(Type::Any)
+        }
+        "ffi_struct_get" => {
+            require_builtin_arity(name, args, 2)?;
+            if !args[1].is_integer() && args[1] != Type::Any {
+                return Err("ffi_struct_get expects an integer field index".into());
+            }
+            Ok(Type::Any)
+        }
         "log_at" => {
             require_builtin_arity(name, args, 2)?;
             Ok(Type::Unit)
@@ -671,8 +815,8 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
         | "sleef_tan_u10" | "sleef_exp_u10" | "sleef_log_u10" | "sleef_sqrt_u05" | "llvm_sin"
         | "llvm_cos" | "llvm_exp" | "llvm_log" | "llvm_sqrt" => {
             require_builtin_arity(name, args, 1)?;
-            Ok(if name == "abs" && args[0] == Type::Int {
-                Type::Int
+            Ok(if name == "abs" && args[0].is_integer() {
+                args[0].clone()
             } else {
                 Type::Float
             })
@@ -687,7 +831,7 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
 }
 
 fn is_numeric(ty: &Type) -> bool {
-    matches!(ty, Type::Int | Type::Float | Type::Any)
+    ty.is_integer() || matches!(ty, Type::Float | Type::Any)
 }
 
 fn require_builtin_arity(name: &str, args: &[Type], expected: usize) -> Result<(), String> {
@@ -762,6 +906,51 @@ end
             check_program(&invalid)
                 .unwrap_err()
                 .contains("expects 3 or 5 arguments")
+        );
+    }
+
+    #[test]
+    fn distinguishes_fixed_width_integer_annotations() {
+        let valid = parse_source(
+            r#"
+fn identity(value:u8) -> u8
+ret value
+fn main() -> int
+    small:u8 = u8(255)
+    widened:int = small
+    copied:u8 = identity(small)
+ret widened + copied
+"#,
+        )
+        .unwrap();
+        assert!(check_program(&valid).is_ok());
+
+        let invalid = parse_source(
+            r#"
+fn main() -> int
+    small:u8 = 300
+ret small
+"#,
+        )
+        .unwrap();
+        assert!(
+            check_program(&invalid)
+                .unwrap_err()
+                .contains("expects u8, got int")
+        );
+
+        let narrowed = parse_source(
+            r#"
+fn main() -> int
+    small:u8 = u32(1)
+ret small
+"#,
+        )
+        .unwrap();
+        assert!(
+            check_program(&narrowed)
+                .unwrap_err()
+                .contains("expects u8, got u32")
         );
     }
 

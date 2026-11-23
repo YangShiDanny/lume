@@ -5,6 +5,7 @@ crates/*/target/
 *.o
 *.so
 *.out
+examples/*/build/
 node_modules/
 editor/vscode-lume/out/
 editor/vscode‑lume/out/

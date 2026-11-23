@@ -73,5 +73,60 @@
     "prefix": "monoms",
     "body": "mono_ms()",
     "description": "Monotonic time in milliseconds for timeouts"
+  },
+  "GC byte buffer": {
+    "prefix": "bufnew",
+    "body": "${1:name}:any = buf_new(${2:size})",
+    "description": "Allocate a GC-managed byte buffer"
+  },
+  "Read u8": {
+    "prefix": "bufget8",
+    "body": "buf_get_u8(${1:buffer}, ${2:offset})",
+    "description": "Read an unsigned byte from a GC buffer"
+  },
+  "Write u8": {
+    "prefix": "bufset8",
+    "body": "buf_set_u8(${1:buffer}, ${2:offset}, u8(${3:value}))",
+    "description": "Write an unsigned byte to a GC buffer"
+  },
+  "Read u32": {
+    "prefix": "bufget32",
+    "body": "buf_get_u32(${1:buffer}, ${2:offset})",
+    "description": "Read a little-endian u32 from a GC buffer"
+  },
+  "Write u32": {
+    "prefix": "bufset32",
+    "body": "buf_set_u32(${1:buffer}, ${2:offset}, u32(${3:value}))",
+    "description": "Write a little-endian u32 to a GC buffer"
+  },
+  "Memory copy": {
+    "prefix": "memcpy",
+    "body": "memcpy(${1:dst}, ${2:dst_offset}, ${3:src}, ${4:src_offset}, ${5:count})",
+    "description": "Copy bytes between GC buffers with explicit offsets; overlapping ranges are rejected"
+  },
+  "Overlapping memory move": {
+    "prefix": "memmove",
+    "body": "memmove(${1:dst}, ${2:dst_offset}, ${3:src}, ${4:src_offset}, ${5:count})",
+    "description": "Copy bytes between GC buffers, allowing overlapping ranges"
+  },
+  "FFI aggregate value": {
+    "prefix": "ffistruct",
+    "body": "${1:value}:any = ffi_struct(\"${2:{i32,i32}}\", [${3:1}, ${4:2}])",
+    "description": "Construct a by-value C struct or union for dynamic FFI"
+  },
+  "FFI aggregate field": {
+    "prefix": "ffistructget",
+    "body": "${1:field}:any = ffi_struct_get(${2:value}, ${3:0})",
+    "description": "Read a field from a by-value C aggregate"
+  },
+  "FFI export attribute": {
+    "prefix": "ffiexport",
+    "body": "#[ffi_export]",
+    "description": "Mark a function for C ABI export"
+  },
+  "FFI export pointer": {
+    "prefix": "ffiexportptr",
+    "body": "ffi_export_ptr(\"${1:function}\", \"${2:i64(i64)}\")",
+    "description": "Create a C callable pointer to a Lume function (interpreter and JIT)"
   }
 }

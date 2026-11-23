@@ -7,12 +7,71 @@
 use crate::gc::GcHeap;
 use crate::typeobj::TypeId;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::ptr;
 use std::rc::Rc;
 
 const BUFFER_TYPE_ID: TypeId = TypeId(0x6275_6631); // "buf1"
 const LEN_PREFIX: usize = std::mem::size_of::<u64>();
+
+thread_local! {
+    static CURRENT_HEAP: RefCell<Option<GcBufferHeap>> = const { RefCell::new(None) };
+    static JIT_BUFFERS: RefCell<HashMap<usize, Rc<GcBuffer>>> = RefCell::new(HashMap::new());
+}
+
+/// Restores the previous thread-local buffer heap when dropped.
+pub struct HeapGuard(Option<GcBufferHeap>);
+
+impl Drop for HeapGuard {
+    fn drop(&mut self) {
+        CURRENT_HEAP.with(|heap| *heap.borrow_mut() = self.0.take());
+    }
+}
+
+/// Installs a buffer heap for the duration of a JIT call.
+pub fn set_current_heap(heap: GcBufferHeap) -> HeapGuard {
+    let previous = CURRENT_HEAP.with(|current| current.borrow_mut().replace(heap));
+    HeapGuard(previous)
+}
+
+pub fn with_current_heap<T>(operation: impl FnOnce(&GcBufferHeap) -> T) -> T {
+    CURRENT_HEAP.with(|heap| {
+        let borrowed = heap.borrow();
+        let heap = borrowed
+            .as_ref()
+            .expect("JIT buffer builtin needs a current GC buffer heap");
+        operation(heap)
+    })
+}
+
+/// Releases all buffers created through the JIT builtins on this thread.
+pub fn clear_jit_buffers() {
+    JIT_BUFFERS.with(|buffers| buffers.borrow_mut().clear());
+}
+
+/// Keeps the buffer alive for the lifetime of the JIT runtime and returns its
+/// stable payload address as the JIT-facing handle.
+pub fn jit_buffer_insert(buffer: GcBuffer) -> i64 {
+    let address = buffer.as_ptr() as usize;
+    JIT_BUFFERS.with(|buffers| {
+        buffers.borrow_mut().insert(address, Rc::new(buffer));
+    });
+    address as i64
+}
+
+pub fn jit_buffer_lookup(handle: i64) -> Result<Rc<GcBuffer>, String> {
+    if handle == 0 {
+        return Err("JIT buffer builtin received a null buffer handle".into());
+    }
+    JIT_BUFFERS.with(|buffers| {
+        buffers
+            .borrow()
+            .get(&(handle as usize))
+            .cloned()
+            .ok_or_else(|| format!("JIT buffer handle {handle} is not alive"))
+    })
+}
 
 #[derive(Clone, Default)]
 pub struct GcBufferHeap(Rc<RefCell<GcHeap>>);
@@ -51,6 +110,10 @@ impl GcBuffer {
 
     pub fn len(&self) -> usize {
         unsafe { ptr::read_unaligned(self.payload as *const u64) as usize }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     fn data_ptr(&self) -> *mut u8 {
@@ -101,7 +164,9 @@ impl GcBuffer {
 
     pub fn write_bytes(&self, offset: usize, bytes: &[u8]) -> Result<(), String> {
         self.check_range("buf_write_bytes", offset, bytes.len())?;
-        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), self.data_ptr().add(offset), bytes.len()) };
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), self.data_ptr().add(offset), bytes.len())
+        };
         Ok(())
     }
 
@@ -109,11 +174,19 @@ impl GcBuffer {
         unsafe { std::slice::from_raw_parts(self.data_ptr(), self.len()) }.to_vec()
     }
 
-    pub fn memcpy(&self, dst_offset: usize, src: &GcBuffer, src_offset: usize, count: usize) -> Result<(), String> {
+    pub fn memcpy(
+        &self,
+        dst_offset: usize,
+        src: &GcBuffer,
+        src_offset: usize,
+        count: usize,
+    ) -> Result<(), String> {
         self.check_range("memcpy destination", dst_offset, count)?;
         src.check_range("memcpy source", src_offset, count)?;
         if ptr::eq(self.payload, src.payload) && ranges_overlap(dst_offset, src_offset, count) {
-            return Err("memcpy: source and destination ranges overlap; use a separate buffer".into());
+            return Err(
+                "memcpy: source and destination ranges overlap; use memmove instead".into(),
+            );
         }
         unsafe {
             ptr::copy_nonoverlapping(
@@ -121,6 +194,35 @@ impl GcBuffer {
                 self.data_ptr().add(dst_offset),
                 count,
             );
+        }
+        Ok(())
+    }
+
+    /// Copies `count` bytes like C `memmove`, allowing overlapping ranges in
+    /// the same buffer. The copy direction is chosen by `ptr::copy`.
+    pub fn memmove(
+        &self,
+        dst_offset: usize,
+        src: &GcBuffer,
+        src_offset: usize,
+        count: usize,
+    ) -> Result<(), String> {
+        self.check_range("memmove destination", dst_offset, count)?;
+        src.check_range("memmove source", src_offset, count)?;
+        unsafe {
+            if ptr::eq(self.payload, src.payload) {
+                ptr::copy(
+                    src.data_ptr().add(src_offset),
+                    self.data_ptr().add(dst_offset),
+                    count,
+                );
+            } else {
+                ptr::copy_nonoverlapping(
+                    src.data_ptr().add(src_offset),
+                    self.data_ptr().add(dst_offset),
+                    count,
+                );
+            }
         }
         Ok(())
     }
@@ -176,6 +278,21 @@ mod tests {
         destination.memcpy(0, &source, 0, 4).unwrap();
         assert_eq!(destination.read_u32(0).unwrap(), 0xdead_beef);
         assert!(destination.memcpy(0, &destination, 1, 3).is_err());
+    }
+
+    #[test]
+    fn memmove_handles_overlapping_ranges_in_both_directions() {
+        let heap = GcBufferHeap::default();
+        let buffer = GcBuffer::new(&heap, 8).unwrap();
+        for (index, byte) in [1u8, 2, 3, 4, 5, 6, 7, 8].iter().enumerate() {
+            buffer.write_u8(index, *byte).unwrap();
+        }
+
+        buffer.memmove(1, &buffer, 0, 4).unwrap();
+        assert_eq!(buffer.read_bytes(), [1, 1, 2, 3, 4, 6, 7, 8]);
+
+        buffer.memmove(0, &buffer, 2, 4).unwrap();
+        assert_eq!(buffer.read_bytes(), [2, 3, 4, 6, 4, 6, 7, 8]);
     }
 
     #[test]

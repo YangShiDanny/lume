@@ -10,6 +10,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use libffi::low;
+use libffi::low::ffi_abi as RawAbi;
+use libffi::middle::ffi_abi_FFI_DEFAULT_ABI;
 use libffi::middle::{Arg, Cif, Closure, CodePtr, Ret, Type, arg};
 use libloading::Library;
 
@@ -24,7 +26,95 @@ impl fmt::Display for FfiError {
 
 impl std::error::Error for FfiError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Portable names for the calling conventions Lume can request. Raw libffi ABI
+/// numbers are platform-specific, so manifests and signatures use these names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FfiAbiName {
+    #[default]
+    Default,
+    SysV,
+    Cdecl,
+    Stdcall,
+    Win64,
+    Fastcall,
+}
+
+impl FfiAbiName {
+    pub fn parse(name: &str) -> Result<Self, FfiError> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "default" | "c" | "ffi_default" => Ok(Self::Default),
+            "sysv" | "unix" => Ok(Self::SysV),
+            "cdecl" => Ok(Self::Cdecl),
+            "stdcall" => Ok(Self::Stdcall),
+            "win64" => Ok(Self::Win64),
+            "fastcall" => Ok(Self::Fastcall),
+            other => Err(FfiError(format!(
+                "unsupported C calling convention `{other}`"
+            ))),
+        }
+    }
+
+    fn resolve(self) -> Result<RawAbi, FfiError> {
+        match self {
+            Self::Default => Ok(ffi_abi_FFI_DEFAULT_ABI),
+            Self::SysV | Self::Cdecl => {
+                #[cfg(all(target_arch = "x86", windows))]
+                {
+                    Ok(libffi::raw::ffi_abi_FFI_SYSV)
+                }
+                #[cfg(not(all(target_arch = "x86", windows)))]
+                {
+                    Ok(ffi_abi_FFI_DEFAULT_ABI)
+                }
+            }
+            Self::Stdcall => {
+                #[cfg(all(target_arch = "x86", windows))]
+                {
+                    Ok(libffi::raw::ffi_abi_FFI_STDCALL)
+                }
+                #[cfg(all(target_arch = "x86_64", windows))]
+                {
+                    Ok(ffi_abi_FFI_DEFAULT_ABI)
+                }
+                #[cfg(not(any(
+                    all(target_arch = "x86", windows),
+                    all(target_arch = "x86_64", windows)
+                )))]
+                {
+                    Err(FfiError(
+                        "stdcall is only available on 32-bit Windows targets".into(),
+                    ))
+                }
+            }
+            Self::Win64 => {
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                {
+                    Ok(libffi::raw::ffi_abi_FFI_WIN64)
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                {
+                    Err(FfiError(
+                        "win64 calling convention requires an x86_64 or aarch64 target".into(),
+                    ))
+                }
+            }
+            Self::Fastcall => {
+                #[cfg(all(target_arch = "x86", windows))]
+                {
+                    Ok(libffi::raw::ffi_abi_FFI_FASTCALL)
+                }
+                #[cfg(not(all(target_arch = "x86", windows)))]
+                {
+                    Err(FfiError(
+                        "fastcall is only available on 32-bit Windows targets".into(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FfiType {
     Void,
     I8,
@@ -38,11 +128,43 @@ pub enum FfiType {
     F32,
     F64,
     Pointer,
+    /// By-value C struct with fields in declaration order.
+    Struct(Vec<FfiType>),
+    /// By-value C union. Only scalar members are supported by the layout
+    /// helper; the ABI uses the largest member's representation.
+    Union(Vec<FfiType>),
 }
 
 impl FfiType {
     pub fn parse(name: &str) -> Result<Self, FfiError> {
-        match name.trim() {
+        let name = name.trim();
+        if let Some(inner) = name
+            .strip_prefix('{')
+            .and_then(|value| value.strip_suffix('}'))
+        {
+            let fields = split_top_level(inner, ',')
+                .into_iter()
+                .map(Self::parse)
+                .collect::<Result<Vec<_>, _>>()?;
+            if fields.is_empty() || fields.contains(&Self::Void) {
+                return Err(FfiError("struct fields must be non-void C types".into()));
+            }
+            return Ok(Self::Struct(fields));
+        }
+        if let Some(inner) = name
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+        {
+            let members = split_top_level(inner, ',')
+                .into_iter()
+                .map(Self::parse)
+                .collect::<Result<Vec<_>, _>>()?;
+            if members.is_empty() || members.contains(&Self::Void) {
+                return Err(FfiError("union members must be non-void C types".into()));
+            }
+            return Ok(Self::Union(members));
+        }
+        match name {
             "void" => Ok(Self::Void),
             "i8" => Ok(Self::I8),
             "i16" => Ok(Self::I16),
@@ -69,8 +191,8 @@ impl FfiType {
         }
     }
 
-    fn libffi_type(self) -> Type {
-        match self {
+    fn libffi_type(self) -> Result<Type, FfiError> {
+        Ok(match self {
             Self::Void => Type::void(),
             Self::I8 => Type::i8(),
             Self::I16 => Type::i16(),
@@ -83,7 +205,73 @@ impl FfiType {
             Self::F32 => Type::f32(),
             Self::F64 => Type::f64(),
             Self::Pointer => Type::pointer(),
+            Self::Struct(fields) => {
+                let fields = fields
+                    .into_iter()
+                    .map(Self::libffi_type)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Type::structure(fields)
+            }
+            Self::Union(members) => {
+                let scalar = largest_scalar(&members)
+                    .ok_or_else(|| FfiError("union members must be scalar C types".into()))?;
+                scalar.libffi_type()?
+            }
+        })
+    }
+}
+
+fn split_top_level(text: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    for (index, character) in text.char_indices() {
+        match character {
+            '(' | '{' | '<' | '[' => depth += 1,
+            ')' | '}' | '>' | ']' => depth = depth.saturating_sub(1),
+            c if c == separator && depth == 0 => {
+                parts.push(text[start..index].trim());
+                start = index + c.len_utf8();
+            }
+            _ => {}
         }
+    }
+    parts.push(text[start..].trim());
+    parts
+}
+
+fn is_scalar(ty: &FfiType) -> bool {
+    matches!(
+        ty,
+        FfiType::I8
+            | FfiType::I16
+            | FfiType::I32
+            | FfiType::I64
+            | FfiType::U8
+            | FfiType::U16
+            | FfiType::U32
+            | FfiType::U64
+            | FfiType::F32
+            | FfiType::F64
+            | FfiType::Pointer
+    )
+}
+
+fn largest_scalar(types: &[FfiType]) -> Option<FfiType> {
+    types
+        .iter()
+        .filter(|&ty| is_scalar(ty))
+        .max_by_key(|ty| scalar_size(ty))
+        .cloned()
+}
+
+fn scalar_size(ty: &FfiType) -> usize {
+    match ty {
+        FfiType::I8 | FfiType::U8 => 1,
+        FfiType::I16 | FfiType::U16 => 2,
+        FfiType::F32 | FfiType::I32 | FfiType::U32 => 4,
+        FfiType::F64 | FfiType::I64 | FfiType::U64 | FfiType::Pointer => 8,
+        _ => 0,
     }
 }
 
@@ -91,17 +279,58 @@ impl FfiType {
 pub struct FfiSignature {
     pub result: FfiType,
     pub args: Vec<FfiType>,
+    pub abi: FfiAbiName,
+    /// `Some(n)` means the first `n` arguments are fixed and the rest are
+    /// variadic; the signature must list every variadic argument type.
+    pub fixed_args: Option<usize>,
 }
 
 impl FfiSignature {
     pub fn new(result: FfiType, args: Vec<FfiType>) -> Result<Self, FfiError> {
+        Self::new_with_abi(result, args, FfiAbiName::Default)
+    }
+
+    pub fn new_with_abi(
+        result: FfiType,
+        args: Vec<FfiType>,
+        abi: FfiAbiName,
+    ) -> Result<Self, FfiError> {
         if args.contains(&FfiType::Void) {
             return Err(FfiError("void is only valid as a C function result".into()));
         }
-        Ok(Self { result, args })
+        Ok(Self {
+            result,
+            args,
+            abi,
+            fixed_args: None,
+        })
+    }
+
+    pub fn variadic(
+        result: FfiType,
+        args: Vec<FfiType>,
+        fixed_args: usize,
+        abi: FfiAbiName,
+    ) -> Result<Self, FfiError> {
+        let mut signature = Self::new_with_abi(result, args, abi)?;
+        if fixed_args == 0 || fixed_args >= signature.args.len() {
+            return Err(FfiError(
+                "variadic signatures need at least one fixed and one variadic argument".into(),
+            ));
+        }
+        signature.fixed_args = Some(fixed_args);
+        Ok(signature)
+    }
+
+    pub fn is_variadic(&self) -> bool {
+        self.fixed_args.is_some()
     }
 
     /// Parses signatures such as `i32(pointer, u64)` or `void()`.
+    ///
+    /// ABI names use a `name:` prefix, for example `stdcall:i32(i32)`. Variadic
+    /// signatures list the actual variadic argument types after `...`, for
+    /// example `i32(pointer, ..., i32, f64)`.
     pub fn parse(spec: &str) -> Result<Self, FfiError> {
         let open = spec
             .find('(')
@@ -109,29 +338,237 @@ impl FfiSignature {
         if !spec.ends_with(')') {
             return Err(FfiError("FFI signature must end with `)`".into()));
         }
-        let result = FfiType::parse(&spec[..open])?;
+        let prefix = spec[..open].trim();
+        let (abi, result_name) = if let Some((abi, result)) = prefix.split_once(':') {
+            (FfiAbiName::parse(abi)?, result.trim())
+        } else {
+            (FfiAbiName::Default, prefix)
+        };
+        let result = FfiType::parse(result_name)?;
         let params = &spec[open + 1..spec.len() - 1];
-        let args = if params.trim().is_empty() {
+        let tokens = if params.trim().is_empty() {
             Vec::new()
         } else {
-            params
-                .split(',')
-                .map(FfiType::parse)
-                .collect::<Result<Vec<_>, _>>()?
+            split_top_level(params, ',')
         };
-        Self::new(result, args)
+        let ellipsis = tokens
+            .iter()
+            .position(|token| *token == "...")
+            .map(|position| {
+                if tokens[position + 1..].contains(&"...") {
+                    Err(FfiError(
+                        "FFI signature contains more than one `...`".into(),
+                    ))
+                } else {
+                    Ok(position)
+                }
+            })
+            .transpose()?;
+        if tokens
+            .iter()
+            .any(|token| *token != "..." && token.contains("..."))
+        {
+            return Err(FfiError("`...` must be a standalone argument".into()));
+        }
+        let args = tokens
+            .iter()
+            .filter(|token| **token != "...")
+            .map(|token| FfiType::parse(token))
+            .collect::<Result<Vec<_>, _>>()?;
+        match ellipsis {
+            Some(fixed) => Self::variadic(result, args, fixed, abi),
+            None => Self::new_with_abi(result, args, abi),
+        }
+    }
+
+    /// Returns the types libffi must use. C variadic arguments undergo the
+    /// default promotions, so `f32` becomes `f64` and narrow integers become
+    /// 32-bit values.
+    pub fn effective_args(&self) -> Vec<FfiType> {
+        self.args
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| {
+                if self.fixed_args.is_some_and(|fixed| index >= fixed) {
+                    match ty {
+                        FfiType::I8 | FfiType::I16 | FfiType::U8 | FfiType::U16 => FfiType::I32,
+                        FfiType::F32 => FfiType::F64,
+                        other => other.clone(),
+                    }
+                } else {
+                    ty.clone()
+                }
+            })
+            .collect()
     }
 
     fn cif(&self) -> Result<Cif, FfiError> {
-        Cif::try_new(
-            self.args
-                .iter()
-                .copied()
-                .map(FfiType::libffi_type)
-                .collect::<Vec<_>>(),
-            self.result.libffi_type(),
-        )
-        .map_err(|error| FfiError(format!("cannot prepare C ABI signature: {error:?}")))
+        let abi = self.abi.resolve()?;
+        let args = self
+            .effective_args()
+            .into_iter()
+            .map(FfiType::libffi_type)
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = self.result.clone().libffi_type()?;
+        let prepared = match self.fixed_args {
+            Some(fixed) => Cif::try_new_variadic_with_abi(args, fixed, result, abi),
+            None => Cif::try_new_with_abi(args, result, abi),
+        };
+        prepared.map_err(|error| FfiError(format!("cannot prepare C ABI signature: {error:?}")))
+    }
+}
+
+pub fn make_aggregate(
+    ty: FfiType,
+    values: &[FfiValue],
+    abi: FfiAbiName,
+) -> Result<AggregateValue, FfiError> {
+    let (offsets, size, _) = type_layout(ty.clone(), abi)?;
+    if size > AggregateStorage::CAPACITY {
+        return Err(FfiError(format!(
+            "C aggregate of type {ty:?} exceeds {} bytes",
+            AggregateStorage::CAPACITY
+        )));
+    }
+    let mut bytes = vec![0u8; size];
+    match &ty {
+        FfiType::Struct(fields) => {
+            if values.len() != fields.len() {
+                return Err(FfiError(format!(
+                    "C struct {ty:?} expects {} field values, received {}",
+                    fields.len(),
+                    values.len()
+                )));
+            }
+            for ((offset, field), value) in offsets.iter().zip(fields).zip(values) {
+                write_native_into(
+                    NativeArg::new(field.clone(), value)?,
+                    &mut bytes,
+                    *offset,
+                    field.clone(),
+                    abi,
+                )?;
+            }
+        }
+        FfiType::Union(members) => {
+            if values.len() != 1 {
+                return Err(FfiError(
+                    "C union values are constructed from exactly one member value".into(),
+                ));
+            }
+            let member = largest_scalar(members)
+                .ok_or_else(|| FfiError("union members must be scalar C types".into()))?;
+            write_native_into(
+                NativeArg::new(member.clone(), &values[0])?,
+                &mut bytes,
+                0,
+                member,
+                abi,
+            )?;
+        }
+        _ => return Err(FfiError("aggregate type must be struct or union".into())),
+    }
+    Ok(AggregateValue {
+        ty,
+        bytes: Rc::from(bytes),
+    })
+}
+
+pub fn aggregate_field(
+    value: &AggregateValue,
+    index: usize,
+    abi: FfiAbiName,
+) -> Result<FfiValue, FfiError> {
+    match &value.ty {
+        FfiType::Struct(fields) => {
+            let (offsets, _, _) = type_layout(value.ty.clone(), abi)?;
+            let field = fields
+                .get(index)
+                .ok_or_else(|| FfiError(format!("struct field index {index} is out of range")))?;
+            let offset = *offsets.get(index).ok_or_else(|| {
+                FfiError(format!("struct field index {index} has no layout offset"))
+            })?;
+            let pointer = value.bytes.as_ptr().wrapping_add(offset).cast::<c_void>();
+            unsafe { FfiValue::read_callback_arg(field.clone(), pointer, abi) }
+        }
+        FfiType::Union(members) => {
+            if index != 0 {
+                return Err(FfiError("union values only expose member 0".into()));
+            }
+            let member = largest_scalar(members)
+                .ok_or_else(|| FfiError("union members must be scalar C types".into()))?;
+            let pointer = value.bytes.as_ptr().cast::<c_void>();
+            unsafe { FfiValue::read_callback_arg(member, pointer, abi) }
+        }
+        _ => Err(FfiError("aggregate type must be struct or union".into())),
+    }
+}
+
+fn write_native_into(
+    native: NativeArg,
+    destination: &mut [u8],
+    offset: usize,
+    ty: FfiType,
+    abi: FfiAbiName,
+) -> Result<(), FfiError> {
+    let pointer = destination.as_mut_ptr().wrapping_add(offset).cast::<u8>();
+    unsafe {
+        match native {
+            NativeArg::I8(value) => ptr::write_unaligned(pointer.cast(), value),
+            NativeArg::I16(value) => ptr::write_unaligned(pointer.cast(), value),
+            NativeArg::I32(value) => ptr::write_unaligned(pointer.cast(), value),
+            NativeArg::I64(value) => ptr::write_unaligned(pointer.cast(), value),
+            NativeArg::U8(value) => ptr::write_unaligned(pointer.cast(), value),
+            NativeArg::U16(value) => ptr::write_unaligned(pointer.cast(), value),
+            NativeArg::U32(value) => ptr::write_unaligned(pointer.cast(), value),
+            NativeArg::U64(value) => ptr::write_unaligned(pointer.cast(), value),
+            NativeArg::F32(value) => ptr::write_unaligned(pointer.cast(), value),
+            NativeArg::F64(value) => ptr::write_unaligned(pointer.cast(), value),
+            NativeArg::Pointer { address, .. } => ptr::write_unaligned(pointer.cast(), address),
+            NativeArg::Aggregate { storage } => {
+                let (_, size, _) = type_layout(ty, abi)?;
+                ptr::copy_nonoverlapping(storage.0.as_ptr(), pointer, size);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn type_layout(ty: FfiType, abi: FfiAbiName) -> Result<(Vec<usize>, usize, usize), FfiError> {
+    let mut ffi_type = ty.clone().libffi_type()?;
+    if matches!(ty, FfiType::Struct(_)) {
+        ffi_type
+            .struct_offsets(abi.resolve()?)
+            .map_err(|error| FfiError(format!("cannot lay out C aggregate: {error:?}")))?;
+    }
+    let raw = ffi_type.as_raw_ptr();
+    let (size, alignment) = unsafe { ((*raw).size, (*raw).alignment as usize) };
+    let offsets = if let FfiType::Struct(fields) = ty {
+        let mut offsets = ffi_type
+            .struct_offsets(abi.resolve()?)
+            .map_err(|error| FfiError(format!("cannot lay out C struct: {error:?}")))?;
+        if offsets.len() != fields.len() {
+            offsets.truncate(fields.len());
+        }
+        offsets
+    } else {
+        vec![0]
+    };
+    Ok((offsets, size, alignment))
+}
+
+#[derive(Clone)]
+pub struct AggregateValue {
+    pub ty: FfiType,
+    pub bytes: Rc<[u8]>,
+}
+
+impl fmt::Debug for AggregateValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AggregateValue")
+            .field("ty", &self.ty)
+            .field("len", &self.bytes.len())
+            .finish()
     }
 }
 
@@ -145,6 +582,7 @@ pub enum FfiValue {
     String(String),
     Callback(Rc<ForeignCallback>),
     Buffer(Rc<ForeignBuffer>),
+    Aggregate(AggregateValue),
 }
 
 impl fmt::Debug for FfiValue {
@@ -158,6 +596,7 @@ impl fmt::Debug for FfiValue {
             Self::String(value) => f.debug_tuple("String").field(value).finish(),
             Self::Callback(_) => f.write_str("Callback(..)"),
             Self::Buffer(buffer) => f.debug_tuple("Buffer").field(&buffer.size()).finish(),
+            Self::Aggregate(value) => f.debug_tuple("Aggregate").field(value).finish(),
         }
     }
 }
@@ -204,8 +643,8 @@ impl ForeignBuffer {
                 "cannot read a void value from an FFI buffer".into(),
             ));
         }
-        let pointer = self.field_ptr(offset, native_type_size(ty))?;
-        unsafe { FfiValue::read_callback_arg(ty, pointer.cast()) }
+        let pointer = self.field_ptr(offset, native_type_size(ty.clone())?)?;
+        unsafe { FfiValue::read_callback_arg(ty, pointer.cast(), FfiAbiName::Default) }
     }
 
     pub fn write(&self, offset: usize, ty: FfiType, value: &FfiValue) -> Result<(), FfiError> {
@@ -214,8 +653,10 @@ impl ForeignBuffer {
                 "cannot write a void value to an FFI buffer".into(),
             ));
         }
-        let destination = self.field_ptr(offset, native_type_size(ty))?.cast::<u8>();
-        let native = NativeArg::new(ty, value)?;
+        let destination = self
+            .field_ptr(offset, native_type_size(ty.clone())?)?
+            .cast::<u8>();
+        let native = NativeArg::new(ty.clone(), value)?;
         unsafe {
             match native {
                 NativeArg::I8(value) => ptr::write_unaligned(destination.cast(), value),
@@ -237,6 +678,10 @@ impl ForeignBuffer {
                 }
                 NativeArg::Pointer { address, .. } => {
                     ptr::write_unaligned(destination.cast(), address)
+                }
+                NativeArg::Aggregate { storage } => {
+                    let (_, size, _) = type_layout(ty, FfiAbiName::Default)?;
+                    ptr::copy_nonoverlapping(storage.0.as_ptr(), destination, size);
                 }
             }
         }
@@ -283,15 +728,16 @@ impl Drop for ForeignBuffer {
     }
 }
 
-fn native_type_size(ty: FfiType) -> usize {
-    match ty {
+fn native_type_size(ty: FfiType) -> Result<usize, FfiError> {
+    Ok(match ty {
         FfiType::Void => 0,
         FfiType::I8 | FfiType::U8 => 1,
         FfiType::I16 | FfiType::U16 => 2,
         FfiType::I32 | FfiType::U32 | FfiType::F32 => 4,
         FfiType::I64 | FfiType::U64 | FfiType::F64 => 8,
         FfiType::Pointer => std::mem::size_of::<*mut c_void>(),
-    }
+        FfiType::Struct(_) | FfiType::Union(_) => type_layout(ty, FfiAbiName::Default)?.1,
+    })
 }
 
 pub struct ForeignLibrary {
@@ -366,23 +812,48 @@ impl ForeignSymbol {
             )));
         }
 
+        let effective_args = signature.effective_args();
         let native_args = signature
             .args
             .iter()
-            .copied()
+            .cloned()
+            .zip(effective_args)
             .zip(args)
-            .map(|(ty, value)| NativeArg::new(ty, value))
+            .map(|((declared, effective), value)| {
+                promote_variadic_value(declared, effective.clone(), value)
+                    .and_then(|promoted| NativeArg::new(effective, &promoted))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let ffi_args = native_args
             .iter()
             .map(NativeArg::as_arg)
             .collect::<Vec<_>>();
         let cif = signature.cif()?;
-        let mut result = NativeValue::zero(signature.result);
+        let mut result = NativeValue::zero(signature.result.clone(), signature.abi)?;
         unsafe {
             result.call_into(&cif, CodePtr(self.address.as_ptr()), &ffi_args);
         }
-        Ok(result.into_ffi_value())
+        Ok(result.into_ffi_value(signature))
+    }
+}
+
+fn promote_variadic_value(
+    declared: FfiType,
+    effective: FfiType,
+    value: &FfiValue,
+) -> Result<FfiValue, FfiError> {
+    if declared == effective {
+        return Ok(value.clone());
+    }
+    match (effective.clone(), value) {
+        (FfiType::I32, FfiValue::Signed(_)) => Ok(value.clone()),
+        (FfiType::I32, FfiValue::Unsigned(number)) => i32::try_from(*number)
+            .map(|number| FfiValue::Signed(number.into()))
+            .map_err(|_| FfiError("variadic integer is out of range after promotion".into())),
+        (FfiType::F64, FfiValue::Float(_)) => Ok(value.clone()),
+        _ => Err(FfiError(format!(
+            "value {value:?} cannot be promoted to C type {effective:?}"
+        ))),
     }
 }
 
@@ -401,12 +872,27 @@ enum NativeArg {
         address: *mut c_void,
         _string: Option<CString>,
     },
+    Aggregate {
+        storage: Box<AggregateStorage>,
+    },
+}
+
+#[repr(align(16))]
+struct AggregateStorage([u8; 128]);
+
+impl AggregateStorage {
+    const CAPACITY: usize = 128;
 }
 
 impl NativeArg {
     fn new(ty: FfiType, value: &FfiValue) -> Result<Self, FfiError> {
-        let mismatch = || FfiError(format!("value {value:?} does not match C type {ty:?}"));
-        Ok(match (ty, value) {
+        let mismatch_type = ty.clone();
+        let mismatch = || {
+            FfiError(format!(
+                "value {value:?} does not match C type {mismatch_type:?}"
+            ))
+        };
+        Ok(match (ty.clone(), value) {
             (FfiType::I8, FfiValue::Signed(value)) => Self::I8(
                 i8::try_from(*value).map_err(|_| FfiError("i8 argument is out of range".into()))?,
             ),
@@ -455,6 +941,19 @@ impl NativeArg {
                 address: buffer.as_ptr(),
                 _string: None,
             },
+            (FfiType::Struct(_) | FfiType::Union(_), FfiValue::Aggregate(value))
+                if value.ty == ty =>
+            {
+                if value.bytes.len() > AggregateStorage::CAPACITY {
+                    return Err(FfiError(format!(
+                        "C aggregate of type {ty:?} exceeds {} bytes",
+                        AggregateStorage::CAPACITY
+                    )));
+                }
+                let mut storage = Box::new(AggregateStorage([0; AggregateStorage::CAPACITY]));
+                storage.0[..value.bytes.len()].copy_from_slice(&value.bytes);
+                Self::Aggregate { storage }
+            }
             _ => return Err(mismatch()),
         })
     }
@@ -472,6 +971,7 @@ impl NativeArg {
             Self::F32(value) => arg(value),
             Self::F64(value) => arg(value),
             Self::Pointer { address, .. } => arg(address),
+            Self::Aggregate { storage } => arg(&storage.0[0]),
         }
     }
 }
@@ -489,11 +989,16 @@ enum NativeValue {
     F32(f32),
     F64(f64),
     Pointer(*mut c_void),
+    Aggregate {
+        ty: FfiType,
+        size: usize,
+        storage: Box<AggregateStorage>,
+    },
 }
 
 impl NativeValue {
-    fn zero(ty: FfiType) -> Self {
-        match ty {
+    fn zero(ty: FfiType, abi: FfiAbiName) -> Result<Self, FfiError> {
+        Ok(match ty {
             FfiType::Void => Self::Void,
             FfiType::I8 => Self::I8(0),
             FfiType::I16 => Self::I16(0),
@@ -506,7 +1011,21 @@ impl NativeValue {
             FfiType::F32 => Self::F32(0.0),
             FfiType::F64 => Self::F64(0.0),
             FfiType::Pointer => Self::Pointer(ptr::null_mut()),
-        }
+            FfiType::Struct(_) | FfiType::Union(_) => {
+                let (_, size, _) = type_layout(ty.clone(), abi)?;
+                if size > AggregateStorage::CAPACITY {
+                    return Err(FfiError(format!(
+                        "C aggregate return of type {ty:?} exceeds {} bytes",
+                        AggregateStorage::CAPACITY
+                    )));
+                }
+                Self::Aggregate {
+                    ty,
+                    size,
+                    storage: Box::new(AggregateStorage([0; AggregateStorage::CAPACITY])),
+                }
+            }
+        })
     }
 
     unsafe fn call_into(&mut self, cif: &Cif, function: CodePtr, args: &[Arg<'_>]) {
@@ -525,10 +1044,13 @@ impl NativeValue {
             Self::Pointer(value) => unsafe {
                 cif.call_return_into(function, args, Ret::new(value))
             },
+            Self::Aggregate { storage, .. } => unsafe {
+                cif.call_return_into(function, args, Ret::new(&mut storage.0))
+            },
         }
     }
 
-    fn into_ffi_value(self) -> FfiValue {
+    fn into_ffi_value(self, _signature: &FfiSignature) -> FfiValue {
         match self {
             Self::Void => FfiValue::Void,
             Self::I8(value) => FfiValue::Signed(value.into()),
@@ -542,6 +1064,10 @@ impl NativeValue {
             Self::F32(value) => FfiValue::Float(value.into()),
             Self::F64(value) => FfiValue::Float(value),
             Self::Pointer(value) => FfiValue::Pointer(value),
+            Self::Aggregate { ty, size, storage } => FfiValue::Aggregate(AggregateValue {
+                ty,
+                bytes: Rc::from(storage.0[..size].to_vec()),
+            }),
         }
     }
 }
@@ -554,9 +1080,18 @@ struct CallbackData {
     last_error: Mutex<Option<String>>,
 }
 
-#[repr(C, align(8))]
-#[derive(Clone, Copy, Default)]
-struct CallbackResult([u64; 2]);
+#[repr(C, align(16))]
+struct CallbackResult([u8; 128]);
+
+impl CallbackResult {
+    const CAPACITY: usize = 128;
+}
+
+impl Default for CallbackResult {
+    fn default() -> Self {
+        Self([0; CallbackResult::CAPACITY])
+    }
+}
 
 unsafe extern "C" fn callback_dispatch(
     _cif: &low::ffi_cif,
@@ -564,7 +1099,13 @@ unsafe extern "C" fn callback_dispatch(
     arguments: *const *const c_void,
     data: &CallbackData,
 ) {
-    result.0 = [0; 2];
+    if let Err(error) = unsafe { zero_callback_result(&data.signature, result) } {
+        *data
+            .last_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(error.0);
+        return;
+    }
     let pointers = if data.signature.args.is_empty() {
         &[][..]
     } else {
@@ -574,9 +1115,9 @@ unsafe extern "C" fn callback_dispatch(
         .signature
         .args
         .iter()
-        .copied()
+        .cloned()
         .zip(pointers.iter().copied())
-        .map(|(ty, ptr)| unsafe { FfiValue::read_callback_arg(ty, ptr) })
+        .map(|(ty, ptr)| unsafe { FfiValue::read_callback_arg(ty, ptr, data.signature.abi) })
         .collect::<Result<Vec<_>, _>>();
     let response = match values {
         Err(error) => Err(error.to_string()),
@@ -594,9 +1135,7 @@ unsafe extern "C" fn callback_dispatch(
     };
     match response {
         Ok(value) => {
-            if let Err(error) =
-                unsafe { write_callback_result(data.signature.result, value, result) }
-            {
+            if let Err(error) = unsafe { write_callback_result(&data.signature, value, result) } {
                 *data
                     .last_error
                     .lock()
@@ -604,6 +1143,7 @@ unsafe extern "C" fn callback_dispatch(
             }
         }
         Err(error) => {
+            let _ = unsafe { zero_callback_result(&data.signature, result) };
             *data
                 .last_error
                 .lock()
@@ -612,8 +1152,29 @@ unsafe extern "C" fn callback_dispatch(
     }
 }
 
+unsafe fn zero_callback_result(
+    signature: &FfiSignature,
+    result: &mut CallbackResult,
+) -> Result<(), FfiError> {
+    if signature.result == FfiType::Void {
+        return Ok(());
+    }
+    let size = native_type_size(signature.result.clone())?;
+    if size > CallbackResult::CAPACITY {
+        return Err(FfiError("C callback result type is too large".into()));
+    }
+    unsafe {
+        ptr::write_bytes(result.0.as_mut_ptr(), 0, size);
+    }
+    Ok(())
+}
+
 impl FfiValue {
-    unsafe fn read_callback_arg(ty: FfiType, pointer: *const c_void) -> Result<Self, FfiError> {
+    unsafe fn read_callback_arg(
+        ty: FfiType,
+        pointer: *const c_void,
+        abi: FfiAbiName,
+    ) -> Result<Self, FfiError> {
         if pointer.is_null() {
             return Err(FfiError("C callback provided a null argument slot".into()));
         }
@@ -646,16 +1207,32 @@ impl FfiValue {
             FfiType::Pointer => {
                 Self::Pointer(unsafe { ptr::read_unaligned(pointer.cast::<*mut c_void>()) })
             }
+            FfiType::Struct(_) | FfiType::Union(_) => {
+                let (_, size, _) = type_layout(ty.clone(), abi)?;
+                if size > AggregateStorage::CAPACITY {
+                    return Err(FfiError(format!(
+                        "C aggregate callback argument of type {ty:?} exceeds {} bytes",
+                        AggregateStorage::CAPACITY
+                    )));
+                }
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) }.to_vec();
+                Self::Aggregate(AggregateValue {
+                    ty,
+                    bytes: Rc::from(bytes),
+                })
+            }
         };
         Ok(value)
     }
 }
 
 unsafe fn write_callback_result(
-    ty: FfiType,
+    signature: &FfiSignature,
     value: FfiValue,
     result: &mut CallbackResult,
 ) -> Result<(), FfiError> {
+    let ty = signature.result.clone();
     if ty == FfiType::Void {
         return if matches!(value, FfiValue::Void) {
             Ok(())
@@ -663,8 +1240,8 @@ unsafe fn write_callback_result(
             Err(FfiError("void callback must return no value".into()))
         };
     }
-    let destination = result.0.as_mut_ptr().cast::<u8>();
-    let native = NativeArg::new(ty, &value)?;
+    let destination = result.0.as_mut_ptr();
+    let native = NativeArg::new(ty.clone(), &value)?;
     unsafe {
         match native {
             NativeArg::I8(value) => ptr::write_unaligned(destination.cast(), value),
@@ -678,6 +1255,13 @@ unsafe fn write_callback_result(
             NativeArg::F32(value) => ptr::write_unaligned(destination.cast(), value),
             NativeArg::F64(value) => ptr::write_unaligned(destination.cast(), value),
             NativeArg::Pointer { address, .. } => ptr::write_unaligned(destination.cast(), address),
+            NativeArg::Aggregate { storage } => {
+                let (_, size, _) = type_layout(ty, signature.abi)?;
+                if size > CallbackResult::CAPACITY {
+                    return Err(FfiError("C aggregate callback result is too large".into()));
+                }
+                ptr::copy_nonoverlapping(storage.0.as_ptr(), destination, size);
+            }
         }
     }
     Ok(())
@@ -699,6 +1283,11 @@ impl ForeignCallback {
         signature: FfiSignature,
         handler: impl Fn(&[FfiValue]) -> Result<FfiValue, String> + 'static,
     ) -> Result<Rc<Self>, FfiError> {
+        if signature.is_variadic() {
+            return Err(FfiError(
+                "C variadic functions cannot be used as Lume callbacks".into(),
+            ));
+        }
         let cif = signature.cif()?;
         let data = Box::new(CallbackData {
             signature,
@@ -757,6 +1346,51 @@ mod tests {
         );
         assert!(FfiSignature::parse("void(void)").is_err());
         assert!(FfiSignature::parse("i32(i128)").is_err());
+    }
+
+    #[test]
+    fn parses_abi_and_variadic_signatures_with_default_promotions() {
+        let abi = FfiSignature::parse("stdcall:i32(i32)").unwrap();
+        assert_eq!(abi.abi, FfiAbiName::Stdcall);
+        assert!(!abi.is_variadic());
+
+        let variadic = FfiSignature::parse("i32(pointer, ..., u8, f32)").unwrap();
+        assert!(variadic.is_variadic());
+        assert_eq!(variadic.fixed_args, Some(1));
+        assert_eq!(
+            variadic.effective_args(),
+            vec![FfiType::Pointer, FfiType::I32, FfiType::F64]
+        );
+
+        assert!(FfiSignature::parse("i32(...)").is_err());
+        assert!(FfiSignature::parse("bogus:i32(i32)").is_err());
+    }
+
+    #[test]
+    fn constructs_and_reads_by_value_aggregates() {
+        let struct_type = FfiType::parse("{i32,f64}").unwrap();
+        let value = make_aggregate(
+            struct_type,
+            &[FfiValue::Signed(7), FfiValue::Float(2.5)],
+            FfiAbiName::Default,
+        )
+        .unwrap();
+        assert!(matches!(
+            aggregate_field(&value, 0, FfiAbiName::Default).unwrap(),
+            FfiValue::Signed(7)
+        ));
+        assert!(matches!(
+            aggregate_field(&value, 1, FfiAbiName::Default).unwrap(),
+            FfiValue::Float(number) if number == 2.5
+        ));
+
+        let union_type = FfiType::parse("<i32,f64>").unwrap();
+        let union =
+            make_aggregate(union_type, &[FfiValue::Float(2.5)], FfiAbiName::Default).unwrap();
+        assert!(matches!(
+            aggregate_field(&union, 0, FfiAbiName::Default).unwrap(),
+            FfiValue::Float(number) if number == 2.5
+        ));
     }
 
     #[test]

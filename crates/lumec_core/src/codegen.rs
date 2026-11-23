@@ -158,11 +158,13 @@ impl FunctionCompiler<'_> {
         if produce_value && self.current.is_some() && then_value.is_none() {
             then_value = Some(self.define(IrOp::Const(0))?);
         }
-        let then_end = self.current.map(|block| {
+        let then_end = if let Some(block) = self.current {
             self.blocks[block].ops.push(IrOp::Jump(usize::MAX));
             self.current = None;
-            block
-        });
+            Some(block)
+        } else {
+            None
+        };
         let then_locals = self.locals.clone();
 
         let else_block = self.new_block();
@@ -177,11 +179,13 @@ impl FunctionCompiler<'_> {
         if produce_value && self.current.is_some() && else_value.is_none() {
             else_value = Some(self.define(IrOp::Const(0))?);
         }
-        let else_end = self.current.map(|block| {
+        let else_end = if let Some(block) = self.current {
             self.blocks[block].ops.push(IrOp::Jump(usize::MAX));
             self.current = None;
-            block
-        });
+            Some(block)
+        } else {
+            None
+        };
         let else_locals = self.locals.clone();
 
         let live_ends: Vec<_> = [then_end, else_end].into_iter().flatten().collect();
@@ -221,13 +225,10 @@ impl FunctionCompiler<'_> {
         self.locals = live_locals;
 
         if produce_value {
-            let incoming = [
-                then_end.and_then(|block| then_value.map(|value| (block, value))),
-                else_end.and_then(|block| else_value.map(|value| (block, value))),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+            let incoming = [then_end.zip(then_value), else_end.zip(else_value)]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
             if incoming.is_empty() {
                 return Ok(Some(self.define(IrOp::Const(0))?));
             }
@@ -334,6 +335,23 @@ impl FunctionCompiler<'_> {
                 self.define(op)
             }
             Expr::Call(name, args) => {
+                if matches!(name.as_str(), "u8" | "u32") && args.len() == 1 {
+                    let value = self.compile_expr(&args[0])?;
+                    let width = if name == "u8" { 8 } else { 32 };
+                    return self.define(IrOp::CastUInt(value, width));
+                }
+                if name == "ffi_export_ptr" && args.len() == 2 {
+                    let (Expr::String(function), Expr::String(signature)) = (&args[0], &args[1])
+                    else {
+                        return Err(
+                            self.error("ffi_export_ptr expects two string literals in JIT code")
+                        );
+                    };
+                    return self.define(IrOp::FfiExportPtr {
+                        name: function.clone(),
+                        signature: signature.clone(),
+                    });
+                }
                 let args = args
                     .iter()
                     .map(|arg| self.compile_expr(arg))
@@ -468,6 +486,8 @@ fn defines_value(op: &IrOp) -> bool {
             | IrOp::Gt(_, _)
             | IrOp::Le(_, _)
             | IrOp::Ge(_, _)
+            | IrOp::CastUInt(_, _)
+            | IrOp::FfiExportPtr { .. }
             | IrOp::Phi(_)
             | IrOp::Call(_, _)
     )
@@ -564,6 +584,31 @@ mod tests {
         );
         assert_eq!(jit_result("fn main() -> int\nret 1 or 0\n", "main", &[]), 1);
         assert_eq!(jit_result("fn main() -> int\nret not 1\n", "main", &[]), 0);
+    }
+
+    #[test]
+    fn lowers_fixed_width_casts_into_jit() {
+        assert_eq!(
+            jit_result("fn main() -> int\nret u8(300)\n", "main", &[]),
+            44
+        );
+        assert_eq!(
+            jit_result("fn main() -> int\nret u32(4294967297)\n", "main", &[]),
+            1
+        );
+    }
+
+    #[test]
+    fn jit_buffer_builtins_and_memmove_work() {
+        let source = r#"
+fn main() -> int
+    b:any = buf_new(8)
+    buf_set_u8(b, 0, 255)
+    buf_set_u32(b, 4, 16909060)
+    memmove(b, 1, b, 0, 4)
+ret buf_get_u8(b, 1)
+"#;
+        assert_eq!(jit_result(source, "main", &[]), 255);
     }
 
     #[test]

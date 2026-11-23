@@ -240,11 +240,62 @@ fn main() -> int
 ret 0
 ```
 
-签名支持 C 默认 ABI 的整数、浮点数、指针和 `void` 返回类型。通过 FFI 可调用
-CUDA、Level Zero、HIP、Vulkan loader 的宿主 API；当前没有 GPU 加速，也不支持
-变参、按值结构体/union 或非默认 calling convention。LLVM JIT 的 IR 目前不支持
-通用动态符号调用。`ffi_buffer` 可创建有界本机缓冲区，以便读写 C 输出参数和
-按目标头文件布局访问结构体指针。
+签名支持整数、浮点数、指针和 `void` 返回类型，可用 ABI 前缀选择调用约定；变参签名
+把实际变参类型写在 `...` 之后，按值 struct/union 分别写作 `{i32,f64}` 与
+`<i32,f64>`。通过 FFI 可调用 CUDA、Level Zero、HIP、Vulkan loader 的宿主 API；
+当前没有 GPU 加速，也不支持 bitfield、long double、向量 ABI 或嵌套聚合。
+`ffi_buffer` 可创建有界本机缓冲区，以便读写 C 输出参数和按目标头文件布局访问
+结构体指针。
+
+函数可用 `#[ffi_export]` 标记为 C ABI 导出；manifest 的 `[ffi.export]` 决定
+实际生成到头文件中的符号。解释器还提供 `ffi_export_ptr(name, signature)`，
+把 Lume 函数包装成可交给 C 的回调指针。静态/AOT 路径的 manifest、
+`[ffi.extern]` 声明与符号校验见 `docs/ffi.md`。
+
+## 时间与 GC 字节缓冲区
+
+解释执行路径提供两个时钟原语：`now_ms()` 返回 Unix epoch 毫秒，`mono_ms()`
+返回单调时钟毫秒。超时、锁等待等需要稳定相对时间的逻辑应使用 `mono_ms()`。
+Rust 宿主可通过 `lumec_core::clock::with_clock` 注入假时钟，测试不依赖 `sleep`。
+
+定宽整数通过构造式转换 `u8(x)` / `u32(x)` 获得，越界会报错；类型检查器保留
+`u8` / `u32` / `i8` / `i16` / `i32` 等宽度，窄整数可隐式加宽到 `int`，反向赋值会报
+错。JIT 以零扩展的 `i64` 表示这些值。GC 管理的字节缓冲区用 `buf_new(n)` 创建，
+长度写在对象 payload 前缀中，缓冲区在存活期间会被 pin，收集时不会搬迁：
+
+```lume
+fn main() -> int
+    data:any = buf_new(8)
+    buf_set_u8(data, 0, u8(255))
+    buf_set_u32(data, 4, u32(16909060))
+    print(buf_get_u8(data, 0))
+    print(buf_get_u32(data, 4))
+
+    copy:any = buf_new(8)
+    memcpy(copy, 0, data, 0, 8)
+ret 0
+```
+
+`buf_get_u32` / `buf_set_u32` 明确使用小端序。`buf_get_u8` / `buf_set_u8` 以及
+`buf_new` / `buf_len` 的偏移和长度都有边界检查。`memcpy(dst, src, count)` 从两个
+缓冲区起点复制；`memcpy(dst, dst_offset, src, src_offset, count)` 支持显式偏移，
+重叠区域会被拒绝。`memmove` 接受相同的两种参数形式，并允许同一缓冲区内的重叠复制。
+`str_to_buf` / `buf_to_str` 用 UTF-8 在字符串与缓冲区之间转换。
+
+解释执行路径与 LLVM JIT 都支持 `buf_new`、`buf_len`、`buf_get/set_u8/u32`、
+`memcpy` 和 `memmove`；JIT 把缓冲区句柄作为稳定地址传递，内置操作仍做边界检查。
+可运行的 JIT 缓冲区样例见 `examples/demo_buffer_jit.lume`，覆盖定宽构造、`memcpy`
+和 `memmove`。JIT 仍不支持字符串值的 `str_to_buf` / `buf_to_str`。`ffi_buffer_*`
+创建的是独立本机内存，不与 GC 缓冲区共享生命周期。
+
+## Socket（动态 FFI）
+
+IPv4 的最小 echo server 已落地在 `examples/server_echo`：C ABI 垫片
+`src/net.c` 封装 `listen` / `accept` / `recv` / `send` / `close`，Lume 侧通过
+manifest `[ffi.extern]` 调用，fd 与长度统一用 `i64`。`sockaddr_in` 没进入 JIT，
+接收缓冲用 `ffi_buffer` 提供；`mono_ms()` 负责单调时钟空闲超时详见
+[docs/server.md](server.md)。当前为单线程顺序 accept 循环，多客户端并发
+poll 集合尚未实现。
 
 ## LLVM JIT 编译路径
 
@@ -261,6 +312,12 @@ cargo run -p lumec_core -- llvm-ir examples/demo_llvm_jit.lume
 结构体、闭包、泛型、模式匹配仍会明确报告暂不支持。当前解析器和 IR lowering
 仍由 Rust 实现；这是可执行的 LLVM 编译子集，但不代表 Lume 编写的前端已经
 替换 stage0 或完成自举。
+
+manifest 项目还可在 JIT 中链接 C 模块产出的 bitcode，或通过 `[ffi.extern]
+library = "..."` 注册 libffi trampoline 调用共享库符号。`#[ffi_export]` 函数
+可生成 C 头文件；`ffi_export_ptr` 在解释器和 JIT 中都会生成真实的 C 回调指针，
+JIT 在编译后把函数地址交给 libffi trampoline。JIT 回调限于当前线程同步调用，
+且按值聚合仍不进入 JIT 的 `i64` 值 ABI。
 
 ## 当前限制
 

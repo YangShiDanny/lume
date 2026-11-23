@@ -1,0 +1,22 @@
+[project]
+name = "server_echo"
+version = "0.1.0"
+
+[[module]]
+path = "src/main.lume"
+lang = "lume"
+export = ["echo_client", "main"]
+
+[[module]]
+path = "src/net.c"
+lang = "c"
+cflags = ["-O1"]
+export = ["lume_net_listen", "lume_net_accept", "lume_net_recv", "lume_net_send", "lume_net_close", "lume_net_last_error"]
+
+[ffi.extern]
+lume_net_listen = { signature = "i64(i64)" }
+lume_net_accept = { signature = "i64(i64, i64)" }
+lume_net_recv = { signature = "i64(i64, pointer, i64, i64)" }
+lume_net_send = { signature = "i64(i64, pointer, i64)" }
+lume_net_close = { signature = "void(i64)" }
+lume_net_last_error = { signature = "void(pointer, i64)" }

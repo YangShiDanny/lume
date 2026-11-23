@@ -73,6 +73,11 @@ pub fn with_clock<T>(clock: Arc<dyn Clock>, body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// # Safety
+///
+/// Must be called with the JIT builtin ABI: `_args` is either null or points to
+/// `count` readable `i64` values. This builtin ignores the pointer and rejects
+/// any non-zero `count`.
 pub unsafe extern "C" fn now_ms_builtin(_args: *const i64, count: u64) -> i64 {
     if count != 0 {
         return -1;
@@ -80,6 +85,11 @@ pub unsafe extern "C" fn now_ms_builtin(_args: *const i64, count: u64) -> i64 {
     wall_ms()
 }
 
+/// # Safety
+///
+/// Must be called with the JIT builtin ABI: `_args` is either null or points to
+/// `count` readable `i64` values. This builtin ignores the pointer and rejects
+/// any non-zero `count`.
 pub unsafe extern "C" fn mono_ms_builtin(_args: *const i64, count: u64) -> i64 {
     if count != 0 {
         return -1;
@@ -116,7 +126,10 @@ mod tests {
         with_clock(fake, || {
             assert_eq!(wall_ms(), 1_700_000_000_123);
             assert_eq!(monotonic_ms(), 4321);
-            assert_eq!(unsafe { now_ms_builtin(std::ptr::null(), 0) }, 1_700_000_000_123);
+            assert_eq!(
+                unsafe { now_ms_builtin(std::ptr::null(), 0) },
+                1_700_000_000_123
+            );
             assert_eq!(unsafe { mono_ms_builtin(std::ptr::null(), 0) }, 4321);
         });
         assert!(wall_ms() >= before);

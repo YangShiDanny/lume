@@ -162,6 +162,24 @@ cargo run -p lumec_core -- jit examples/demo_llvm_jit.lume
 # 输出 LLVM IR
 cargo run -p lumec_core -- llvm-ir examples/demo_llvm_jit.lume
 
+# manifest 项目：静态 / AOT FFI 与 C 互操作
+cargo run -p lumec_core -- header examples/demo_c_interop/manifest.toml
+cargo run -p lumec_core -- run examples/demo_c_interop/manifest.toml
+cargo run -p lumec_core -- jit examples/demo_c_interop/manifest.toml
+
+# 从 manifest 生成项目接口文档（可选写入指定文件）
+cargo run -p lumec_core -- docs examples/demo_c_interop/manifest.toml
+cargo run -p lumec_core -- docs examples/demo_c_interop/manifest.toml docs/demo_c_interop.md
+
+# 自动检查示例输出
+bash scripts/test-examples.sh target/debug/lume-bootstrap
+
+# socket echo server：动态 FFI + 跨平台 C ABI 垫片 + 回环测试
+bash examples/server_echo/test_echo.sh
+
+# LSP 服务由 VS Code 扩展自动启动；也可直接通过 stdio 启动
+cargo run -p lumec_core -- --lsp
+
 # 运行测试
 cargo test --workspace
 
@@ -171,8 +189,9 @@ cargo fmt --manifest-path crates/lumec_core/Cargo.toml -- --check
 
 ## Visual Studio Code 扩展
 
-扩展提供 Lume 语法高亮、`#` 行注释、关键字/函数补全、悬停提示、函数符号、
-基础诊断，以及运行和检查当前文件的命令。
+扩展提供 Lume 语法高亮、`#` 行注释、LSP 补全与悬停、parser/type checker
+诊断、签名帮助、函数符号，以及运行和检查当前文件的命令。扩展连接
+`lume-bootstrap --lsp`；请先构建二进制，或设置 `lume.bootstrapPath`。
 
 在仓库根目录构建扩展：
 
@@ -190,12 +209,15 @@ npm run package
 ## 持续集成
 
 GitHub Actions 会在推送和 Pull Request 时安装 LLVM 23，并执行 Rust 格式、
-测试、Clippy、Release 构建、Lume 示例检查/运行和 VS Code 扩展编译。
+测试、Clippy、Release 构建、`scripts/test-examples.sh` 示例检查与输出断言、
+echo server 回环测试和 VS Code 扩展编译。
 
 ## 文档索引
 
 - [Lume 语言说明](docs/lume_spec.md)
 - [数学与日志内置函数](docs/math-and-logging.md)
-- [动态 C FFI、回调与 GC pin](docs/ffi.md)
+- [C FFI：动态调用、静态 / AOT 与导出](docs/ffi.md)
+- [语言服务与开发辅助工具](docs/tooling.md)
+- [小型服务器：Socket 最小闭环](docs/server.md)
 - [Immix 垃圾回收器](docs/immix-gc.md)
 - [VS Code 扩展说明](editor/vscode‑lume/README.md)

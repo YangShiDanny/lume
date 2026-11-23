@@ -78,6 +78,8 @@ pub struct FuncDef {
     pub params: Vec<Param>,
     pub ret_ty: Option<String>,
     pub body: Vec<Stmt>,
+    /// Function attributes such as `ffi_export`, written as `#[ffi_export]`.
+    pub attrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -567,7 +569,19 @@ fn parse_expr(source: &str) -> Result<Expr, String> {
 
 pub fn parse_source(source: &str) -> Result<Vec<FuncDef>, ParseError> {
     let mut lines = Vec::new();
+    let mut pending_attrs: Vec<String> = Vec::new();
     for (index, raw) in source.lines().enumerate() {
+        let raw_trimmed = raw.trim();
+        if raw_trimmed.starts_with("#[") && raw_trimmed.ends_with(']') {
+            if raw.len() - raw.trim_start().len() != 0 {
+                return Err(ParseError {
+                    line: index + 1,
+                    message: "attributes are only allowed at module scope".into(),
+                });
+            }
+            pending_attrs.push(raw_trimmed[2..raw_trimmed.len() - 1].trim().to_string());
+            continue;
+        }
         let text = strip_comment(raw);
         if text.trim().is_empty() {
             continue;
@@ -602,6 +616,7 @@ pub fn parse_source(source: &str) -> Result<Vec<FuncDef>, ParseError> {
                 message: "top-level statement must be fn".into(),
             });
         }
+        let attrs = std::mem::take(&mut pending_attrs);
         let (name, params, ret_ty) =
             parse_func_header(&line.text).map_err(|message| ParseError {
                 line: line.number,
@@ -630,6 +645,7 @@ pub fn parse_source(source: &str) -> Result<Vec<FuncDef>, ParseError> {
             params,
             ret_ty,
             body,
+            attrs,
         });
     }
     Ok(funcs)
@@ -1078,6 +1094,21 @@ ret c
         assert_eq!(funcs.len(), 1);
         assert_eq!(funcs[0].name, "add");
         assert_eq!(funcs[0].params.len(), 2);
+        assert!(funcs[0].attrs.is_empty());
+    }
+
+    #[test]
+    fn parses_ffi_export_attribute() {
+        let funcs = parse_source(
+            r#"
+#[ffi_export]
+fn exported(n:int) -> int
+ret n
+"#,
+        )
+        .unwrap();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].attrs, vec!["ffi_export".to_string()]);
     }
 
     #[test]

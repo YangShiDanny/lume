@@ -1,7 +1,8 @@
 use crate::buffer::{GcBuffer, GcBufferHeap};
 use crate::clock;
 use crate::ffi::{
-    FfiSignature, FfiType, FfiValue, ForeignBuffer, ForeignCallback, ForeignLibrary, ForeignSymbol,
+    FfiAbiName, FfiSignature, FfiType, FfiValue, ForeignBuffer, ForeignCallback, ForeignLibrary,
+    ForeignSymbol, aggregate_field, make_aggregate,
 };
 use crate::parser::{Expr, FuncDef, Param, Pattern, Stmt};
 #[cfg(feature = "system-sleef")]
@@ -33,6 +34,7 @@ pub enum Value {
     FfiSymbol(Rc<ForeignSymbol>),
     FfiCallback(Rc<ForeignCallback>),
     FfiBuffer(Rc<ForeignBuffer>),
+    FfiAggregate(crate::ffi::AggregateValue),
     FfiPointer(*mut c_void),
     GcBuffer(Rc<GcBuffer>),
     Unit,
@@ -72,10 +74,17 @@ impl Value {
             | Value::FfiSymbol(_)
             | Value::FfiCallback(_)
             | Value::FfiBuffer(_)
+            | Value::FfiAggregate(_)
             | Value::FfiPointer(_) => true,
-            Value::GcBuffer(buffer) => buffer.len() > 0,
+            Value::GcBuffer(buffer) => !buffer.is_empty(),
             Value::Unit => false,
         }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        values_equal(self, other)
     }
 }
 
@@ -86,17 +95,29 @@ pub enum EvalResult {
 }
 
 #[derive(Clone)]
+pub struct ExternBinding {
+    pub signature: FfiSignature,
+    pub symbol: Rc<ForeignSymbol>,
+}
+
+#[derive(Clone)]
 pub struct Evaluator {
     funcs: HashMap<String, FuncDef>,
     heap: GcBufferHeap,
+    externs: HashMap<String, ExternBinding>,
 }
 
 impl Evaluator {
     pub fn new(funcs: Vec<FuncDef>) -> Self {
+        Self::with_externs(funcs, HashMap::new())
+    }
+
+    pub fn with_externs(funcs: Vec<FuncDef>, externs: HashMap<String, ExternBinding>) -> Self {
         let funcs = funcs.into_iter().map(|f| (f.name.clone(), f)).collect();
         Self {
             funcs,
             heap: GcBufferHeap::default(),
+            externs,
         }
     }
 
@@ -124,6 +145,30 @@ impl Evaluator {
 
     pub fn has_function(&self, name: &str) -> bool {
         self.funcs.contains_key(name)
+    }
+
+    fn call_extern(&self, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+        let Some(binding) = self.externs.get(name) else {
+            return Ok(None);
+        };
+        if args.len() != binding.signature.args.len() {
+            return Err(format!(
+                "extern `{name}` expects {} arguments, received {}",
+                binding.signature.args.len(),
+                args.len()
+            ));
+        }
+        let ffi_args = binding
+            .signature
+            .args
+            .iter()
+            .cloned()
+            .zip(args)
+            .map(|(ty, value)| ffi_value_from_lume(ty, value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = unsafe { binding.symbol.call(&binding.signature, &ffi_args) }
+            .map_err(|error| error.to_string())?;
+        Ok(Some(lume_value_from_ffi(result)))
     }
 
     fn invoke_closure(
@@ -190,7 +235,7 @@ impl Evaluator {
                 let ffi_args = signature
                     .args
                     .iter()
-                    .copied()
+                    .cloned()
                     .zip(values)
                     .map(|(ty, value)| ffi_value_from_lume(ty, value))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -227,7 +272,7 @@ impl Evaluator {
                     }
                     let lume_args = values.iter().cloned().map(lume_value_from_ffi).collect();
                     let result = evaluator.invoke_closure(&params, &body, &captured, lume_args)?;
-                    ffi_value_from_lume(callback_signature.result, &result)
+                    ffi_value_from_lume(callback_signature.result.clone(), &result)
                 })
                 .map_err(|error| error.to_string())?;
                 Ok(Some(Value::FfiCallback(callback)))
@@ -247,6 +292,26 @@ impl Evaluator {
             "ffi_null" => {
                 require_arity(name, args, 0)?;
                 Ok(Some(Value::FfiPointer(std::ptr::null_mut())))
+            }
+            "ffi_export_ptr" => {
+                require_arity(name, args, 2)?;
+                let (Value::String(function), Value::String(spec)) = (&args[0], &args[1]) else {
+                    return Err("ffi_export_ptr expects a function name and signature".into());
+                };
+                if !self.has_function(function) {
+                    return Err(format!("cannot export undefined function `{function}`"));
+                }
+                let signature = FfiSignature::parse(spec).map_err(|error| error.to_string())?;
+                let result_type = signature.result.clone();
+                let evaluator = self.clone();
+                let function = function.clone();
+                let callback = ForeignCallback::new(signature, move |values| {
+                    let lume_args = values.iter().cloned().map(lume_value_from_ffi).collect();
+                    let result = evaluator.call(&function, lume_args)?;
+                    ffi_value_from_lume(result_type.clone(), &result)
+                })
+                .map_err(|error| error.to_string())?;
+                Ok(Some(Value::FfiCallback(callback)))
             }
             "ffi_buffer" => {
                 require_arity(name, args, 2)?;
@@ -281,7 +346,7 @@ impl Evaluator {
                 let offset = usize::try_from(value_int(&args[1], name)?)
                     .map_err(|_| "FFI buffer offset must be non-negative")?;
                 let ty = FfiType::parse(type_name).map_err(|error| error.to_string())?;
-                let value = ffi_value_from_lume(ty, &args[3])?;
+                let value = ffi_value_from_lume(ty.clone(), &args[3])?;
                 buffer
                     .write(offset, ty, &value)
                     .map_err(|error| error.to_string())?;
@@ -314,6 +379,45 @@ impl Evaluator {
                     .read_c_string(offset, max_len)
                     .map_err(|error| error.to_string())?;
                 Ok(Some(Value::String(value)))
+            }
+            "ffi_struct" => {
+                require_arity(name, args, 2)?;
+                let (Value::String(spec), Value::Array(fields)) = (&args[0], &args[1]) else {
+                    return Err("ffi_struct expects an aggregate type and field values".into());
+                };
+                let ty = FfiType::parse(spec).map_err(|error| error.to_string())?;
+                let values = match &ty {
+                    FfiType::Struct(field_types) => field_types
+                        .iter()
+                        .zip(fields)
+                        .map(|(field, value)| ffi_value_from_lume(field.clone(), value))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    FfiType::Union(_) if fields.len() == 1 => {
+                        vec![ffi_value_from_lume(
+                            infer_ffi_type(&fields[0])?,
+                            &fields[0],
+                        )?]
+                    }
+                    FfiType::Union(_) => {
+                        return Err("a C union value needs exactly one member value".into());
+                    }
+                    _ => return Err("ffi_struct expects a struct or union type".into()),
+                };
+                let aggregate = make_aggregate(ty, &values, FfiAbiName::Default)
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(Value::FfiAggregate(aggregate)))
+            }
+            "ffi_struct_get" => {
+                require_arity(name, args, 2)?;
+                let (Value::FfiAggregate(aggregate), Value::Int(index)) = (&args[0], &args[1])
+                else {
+                    return Err("ffi_struct_get expects an aggregate and field index".into());
+                };
+                let index = usize::try_from(*index)
+                    .map_err(|_| "ffi_struct_get field index must be non-negative")?;
+                let field = aggregate_field(aggregate, index, FfiAbiName::Default)
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(lume_value_from_ffi(field)))
             }
             _ => Ok(None),
         }
@@ -366,9 +470,15 @@ impl Evaluator {
                     .map_err(|error| error.to_string())?;
                 Ok(Some(Value::Unit))
             }
-            "memcpy" => {
+            "memcpy" | "memmove" => {
                 let (dst, dst_offset, src, src_offset, count) = match args.len() {
-                    3 => (&args[0], 0usize, &args[1], 0usize, usize_arg(&args[2], name)?),
+                    3 => (
+                        &args[0],
+                        0usize,
+                        &args[1],
+                        0usize,
+                        usize_arg(&args[2], name)?,
+                    ),
                     5 => (
                         &args[0],
                         usize_arg(&args[1], name)?,
@@ -376,13 +486,21 @@ impl Evaluator {
                         usize_arg(&args[3], name)?,
                         usize_arg(&args[4], name)?,
                     ),
-                    _ => return Err(format!("`{name}` expects 3 or 5 arguments, received {}", args.len())),
+                    _ => {
+                        return Err(format!(
+                            "`{name}` expects 3 or 5 arguments, received {}",
+                            args.len()
+                        ));
+                    }
                 };
                 let destination = gc_buffer_arg(dst, name)?;
                 let source = gc_buffer_arg(src, name)?;
-                destination
-                    .memcpy(dst_offset, &source, src_offset, count)
-                    .map_err(|error| error.to_string())?;
+                let result = if name == "memmove" {
+                    destination.memmove(dst_offset, source.as_ref(), src_offset, count)
+                } else {
+                    destination.memcpy(dst_offset, source.as_ref(), src_offset, count)
+                };
+                result.map_err(|error| error.to_string())?;
                 Ok(Some(Value::Unit))
             }
             "str_to_buf" => {
@@ -390,7 +508,8 @@ impl Evaluator {
                 let Value::String(text) = &args[0] else {
                     return Err("str_to_buf expects a string".into());
                 };
-                let buffer = GcBuffer::new(&self.heap, text.len()).map_err(|error| error.to_string())?;
+                let buffer =
+                    GcBuffer::new(&self.heap, text.len()).map_err(|error| error.to_string())?;
                 buffer
                     .write_bytes(0, text.as_bytes())
                     .map_err(|error| error.to_string())?;
@@ -605,6 +724,9 @@ impl Evaluator {
                 if let Some(value) = self.ffi_builtin(name, &values)? {
                     return Ok(value);
                 }
+                if let Some(value) = self.call_extern(name, &values)? {
+                    return Ok(value);
+                }
                 self.call(name, values)
             }
             Expr::Apply(callee, args) => {
@@ -750,14 +872,12 @@ impl Evaluator {
 
 fn binary(op: &str, lhs: Value, rhs: Value) -> Result<Value, String> {
     match (op, lhs, rhs) {
-        ("+", Value::String(lhs), Value::String(rhs)) => {
-            return Ok(Value::String(lhs + &rhs));
-        }
+        ("+", Value::String(lhs), Value::String(rhs)) => Ok(Value::String(lhs + &rhs)),
         ("+", Value::Array(mut lhs), Value::Array(rhs)) => {
             lhs.extend(rhs);
-            return Ok(Value::Array(lhs));
+            Ok(Value::Array(lhs))
         }
-        (op, lhs, rhs) => return binary_numeric(op, lhs, rhs),
+        (op, lhs, rhs) => binary_numeric(op, lhs, rhs),
     }
 }
 
@@ -922,6 +1042,9 @@ fn values_equal(lhs: &Value, rhs: &Value) -> bool {
         (Value::String(a), Value::String(b)) => a == b,
         (Value::FfiPointer(a), Value::FfiPointer(b)) => a == b,
         (Value::GcBuffer(a), Value::GcBuffer(b)) => Rc::ptr_eq(a, b),
+        (Value::FfiAggregate(a), Value::FfiAggregate(b)) => {
+            a.ty == b.ty && a.bytes.as_ref() == b.bytes.as_ref()
+        }
         (Value::Unit, Value::Unit) => true,
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(a, b)| values_equal(a, b))
@@ -948,14 +1071,32 @@ fn values_equal(lhs: &Value, rhs: &Value) -> bool {
     }
 }
 
+fn infer_ffi_type(value: &Value) -> Result<FfiType, String> {
+    Ok(match value {
+        Value::Int(_) => FfiType::I64,
+        Value::UInt(_) => FfiType::U64,
+        Value::Float(_) => FfiType::F64,
+        Value::Bool(_) => FfiType::U8,
+        Value::String(_) | Value::FfiPointer(_) | Value::FfiBuffer(_) => FfiType::Pointer,
+        Value::FfiAggregate(aggregate) => aggregate.ty.clone(),
+        other => {
+            return Err(format!(
+                "cannot infer a C type for {}",
+                value_to_string(other)
+            ));
+        }
+    })
+}
+
 fn ffi_value_from_lume(ty: FfiType, value: &Value) -> Result<FfiValue, String> {
-    let mismatch = || {
+    let mismatch_type = ty.clone();
+    let mismatch = move || {
         format!(
-            "value {} does not match C type {ty:?}",
+            "value {} does not match C type {mismatch_type:?}",
             value_to_string(value)
         )
     };
-    Ok(match (ty, value) {
+    Ok(match (ty.clone(), value) {
         (FfiType::Void, Value::Unit) => FfiValue::Void,
         (FfiType::I8 | FfiType::I16 | FfiType::I32 | FfiType::I64, Value::Int(value)) => {
             FfiValue::Signed(*value)
@@ -984,6 +1125,7 @@ fn ffi_value_from_lume(ty: FfiType, value: &Value) -> Result<FfiValue, String> {
         (FfiType::Pointer, Value::GcBuffer(buffer)) => {
             FfiValue::Pointer(buffer.as_ptr() as *mut c_void)
         }
+        (_, Value::FfiAggregate(value)) if ty == value.ty => FfiValue::Aggregate(value.clone()),
         _ => return Err(mismatch()),
     })
 }
@@ -998,6 +1140,7 @@ fn lume_value_from_ffi(value: FfiValue) -> Value {
         FfiValue::String(value) => Value::String(value),
         FfiValue::Callback(callback) => Value::FfiCallback(callback),
         FfiValue::Buffer(buffer) => Value::FfiBuffer(buffer),
+        FfiValue::Aggregate(value) => Value::FfiAggregate(value),
     }
 }
 
@@ -1070,13 +1213,6 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
                 _ => unreachable!(),
             };
             Ok(Some(Value::Bool(valid)))
-        }
-        "c_matmul" => {
-            if args.is_empty() {
-                return Err("c_matmul expects at least 1 argument".into());
-            }
-            let n = value_int(&args[0], "c_matmul")?;
-            Ok(Some(Value::Int(n.saturating_mul(2))))
         }
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
         | "acosh" | "atanh" | "exp" | "exp2" | "expm1" | "ln" | "log" | "log2" | "log10"
@@ -1257,6 +1393,9 @@ fn value_to_string(value: &Value) -> String {
         Value::FfiSymbol(_) => "<ffi symbol>".into(),
         Value::FfiCallback(_) => "<ffi callback>".into(),
         Value::FfiBuffer(buffer) => format!("<ffi buffer {} bytes>", buffer.size()),
+        Value::FfiAggregate(value) => {
+            format!("<ffi aggregate {:?} {} bytes>", value.ty, value.bytes.len())
+        }
         Value::FfiPointer(pointer) => format!("ptr({pointer:p})"),
         Value::GcBuffer(buffer) => format!("<gc buffer {} bytes>", buffer.len()),
         Value::Unit => "()".into(),
@@ -1282,7 +1421,10 @@ mod tests {
 
     #[test]
     fn fixed_width_constructors_check_ranges() {
-        assert_eq!(builtin("u8", &[Value::Int(255)]).unwrap(), Some(Value::UInt(255)));
+        assert_eq!(
+            builtin("u8", &[Value::Int(255)]).unwrap(),
+            Some(Value::UInt(255))
+        );
         assert!(builtin("u8", &[Value::Int(256)]).is_err());
         assert_eq!(
             builtin("u32", &[Value::Int(4_294_967_295)]).unwrap(),
@@ -1300,7 +1442,10 @@ mod tests {
             .unwrap();
 
         evaluator
-            .gc_buffer_builtin("buf_set_u8", &[buffer.clone(), Value::Int(0), Value::Int(255)])
+            .gc_buffer_builtin(
+                "buf_set_u8",
+                &[buffer.clone(), Value::Int(0), Value::Int(255)],
+            )
             .unwrap();
         evaluator
             .gc_buffer_builtin(
@@ -1321,18 +1466,18 @@ mod tests {
                 .unwrap(),
             Some(Value::UInt(0x0102_0304))
         );
-        assert!(evaluator
-            .gc_buffer_builtin("buf_get_u32", &[buffer.clone(), Value::Int(5)])
-            .is_err());
+        assert!(
+            evaluator
+                .gc_buffer_builtin("buf_get_u32", &[buffer.clone(), Value::Int(5)])
+                .is_err()
+        );
 
         let text = evaluator
             .gc_buffer_builtin("str_to_buf", &[Value::String("lume".into())])
             .unwrap()
             .unwrap();
         assert_eq!(
-            evaluator
-                .gc_buffer_builtin("buf_to_str", &[text])
-                .unwrap(),
+            evaluator.gc_buffer_builtin("buf_to_str", &[text]).unwrap(),
             Some(Value::String("lume".into()))
         );
     }
@@ -1375,9 +1520,54 @@ mod tests {
     }
 
     #[test]
+    fn memmove_allows_overlapping_ranges() {
+        let evaluator = Evaluator::new(vec![]);
+        let buffer = evaluator
+            .gc_buffer_builtin("buf_new", &[Value::Int(8)])
+            .unwrap()
+            .unwrap();
+        for index in 0..8 {
+            evaluator
+                .gc_buffer_builtin(
+                    "buf_set_u8",
+                    &[buffer.clone(), Value::Int(index), Value::Int(index + 1)],
+                )
+                .unwrap();
+        }
+        evaluator
+            .gc_buffer_builtin(
+                "memmove",
+                &[
+                    buffer.clone(),
+                    Value::Int(1),
+                    buffer.clone(),
+                    Value::Int(0),
+                    Value::Int(4),
+                ],
+            )
+            .unwrap();
+        let bytes = (0..8)
+            .map(|index| {
+                let Value::UInt(byte) = evaluator
+                    .gc_buffer_builtin("buf_get_u8", &[buffer.clone(), Value::Int(index)])
+                    .unwrap()
+                    .unwrap()
+                else {
+                    panic!("buf_get_u8 must return UInt");
+                };
+                byte
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, [1, 1, 2, 3, 4, 6, 7, 8]);
+    }
+
+    #[test]
     fn time_builtins_use_the_injected_clock() {
         clock::with_clock(Arc::new(FakeClock), || {
-            assert_eq!(builtin("now_ms", &[]).unwrap(), Some(Value::Int(1_700_000_000_999)));
+            assert_eq!(
+                builtin("now_ms", &[]).unwrap(),
+                Some(Value::Int(1_700_000_000_999))
+            );
             assert_eq!(builtin("mono_ms", &[]).unwrap(), Some(Value::Int(1234)));
             assert!(builtin("now_ms", &[Value::Int(1)]).is_err());
         });

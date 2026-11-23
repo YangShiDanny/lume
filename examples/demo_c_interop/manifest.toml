@@ -6,7 +6,7 @@ build_mode = "jit"
 [[module]]
 path = "src/main.lume"
 lang = "lume"
-export = ["entry"]
+export = ["calc_sum", "entry"]
 
 [[module]]
 path = "src/calc.c"
@@ -14,5 +14,8 @@ lang = "c"
 cflags = ["-O1"]
 export = ["c_matmul"]
 
+[ffi.export]
+export = ["calc_sum"]
+
 [ffi.extern]
-c_matmul = { params = ["i64", "*u8"], ret = "i64" }
+c_matmul = { params = ["i64", "pointer"], ret = "i64" }

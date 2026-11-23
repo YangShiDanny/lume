@@ -8,5 +8,12 @@ fn calc_sum(n:int) -> int
     end
 ret s
 
+fn main() -> int
+    callback:any = ffi_export_ptr("calc_sum", "i64(i64)")
+ret c_matmul(128, callback)
+
+# `build_mode = "jit"` uses this entry; JIT now materializes the same
+# `ffi_export_ptr` callback as the interpreter.
 fn entry() -> int
-ret c_matmul(128, 0)
+    callback:any = ffi_export_ptr("calc_sum", "i64(i64)")
+ret c_matmul(128, callback)

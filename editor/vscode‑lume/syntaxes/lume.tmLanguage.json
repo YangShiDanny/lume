@@ -4,6 +4,7 @@
   "scopeName": "source.lume",
   "fileTypes": ["lume"],
   "patterns": [
+    { "include": "#attributes" },
     { "include": "#comments" },
     { "include": "#strings" },
     { "include": "#function-declaration" },
@@ -19,6 +20,10 @@
     { "include": "#punctuation" }
   ],
   "repository": {
+    "attributes": {
+      "match": "#\\[[A-Za-z_][A-Za-z0-9_]*\\]",
+      "name": "storage.modifier.attribute.lume"
+    },
     "comments": {
       "match": "#.*$",
       "name": "comment.line.number-sign.lume"
@@ -39,11 +44,11 @@
       }
     },
     "builtins": {
-      "match": "\\b(print|len|sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|asinh|acosh|atanh|exp|exp2|expm1|ln|log|log2|log10|log1p|sqrt|cbrt|floor|ceil|round|trunc|abs|pow|atan2|hypot|fmod|remainder|copysign|trace|debug|info|warn|error|log_trace|log_debug|log_info|log_warn|log_error|log_at)\\b(?=\\s*\\()",
+      "match": "\\b(print|len|is_alpha|is_digit|is_alphanumeric|is_whitespace|is_newline|is_identifier_start|is_identifier_continue|now_ms|mono_ms|buf_new|buf_len|buf_get_u8|buf_set_u8|buf_get_u32|buf_set_u32|memcpy|memmove|str_to_buf|buf_to_str|ffi_unsafe_load|ffi_symbol|ffi_unsafe_call|ffi_callback|ffi_callback_error|ffi_null|ffi_buffer|ffi_buffer_read|ffi_buffer_write|ffi_buffer_write_cstr|ffi_buffer_read_cstr|ffi_struct|ffi_struct_get|ffi_export_ptr|sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|asinh|acosh|atanh|exp|exp2|expm1|ln|log|log2|log10|log1p|sqrt|cbrt|floor|ceil|round|trunc|abs|pow|atan2|hypot|fmod|remainder|copysign|sleef_sin_u10|sleef_sin_u35|sleef_cos_u10|sleef_cos_u35|sleef_tan_u10|sleef_exp_u10|sleef_log_u10|sleef_sqrt_u05|sleef_pow_u10|sleef_pow_u35|llvm_sin|llvm_cos|llvm_exp|llvm_log|llvm_sqrt|trace|debug|info|warn|error|log_trace|log_debug|log_info|log_warn|log_error|log_at)\\b(?=\\s*\\()",
       "name": "support.function.builtin.lume"
     },
     "types": {
-      "match": "\\b(int|i16|i32|i64|u8|u16|u32|u64|usize|float|f32|f64|string|bool|pointer|unit|void|any)\\b",
+      "match": "\\b(int|i8|i16|i32|i64|u8|u16|u32|u64|usize|float|f32|f64|string|str|bool|pointer|unit|void|any)\\b",
       "name": "support.type.lume"
     },
     "constants": {

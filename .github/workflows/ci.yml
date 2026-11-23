@@ -65,8 +65,7 @@ jobs:
 
       - name: 运行 Clippy
         shell: bash
-        # 临时放行三个纯风格 lint，等手头的 FFI/GC 改完再逐条改成 inspect/zip/去掉 return。
-        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::manual_inspect -A clippy::manual_option_zip -A clippy::needless_return
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: 构建 Release 版本
         shell: bash
@@ -76,12 +75,8 @@ jobs:
         shell: bash
         run: |
           BIN="target/release/${{ matrix.exe }}"
-          "$BIN" check examples/demo_basic/src/main.lume
-          "$BIN" run examples/demo_basic/src/main.lume
-          "$BIN" run examples/demo_math_logging.lume
-          "$BIN" jit examples/demo_basic/src/main.lume
-          "$BIN" jit examples/demo_llvm_jit.lume
-          "$BIN" llvm-ir examples/demo_llvm_jit.lume
+          bash scripts/test-examples.sh "$BIN"
+          LUME_BIN="$BIN" bash examples/server_echo/test_echo.sh
 
   build-vscode:
     name: VS Code 扩展
