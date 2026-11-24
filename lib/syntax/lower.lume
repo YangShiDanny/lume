@@ -1,7 +1,491 @@
-# AST 到 lumec_core IR 降低器
+# Lume 编写的 AST -> 文本 IR 降低器。
+# 文本 IR 由 Rust 后端解析、校验并交给 LLVM JIT。
 
-fn lower_file(ast:int) -> int
-ret 0
+fn new_lowerer() -> any
+ret Lowerer{lines:[], next_value:0, next_block:1, locals:[], current_block:0, terminated:false, error:""}
 
-fn lower_ret(expr:int) -> int
-ret expr
+fn emit_line(state:any, line:string) -> any
+    state.lines = state.lines + [line]
+ret state
+
+fn patch_line(state:any, index:int, line:string) -> any
+    lines:any = state.lines
+    lines[index] = line
+    state.lines = lines
+ret state
+
+fn join_lines(lines:any) -> string
+    output:string = ""
+    index:int = 0
+    while index < len(lines)
+        output := output + lines[index] + "\n"
+        index := index + 1
+    end
+ret output
+
+fn define_const(state:any, text:string) -> any
+    value:int = state.next_value
+    state.next_value = value + 1
+    state := emit_line(state, "const " + to_string(value) + " " + text)
+ret Lowered{state:state, value:value}
+
+fn define_param(state:any, index:int) -> any
+    value:int = state.next_value
+    state.next_value = value + 1
+    state := emit_line(state, "param " + to_string(value) + " " + to_string(index))
+ret Lowered{state:state, value:value}
+
+fn define_unary(state:any, op:string, source:int) -> any
+    value:int = state.next_value
+    state.next_value = value + 1
+    state := emit_line(state, op + " " + to_string(value) + " " + to_string(source))
+ret Lowered{state:state, value:value}
+
+fn define_binary(state:any, op:string, lhs:int, rhs:int) -> any
+    value:int = state.next_value
+    state.next_value = value + 1
+    state := emit_line(state, op + " " + to_string(value) + " " + to_string(lhs) + " " + to_string(rhs))
+ret Lowered{state:state, value:value}
+
+fn define_call(state:any, name:string, args:Nodes) -> any
+    value:int = state.next_value
+    state.next_value = value + 1
+    line:string = "call " + to_string(value) + " " + name
+    index:int = 0
+    while index < len(args)
+        line := line + " " + to_string(args[index])
+        index := index + 1
+    end
+    state := emit_line(state, line)
+ret Lowered{state:state, value:value}
+
+fn define_phi(state:any, incoming:string) -> any
+    value:int = state.next_value
+    state.next_value = value + 1
+    state := emit_line(state, "phi " + to_string(value) + " " + incoming)
+ret PhiSlot{state:state, value:value, index:len(state.lines) - 1}
+
+fn alloc_block(state:any) -> BlockSlot
+    id:int = state.next_block
+    state.next_block = id + 1
+ret BlockSlot{state:state, id:id}
+
+fn begin_block(state:any, id:int) -> any
+    state := emit_line(state, "block " + to_string(id))
+    state.current_block = id
+    state.terminated = false
+ret state
+
+fn terminate(state:any, line:string) -> any
+    state := emit_line(state, line)
+    state.terminated = true
+ret state
+
+fn local_value(locals:Nodes, name:string) -> int
+    index:int = 0
+    while index < len(locals)
+        binding:any = locals[index]
+        if binding.name is name
+            ret binding.value
+        end
+        index := index + 1
+    end
+ret -1
+
+fn set_local(locals:Nodes, name:string, value:int) -> Nodes
+    index:int = 0
+    while index < len(locals)
+        binding:any = locals[index]
+        if binding.name is name
+            replacement:Binding = Binding{name:name, value:value}
+            locals[index] = replacement
+            ret locals
+        end
+        index := index + 1
+    end
+ret locals + [Binding{name:name, value:value}]
+
+fn binding_name(binding:any) -> string
+ret binding.name
+
+fn binding_value(binding:any) -> int
+ret binding.value
+
+fn has_local(locals:Nodes, name:string) -> bool
+ret local_value(locals, name) != -1
+
+fn binary_op(op:string) -> string
+    if op is "+"
+        ret "add"
+    end
+    if op is "-"
+        ret "sub"
+    end
+    if op is "*"
+        ret "mul"
+    end
+    if op is "/"
+        ret "div"
+    end
+    if op is "==" or op is "is"
+        ret "eq"
+    end
+    if op is "!="
+        ret "neq"
+    end
+    if op is "<"
+        ret "lt"
+    end
+    if op is ">"
+        ret "gt"
+    end
+    if op is "<="
+        ret "le"
+    end
+    if op is ">="
+        ret "ge"
+    end
+ret ""
+
+fn lower_expr(state:any, node:any) -> any
+    kind:string = node.kind
+    if kind is "int"
+        ret define_const(state, node.value)
+    end
+    if kind is "bool"
+        if node.value is "true"
+            ret define_const(state, "1")
+        end
+        ret define_const(state, "0")
+    end
+    if kind is "identifier"
+        value:int = local_value(state.locals, node.value)
+        if value < 0
+            state.error = "undefined variable `" + node.value + "`"
+        end
+        ret Lowered{state:state, value:value}
+    end
+    if kind is "unary"
+        operand:any = lower_expr(state, node.children[0])
+        state := operand.state
+        if node.value is "-"
+            zero:any = define_const(state, "0")
+            state := zero.state
+            ret define_binary(state, "sub", zero.value, operand.value)
+        end
+        if node.value is "not"
+            not_zero:any = define_const(state, "0")
+            state := not_zero.state
+            ret define_binary(state, "eq", operand.value, not_zero.value)
+        end
+        state.error = "unsupported unary operator `" + node.value + "`"
+        ret Lowered{state:state, value:0}
+    end
+    if kind is "binary"
+        lhs:any = lower_expr(state, node.children[0])
+        state := lhs.state
+        rhs:any = lower_expr(state, node.children[1])
+        state := rhs.state
+        op:string = binary_op(node.value)
+        if op is ""
+            state.error = "unsupported operator `" + node.value + "`"
+            ret Lowered{state:state, value:0}
+        end
+        ret define_binary(state, op, lhs.value, rhs.value)
+    end
+    if kind is "call"
+        if (node.value is "u8" or node.value is "u32") and len(node.children) is 1
+            source:any = lower_expr(state, node.children[0])
+            state := source.state
+            if node.value is "u8"
+                ret define_unary(state, "cast8", source.value)
+            end
+            ret define_unary(state, "cast32", source.value)
+        end
+        args:Nodes = []
+        index:int = 0
+        while index < len(node.children)
+            argument:any = lower_expr(state, node.children[index])
+            state := argument.state
+            args = args + [argument.value]
+            index := index + 1
+        end
+        ret define_call(state, node.value, args)
+    end
+    state.error = "cannot lower expression kind `" + kind + "`"
+ret Lowered{state:state, value:0}
+
+fn merge_locals(state:any, original:Nodes, then_locals:Nodes, else_locals:Nodes, then_end:int, else_end:int, then_live:bool, else_live:bool) -> any
+    names:Nodes = []
+    index:int = 0
+    while index < len(original)
+        name:string = binding_name(original[index])
+        if not has_local(names, name)
+            names = names + [ast_node("name", name, [])]
+        end
+        index := index + 1
+    end
+    index := 0
+    while index < len(then_locals)
+        name := binding_name(then_locals[index])
+        if not has_local(names, name)
+            names = names + [ast_node("name", name, [])]
+        end
+        index := index + 1
+    end
+    index := 0
+    while index < len(else_locals)
+        name := binding_name(else_locals[index])
+        if not has_local(names, name)
+            names = names + [ast_node("name", name, [])]
+        end
+        index := index + 1
+    end
+
+    merged:Nodes = []
+    index := 0
+    while index < len(names)
+        name := names[index].value
+        then_value:int = local_value(then_locals, name)
+        else_value:int = local_value(else_locals, name)
+        if then_value < 0
+            then_value = local_value(original, name)
+        end
+        if else_value < 0
+            else_value = local_value(original, name)
+        end
+        if then_value == else_value
+            if then_value >= 0
+                merged = set_local(merged, name, then_value)
+            end
+        else
+            incoming:string = ""
+            if then_live
+                incoming := incoming + " " + to_string(then_end) + ":" + to_string(then_value)
+            end
+            if else_live
+                incoming := incoming + " " + to_string(else_end) + ":" + to_string(else_value)
+            end
+            phi:any = define_phi(state, incoming)
+            state := phi.state
+            merged = set_local(merged, name, phi.value)
+        end
+        index := index + 1
+    end
+    state.locals = merged
+ret state
+
+fn lower_if(state:any, node:any, produce_value:bool) -> any
+    original:Nodes = state.locals
+    condition:any = lower_expr(state, node.cond)
+    state := condition.state
+
+    then_slot:BlockSlot = alloc_block(state)
+    state := then_slot.state
+    else_slot:BlockSlot = alloc_block(state)
+    state := else_slot.state
+    merge_slot:BlockSlot = alloc_block(state)
+    state := merge_slot.state
+
+    branch:string = "if " + to_string(condition.value) + " " + to_string(then_slot.id) + " " + to_string(else_slot.id)
+    state := terminate(state, branch)
+
+    state := begin_block(state, then_slot.id)
+    state.locals = original
+    then_result:any = lower_block(state, node.then_body.children, produce_value)
+    state := then_result.state
+    then_live:bool = not state.terminated
+    then_end:int = state.current_block
+    if then_live
+        state := terminate(state, "jump " + to_string(merge_slot.id))
+    end
+    then_locals:Nodes = state.locals
+
+    state := begin_block(state, else_slot.id)
+    state.locals = original
+    else_result:any = lower_block(state, node.else_body.children, produce_value)
+    state := else_result.state
+    else_live:bool = not state.terminated
+    else_end:int = state.current_block
+    if else_live
+        state := terminate(state, "jump " + to_string(merge_slot.id))
+    end
+    else_locals:Nodes = state.locals
+
+    if not then_live and not else_live
+        state.terminated = true
+        ret Lowered{state:state, value:0}
+    end
+
+    state := begin_block(state, merge_slot.id)
+    state := merge_locals(state, original, then_locals, else_locals, then_end, else_end, then_live, else_live)
+
+    value:int = 0
+    if produce_value
+        if then_live and else_live and then_result.value != else_result.value
+            incoming:string = " " + to_string(then_end) + ":" + to_string(then_result.value)
+            incoming := incoming + " " + to_string(else_end) + ":" + to_string(else_result.value)
+            phi:any = define_phi(state, incoming)
+            state := phi.state
+            value := phi.value
+        else if then_live
+            value := then_result.value
+        else
+            value := else_result.value
+        end
+    end
+ret Lowered{state:state, value:value}
+
+fn lower_while(state:any, node:any, produce_value:bool) -> any
+    original:Nodes = state.locals
+    preheader:int = state.current_block
+    initial:any = define_const(state, "0")
+    state := initial.state
+
+    header_slot:BlockSlot = alloc_block(state)
+    state := header_slot.state
+    body_slot:BlockSlot = alloc_block(state)
+    state := body_slot.state
+    exit_slot:BlockSlot = alloc_block(state)
+    state := exit_slot.state
+
+    state := terminate(state, "jump " + to_string(header_slot.id))
+    state := begin_block(state, header_slot.id)
+
+    loop_locals:Nodes = []
+    phi_lines:Nodes = []
+    phi_names:Nodes = []
+    index:int = 0
+    while index < len(original)
+        name:string = binding_name(original[index])
+        incoming:string = " " + to_string(preheader) + ":" + to_string(binding_value(original[index]))
+        slot:any = define_phi(state, incoming)
+        state := slot.state
+        phi_lines = phi_lines + [slot.index]
+        phi_names = phi_names + [ast_node("name", name, [])]
+        loop_locals = set_local(loop_locals, name, slot.value)
+        index := index + 1
+    end
+
+    result_slot:any = define_phi(state, " " + to_string(preheader) + ":" + to_string(initial.value))
+    state := result_slot.state
+
+    state.locals = loop_locals
+    condition:any = lower_expr(state, node.cond)
+    state := condition.state
+    state := terminate(state, "if " + to_string(condition.value) + " " + to_string(body_slot.id) + " " + to_string(exit_slot.id))
+
+    state := begin_block(state, body_slot.id)
+    state.locals = loop_locals
+    body_result:any = lower_block(state, node.body.children, produce_value)
+    state := body_result.state
+    backedge:int = state.current_block
+    if not state.terminated
+        state := terminate(state, "jump " + to_string(header_slot.id))
+    end
+
+    index := 0
+    while index < len(phi_lines)
+        name := phi_names[index].value
+        incoming := " " + to_string(preheader) + ":" + to_string(binding_value(original[index]))
+        incoming := incoming + " " + to_string(backedge) + ":" + to_string(local_value(state.locals, name))
+        state := patch_line(state, phi_lines[index], "phi " + to_string(local_value(loop_locals, name)) + incoming)
+        index := index + 1
+    end
+    result_incoming:string = " " + to_string(preheader) + ":" + to_string(initial.value)
+    result_incoming := result_incoming + " " + to_string(backedge) + ":" + to_string(body_result.value)
+    state := patch_line(state, result_slot.index, "phi " + to_string(result_slot.value) + result_incoming)
+
+    state := begin_block(state, exit_slot.id)
+    state.locals = loop_locals
+ret Lowered{state:state, value:result_slot.value}
+
+fn lower_statement(state:any, node:any) -> any
+    kind:string = node.kind
+    if kind is "declare"
+        assigned:any = lower_expr(state, node.children[1])
+        state := assigned.state
+        state.locals = set_local(state.locals, node.value, assigned.value)
+        ret Lowered{state:state, value:assigned.value}
+    end
+    if kind is "assign" or kind is "walrus"
+        assigned_value:any = lower_expr(state, node.children[0])
+        state := assigned_value.state
+        state.locals = set_local(state.locals, node.value, assigned_value.value)
+        ret Lowered{state:state, value:assigned_value.value}
+    end
+    if kind is "return"
+        return_value:int = 0
+        if len(node.children) > 0
+            returned:any = lower_expr(state, node.children[0])
+            state := returned.state
+            return_value := returned.value
+        end
+        state := terminate(state, "ret " + to_string(return_value))
+        ret Lowered{state:state, value:return_value}
+    end
+    if kind is "expression"
+        ret lower_expr(state, node.children[0])
+    end
+    if kind is "if"
+        ret lower_if(state, node, false)
+    end
+    if kind is "while"
+        ret lower_while(state, node, false)
+    end
+    state.error = "cannot lower statement kind `" + kind + "`"
+ret Lowered{state:state, value:0}
+
+fn lower_block(state:any, nodes:Nodes, produce_value:bool) -> any
+    value:int = 0
+    index:int = 0
+    while index < len(nodes) and not state.terminated
+        result:any = lower_statement(state, nodes[index])
+        state := result.state
+        value := result.value
+        index := index + 1
+    end
+ret Lowered{state:state, value:value}
+
+fn lower_function(state:any, function:any) -> any
+    state.next_value = 0
+    state.next_block = 1
+    state.locals = []
+    state.terminated = false
+    state.current_block = 0
+    state := emit_line(state, "func " + function.name + " " + to_string(len(function.params)))
+    state := begin_block(state, 0)
+
+    index:int = 0
+    while index < len(function.params)
+        parameter:any = function.params[index]
+        value:any = define_param(state, index)
+        state := value.state
+        state.locals = set_local(state.locals, parameter.value, value.value)
+        index := index + 1
+    end
+
+    result:any = lower_block(state, function.body, false)
+    state := result.state
+    if not state.terminated
+        zero:any = define_const(state, "0")
+        state := zero.state
+        state := terminate(state, "ret " + to_string(zero.value))
+    end
+    state := emit_line(state, "end")
+ret state
+
+fn lower_file(ast:any) -> string
+    if ast.error != ""
+        ret "error: " + ast.error
+    end
+    state:any = new_lowerer()
+    index:int = 0
+    while index < len(ast.functions)
+        state := lower_function(state, ast.functions[index])
+        if state.error != ""
+            ret "error: " + state.error
+        end
+        index := index + 1
+    end
+ret join_lines(state.lines)

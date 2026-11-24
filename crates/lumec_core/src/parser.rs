@@ -179,7 +179,14 @@ fn expression_tokens(source: &str) -> Vec<LexToken> {
                 let ch = chars[i];
                 i += 1;
                 if escaped {
-                    value.push(ch);
+                    match ch {
+                        'n' => value.push('\n'),
+                        't' => value.push('\t'),
+                        'r' => value.push('\r'),
+                        '\\' => value.push('\\'),
+                        '"' => value.push('"'),
+                        other => value.push(other),
+                    }
                     escaped = false;
                 } else if ch == '\\' {
                     escaped = true;
@@ -1258,7 +1265,7 @@ ret add_base(5)
     }
 
     #[test]
-    fn self_hosted_parser_does_not_confuse_nested_end_with_function_end() {
+    fn self_hosted_parser_handles_nested_end_and_following_function() {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lib/syntax/parser.lume");
         let functions = crate::modules::load_source_graph(path).unwrap();
@@ -1271,15 +1278,17 @@ ret add_base(5)
                 )],
             )
             .unwrap();
-        assert!(matches!(
-            value,
-            Value::Struct { fields, .. }
-                if matches!(
-                    fields.get("error"),
-                    Some(Value::String(message))
-                        if message.contains("straight-line function bodies")
-                )
-        ));
+        let Value::Struct { fields, .. } = value else {
+            panic!("parser must return an AST file");
+        };
+        assert!(
+            matches!(fields.get("error"), Some(Value::String(error)) if error.is_empty()),
+            "unexpected parser error: {:?}",
+            fields.get("error")
+        );
+        assert!(
+            matches!(fields.get("functions"), Some(Value::Array(functions)) if functions.len() == 2)
+        );
     }
 
     #[cfg(target_os = "linux")]

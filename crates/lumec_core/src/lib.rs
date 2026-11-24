@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod buffer;
 pub mod builtin;
 pub mod clock;
@@ -6,6 +7,7 @@ pub mod evaluator;
 pub mod ffi;
 pub mod gc;
 pub mod ir;
+pub mod ir_text;
 mod jit;
 pub mod lsp;
 pub mod manifest;

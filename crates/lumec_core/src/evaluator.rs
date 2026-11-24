@@ -785,10 +785,9 @@ impl Evaluator {
                 match (base, index) {
                     (Value::Array(items), Value::Int(index)) => {
                         let index = usize::try_from(index).map_err(|_| "negative array index")?;
-                        items
-                            .get(index)
-                            .cloned()
-                            .ok_or_else(|| "array index out of bounds".into())
+                        items.get(index).cloned().ok_or_else(|| {
+                            format!("array index {index} out of bounds (length {})", items.len())
+                        })
                     }
                     (Value::String(text), Value::Int(index)) => {
                         let index = usize::try_from(index).map_err(|_| "negative string index")?;
@@ -1162,6 +1161,10 @@ fn builtin(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
                 Value::String(text) => Ok(Some(Value::Int(text.chars().count() as i64))),
                 _ => Err("len expects string or array".into()),
             }
+        }
+        "to_string" => {
+            require_arity(name, args, 1)?;
+            Ok(Some(Value::String(value_to_string(&args[0]))))
         }
         "now_ms" => {
             require_arity(name, args, 0)?;

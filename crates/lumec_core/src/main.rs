@@ -22,6 +22,8 @@ fn print_usage() {
     eprintln!("  lume-bootstrap llvm-ir <file.lume>");
     eprintln!("  lume-bootstrap <run|check|jit|llvm-ir|header> <manifest.toml>");
     eprintln!("  lume-bootstrap docs <manifest.toml> [output.md]");
+    eprintln!("  lume-bootstrap bootstrap <file.lume>");
+    eprintln!("  lume-bootstrap bootstrap-ir <file.lume>");
     eprintln!("  lume-bootstrap --lsp");
 }
 
@@ -227,6 +229,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--lsp") {
         lumec_core::lsp::serve_stdio()?;
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("bootstrap") {
+        let ([_, source_path] | [_, source_path, _]) = args.as_slice() else {
+            print_usage();
+            return Ok(());
+        };
+        let source = std::fs::read_to_string(source_path)?;
+        let functions = lumec_core::bootstrap::compile_source(&source)?;
+        let has_main = functions.iter().any(|function| function.name == "main");
+        let has_entry = functions.iter().any(|function| function.name == "entry");
+        let mut core = LumeCore::new();
+        for function in functions {
+            core.define_function(function)?;
+        }
+        let entry = if has_main {
+            "main"
+        } else if has_entry {
+            "entry"
+        } else {
+            "boot"
+        };
+        println!("{}", core.call(entry, &[])?);
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("bootstrap-ir") {
+        let ([_, source_path] | [_, source_path, _]) = args.as_slice() else {
+            print_usage();
+            return Ok(());
+        };
+        let source = std::fs::read_to_string(source_path)?;
+        let functions = lumec_core::bootstrap::compile_source(&source)?;
+        let mut core = LumeCore::new();
+        for function in functions {
+            core.define_function(function)?;
+        }
+        print!("{}", core.llvm_ir()?);
         return Ok(());
     }
     if args.first().map(String::as_str) == Some("docs") {

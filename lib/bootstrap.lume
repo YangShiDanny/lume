@@ -1,11 +1,14 @@
-# Lume 自举世界入口
+# Lume 自举世界入口：由 Lume 源码生成文本 IR，再由 Rust 后端校验与执行。
+
+import "syntax/parser.lume"
+import "syntax/lower.lume"
+
+fn compile(source:string) -> string
+    ast:any = parse(source)
+ret lower_file(ast)
 
 fn bootstrap()
-    lexer:int = load_source("lib/syntax/lexer.lume")
-    parser:int = load_source("lib/syntax/parser.lume")
-    ast:int = load_source("lib/syntax/ast.lume")
-    lower:int = load_source("lib/syntax/lower.lume")
-    build:int = load_source("lib/build/build.lume")
-
-    print_bootstrap_ready()
+    ir:string = compile("fn main() -> int\nret 42\n")
+    print(ir)
+ret 0
 end

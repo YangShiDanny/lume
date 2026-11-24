@@ -14,3 +14,12 @@ ret Node{kind:"error", message:message}
 
 fn ast_parsed(node:Node, next:int) -> Parsed
 ret Parsed{node:node, next:next}
+
+fn ast_block(nodes:Nodes) -> Node
+ret Node{kind:"block", value:"", children:nodes}
+
+fn ast_if(condition:Node, then_body:Node, else_body:Node) -> Node
+ret Node{kind:"if", value:"", cond:condition, then_body:then_body, else_body:else_body}
+
+fn ast_while(condition:Node, body:Node) -> Node
+ret Node{kind:"while", value:"", cond:condition, body:body}

@@ -55,9 +55,29 @@ fn lex(source:string) -> Tokens
             column := column + 1
             string_text:string = ""
             while index < source_length and source[index] != "\""
-                string_text := string_text + source[index]
-                index := index + 1
-                column := column + 1
+                current_char:string = source[index]
+                if current_char is "\\" and index + 1 < source_length
+                    escaped:string = source[index + 1]
+                    if escaped is "n"
+                        string_text := string_text + "\n"
+                    else if escaped is "t"
+                        string_text := string_text + "\t"
+                    else if escaped is "r"
+                        string_text := string_text + "\r"
+                    else if escaped is "\\"
+                        string_text := string_text + "\\"
+                    else if escaped is "\""
+                        string_text := string_text + "\""
+                    else
+                        string_text := string_text + escaped
+                    end
+                    index := index + 2
+                    column := column + 2
+                else
+                    string_text := string_text + current_char
+                    index := index + 1
+                    column := column + 1
+                end
             end
             if index < source_length
                 index := index + 1

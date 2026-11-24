@@ -44,6 +44,8 @@ run_expected 50727435 jit examples/demo_buffer_jit.lume
 "$BIN" jit examples/demo_basic/src/main.lume > /dev/null
 "$BIN" jit examples/demo_llvm_jit.lume > /dev/null
 "$BIN" llvm-ir examples/demo_llvm_jit.lume > /dev/null
+run_expected 55 bootstrap examples/demo_llvm_jit.lume
+"$BIN" bootstrap-ir examples/demo_llvm_jit.lume > /dev/null
 
 check_ok examples/demo_c_interop/manifest.toml
 "$BIN" header examples/demo_c_interop/manifest.toml > /dev/null

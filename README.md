@@ -162,6 +162,10 @@ cargo run -p lumec_core -- jit examples/demo_llvm_jit.lume
 # 输出 LLVM IR
 cargo run -p lumec_core -- llvm-ir examples/demo_llvm_jit.lume
 
+# stage1 自举：Lume 编写的前端生成文本 IR，再由 Rust 后端 JIT 执行
+cargo run -p lumec_core -- bootstrap examples/demo_llvm_jit.lume      # 输出 55
+cargo run -p lumec_core -- bootstrap-ir examples/demo_llvm_jit.lume
+
 # manifest 项目：静态 / AOT FFI 与 C 互操作
 cargo run -p lumec_core -- header examples/demo_c_interop/manifest.toml
 cargo run -p lumec_core -- run examples/demo_c_interop/manifest.toml

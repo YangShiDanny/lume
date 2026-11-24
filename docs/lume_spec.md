@@ -319,6 +319,36 @@ library = "..."` 注册 libffi trampoline 调用共享库符号。`#[ffi_export]
 JIT 在编译后把函数地址交给 libffi trampoline。JIT 回调限于当前线程同步调用，
 且按值聚合仍不进入 JIT 的 `i64` 值 ABI。
 
+## 自举（stage1）
+
+`lib/` 下有一条可执行的前端链路，词法、语法和 IR lowering 均由 Lume 编写：
+
+```text
+Lume 源码
+  └─ lib/syntax/lexer.lume + parser.lume   （Lume 前端）
+      └─ lib/syntax/lower.lume             （Lume 前端，输出文本 IR）
+          └─ crates/lumec_core/src/ir_text.rs（Rust 解析并校验）
+              └─ LumeCore + LLVM JIT        （Rust 后端）
+```
+
+```bash
+cargo run -p lumec_core -- bootstrap examples/demo_llvm_jit.lume      # 输出 55
+cargo run -p lumec_core -- bootstrap-ir examples/demo_llvm_jit.lume   # 输出 LLVM IR
+```
+
+文本 IR 是行式格式，指令包括 `func <name> <nparams>`、`block <id>`、
+`const`/`param`、`add`/`sub`/`mul`/`div`、比较运算、`cast8`/`cast32`、
+`call <id> <name> [args...]`、`phi <id> <block>:<value> ...`、
+`if <cond> <then> <else>`、`jump <block>`、`ret <value>` 和 `end`。
+stage1 当前支持函数（含多函数文件）、参数、局部变量、整数常量、加减乘除、
+比较、`if`/`else`、`while`、命名函数调用和 `u8`/`u32` 构造式转换。
+字符串可以出现在源码字符串字面量中，但不能降低到 IR。
+字符串字面量支持 `\n`、`\t`、`\r`、`\\`、`\"` 转义；stage0 与 Lume 词法器
+行为一致。
+
+这条链路仍由 stage0 解释器加载前端模块，Rust 负责类型检查、IR 校验和 LLVM
+后端，因此属于 stage1，而非完全自托管的 stage2。
+
 ## 当前限制
 
 当前 `lume-bootstrap` 的解释器/解析器尚未实现完整语言规范，主要限制包括：
@@ -328,6 +358,6 @@ JIT 在编译后把函数地址交给 libffi trampoline。JIT 回调限于当前
 - 结构体目前是动态字段值，尚无独立声明/schema；闭包只支持单表达式和按值捕获；泛型仅支持语法擦除，未完整实现类型参数推导。
 - 模式匹配支持字面量、绑定名和通配符，暂不支持解构、守卫、类型/范围模式或编译期穷尽性分析。
 - 静态类型检查为基础子集；完整错误恢复、流敏感分析、数组元素类型和模块命名空间尚未实现。
-- LLVM JIT 前端仅支持上述整数和控制流子集；浮点、聚合值、闭包、泛型和模式匹配尚未降低到 IR。`run` 仍由解释器执行。Lume 编写的 lexer/parser/lower/build 文件仍是骨架，完整 stage1/stage2 自举尚未完成。
+- LLVM JIT 前端仅支持上述整数和控制流子集；浮点、聚合值、闭包、泛型和模式匹配尚未降低到 IR。`run` 仍由解释器执行。Lume 编写的 lexer/parser/lower 已能生成文本 IR 并经 Rust 后端 JIT 执行（见上一节），但 stage0 仍负责加载模块与类型检查，完整 stage2 自举尚未完成。
 
 发现与实现不符时，请以可运行代码和测试为准，并通过项目 issue/PR 反馈。

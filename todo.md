@@ -5,7 +5,9 @@
 > 本轮先完成 P0 的静态 / AOT FFI 与 Clippy 基线债；P1-1 / P1-2 及本轮“地基补完”
 > （JIT 定宽 cast / buffer、memmove、FFI ABI / 变参 / 按值聚合、JIT 侧 C 回调 Lume）
 > 均已完成。随后修复 stable/nightly rustfmt 差异导致的 CI 格式门禁失败；P1-5 socket
-> 最小 echo 已落地（顺序客户端），并发 poll 集合仍待做。所有改动均未提交。
+> 最小 echo 已落地（顺序客户端），并发 poll 集合仍待做。stage1 自举前端
+> （Lume lexer/parser/lower → 文本 IR → Rust 后端 JIT）已跑通并接入门禁。
+> 所有改动均未提交。
 
 ## 状态快照
 
@@ -15,7 +17,8 @@
 - 已完成（CI 侧）：三平台构建 / Release / Pages / Wiki 同步；LLVM 23 安装脚本修复（Linux 补 `libpolly-23-dev`，Windows 改流式下载 + 7z + 缓存，macOS runner 改 `macos-15`）。
 - 已完成（未提交，P0）：manifest 解析与 C bitcode 构建/符号校验、JIT 外部符号分派、`#[ffi_export]` 头文件生成、`ffi_export_ptr` 回调桥、移除 `c_matmul` 桩、全 workspace 严格 Clippy 通过并恢复 CI 门禁。
 - 已完成（未提交，P1-5 第一步）：`examples/server_echo` 的跨平台 C ABI 垫片、manifest extern 动态 FFI 绑定、`ffi_buffer` 接收、`mono_ms()` 空闲超时与 C 客户端回环测试；当前是顺序客户端循环。
-- 待做：P1-5 多客户端并发 poll 集合；rawptr / unsafe、HashMap；多语言项目工具链；GPU SDK 封装与硬件验证。
+- 已完成（未提交，stage1 自举）：`lib/syntax/lexer.lume` / `parser.lume` / `lower.lume` 由骨架升级为可运行前端；新增 `ir_text.rs` 解析文本 IR、`bootstrap.rs` 串联前端与 JIT；CLI 新增 `bootstrap` / `bootstrap-ir`；stage0 与 Lume 词法器的字符串转义对齐。
+- 待做：完整 stage2 自托管（stage0 加载与类型检查尚未由 Lume 接管）；P1-5 多客户端并发 poll 集合；rawptr / unsafe、HashMap；多语言项目工具链；GPU SDK 封装与硬件验证。
 
 ## 排序原则
 
@@ -165,10 +168,11 @@
 - [x] 工具链：实现 `lume-bootstrap --lsp` stdio 服务，提供关键字/类型/内置函数/函数/局部变量补全、hover 与 parser/type checker 实时诊断；VS Code 扩展连接语言服务。
 - [x] 工具链：完善 TextMate 高亮的 FFI / buffer / math 内置函数和 `#[ffi_export]` 属性；manifest `docs` 子命令生成模块与外部签名 Markdown；`scripts/test-examples.sh` 统一执行示例检查、输出断言和文档生成验证。
 - [ ] 工具链：VS Code 补全跟上 `ptr_*`、HashMap、GPU 等新关键字。
-- [x] CI：三平台构建 / Release / Pages / Wiki 同步；LLVM 23 安装脚本已修（Linux Polly、Windows 流式下载 + 7z + 缓存、macOS runner）；`examples/demo_buffer.lume`（解释器）、`examples/demo_buffer_jit.lume`（run/jit）、`examples/demo_c_interop/manifest.toml` 的 check/header/run/jit/llvm-ir、以及 `examples/server_echo/test_echo.sh` 回环测试已加入示例矩阵；Clippy 门禁恢复严格模式；stable/nightly rustfmt 差异已按 CI 的 stable rustfmt 对齐。
+- [x] CI：三平台构建 / Release / Pages / Wiki 同步；LLVM 23 安装脚本已修（Linux Polly、Windows 流式下载 + 7z + 缓存、macOS runner）；`examples/demo_buffer.lume`（解释器）、`examples/demo_buffer_jit.lume`（run/jit）、`examples/demo_c_interop/manifest.toml` 的 check/header/run/jit/llvm-ir、以及 `examples/server_echo/test_echo.sh` 回环测试已加入示例矩阵；stage1 `bootstrap` / `bootstrap-ir examples/demo_llvm_jit.lume` 已加入 `scripts/test-examples.sh`，随 CI 示例矩阵执行；Clippy 门禁恢复严格模式；stable/nightly rustfmt 差异已按 CI 的 stable rustfmt 对齐。
 - [ ] CI：后续阶段继续把新示例加入 `ci.yml`。
 - [x] 验证（本轮）：`cargo test --workspace` 78 项 core 测试 + 9 项 Immix 测试通过；stable rustfmt / strict Clippy / `git diff --check` 全绿；示例矩阵 `ffi_strlen`、`demo_buffer`、`demo_buffer_jit`（run/jit 同为 `50727435`）、`demo_c_interop`（run/jit 同为 `8256`）与 `server_echo` 回显测试全部通过。
 - [x] 验证（辅助工具）：`cargo test --workspace` 85 项 core 测试 + 9 项 Immix 测试通过；严格 Clippy、格式检查和 VS Code 扩展编译通过；示例自动测试脚本及独立 LSP stdio 握手/诊断/补全/hover 测试通过。
+- [x] 验证（stage1 自举）：5 项 `bootstrap::tests` 覆盖单函数 lowering/JIT、嵌套 `while`、`if`/`else`、自举入口与多函数 IR 解析；CLI `bootstrap examples/demo_llvm_jit.lume` 输出 `55`，`bootstrap-ir` 生成预期 LLVM IR。
 - [ ] 验证（剩余）：GPU / socket 等后续阶段示例尚未加入。
 
 ---

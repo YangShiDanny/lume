@@ -376,6 +376,9 @@ impl Checker<'_> {
             Expr::Binary(op, lhs, rhs) => {
                 let lhs = self.check_expr(lhs)?;
                 let rhs = self.check_expr(rhs)?;
+                if matches!(lhs, Type::Any) || matches!(rhs, Type::Any) {
+                    return Ok(Type::Any);
+                }
                 match op.as_str() {
                     "and" | "or" => {
                         self.require_compatible(&Type::Bool, &lhs, "logical operand")?;
@@ -654,6 +657,10 @@ fn check_builtin(name: &str, args: &[Type]) -> Result<Type, String> {
                 return Err("len expects a string or array".into());
             }
             Ok(Type::Int)
+        }
+        "to_string" => {
+            require_builtin_arity(name, args, 1)?;
+            Ok(Type::String)
         }
         "now_ms" | "mono_ms" => {
             require_builtin_arity(name, args, 0)?;
