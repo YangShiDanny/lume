@@ -14,3 +14,4 @@ crates/*/src/pack.sh
 usr
 .Trash-0/
 .workbuddy/
+.venv
