@@ -223,5 +223,6 @@ echo server 回环测试和 VS Code 扩展编译。
 - [C FFI：动态调用、静态 / AOT 与导出](docs/ffi.md)
 - [语言服务与开发辅助工具](docs/tooling.md)
 - [小型服务器：Socket 最小闭环](docs/server.md)
+- [测试总览：全部测试项与 CI 入口](docs/testing.md)
 - [Immix 垃圾回收器](docs/immix-gc.md)
 - [VS Code 扩展说明](editor/vscode‑lume/README.md)

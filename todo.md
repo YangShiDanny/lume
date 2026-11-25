@@ -5,9 +5,9 @@
 > 本轮先完成 P0 的静态 / AOT FFI 与 Clippy 基线债；P1-1 / P1-2 及本轮“地基补完”
 > （JIT 定宽 cast / buffer、memmove、FFI ABI / 变参 / 按值聚合、JIT 侧 C 回调 Lume）
 > 均已完成。随后修复 stable/nightly rustfmt 差异导致的 CI 格式门禁失败；P1-5 socket
-> 最小 echo 已落地（顺序客户端），并发 poll 集合仍待做。stage1 自举前端
+> 最小 echo 已升级为 `poll` fd 集合（单线程多客户端并发）。stage1 自举前端
 > （Lume lexer/parser/lower → 文本 IR → Rust 后端 JIT）已跑通并接入门禁。
-> 所有改动均未提交。
+> stage1 主改动已由用户提交（`8ddeb5f`）；本轮 CI 修复与 echo 并发改动仍在工作区。
 
 ## 状态快照
 
@@ -16,16 +16,17 @@
 - 已完成（未提交，地基补完）：FFI ABI 前缀、C 变参（显式列出实参类型并做默认提升）、按值 struct/union（libffi 布局）、JIT 侧真实 `ffi_export_ptr` 回调；`demo_c_interop` 的 run / jit 输出均为 `8256`。
 - 已完成（CI 侧）：三平台构建 / Release / Pages / Wiki 同步；LLVM 23 安装脚本修复（Linux 补 `libpolly-23-dev`，Windows 改流式下载 + 7z + 缓存，macOS runner 改 `macos-15`）。
 - 已完成（未提交，P0）：manifest 解析与 C bitcode 构建/符号校验、JIT 外部符号分派、`#[ffi_export]` 头文件生成、`ffi_export_ptr` 回调桥、移除 `c_matmul` 桩、全 workspace 严格 Clippy 通过并恢复 CI 门禁。
-- 已完成（未提交，P1-5 第一步）：`examples/server_echo` 的跨平台 C ABI 垫片、manifest extern 动态 FFI 绑定、`ffi_buffer` 接收、`mono_ms()` 空闲超时与 C 客户端回环测试；当前是顺序客户端循环。
+- 已完成（P1-5）：`examples/server_echo` 的跨平台 C ABI 垫片、manifest extern 动态 FFI 绑定、`ffi_buffer` 接收、`mono_ms()` 空闲超时、单客户端与多客户端回环测试；当前为单线程 `poll` fd 集合多客户端并发。
 - 已完成（未提交，stage1 自举）：`lib/syntax/lexer.lume` / `parser.lume` / `lower.lume` 由骨架升级为可运行前端；新增 `ir_text.rs` 解析文本 IR、`bootstrap.rs` 串联前端与 JIT；CLI 新增 `bootstrap` / `bootstrap-ir`；stage0 与 Lume 词法器的字符串转义对齐。
-- 待做：完整 stage2 自托管（stage0 加载与类型检查尚未由 Lume 接管）；P1-5 多客户端并发 poll 集合；rawptr / unsafe、HashMap；多语言项目工具链；GPU SDK 封装与硬件验证。
+- 已完成（测试体系）：新增 `.github/workflows/test.yml` 专门测试 CI 与 `docs/testing.md` 测试项总览；`scripts/test-llvm-languages.sh` 把 C/Rust/Fortran 统一到 LLVM bitcode 并做符号/`llvm-link`/`lli` 验证。
+- 待做：完整 stage2 自托管（stage0 加载与类型检查尚未由 Lume 接管）；rawptr / unsafe、HashMap；多语言项目工具链；GPU SDK 封装与硬件验证。
 
 ## 排序原则
 
 1. 先地基后上层：时间 → buffer → rawptr → HashMap → socket → 服务器 demo。
 2. 每块必须有可运行示例 + 单测，不堆“只设计不落地”的文档。
 3. 跨语言边界坚持 C ABI（i64 / 指针），不穿透 GC；GPU 先显式搬运，不自动统一内存。
-4. 动态 FFI、`mono_ms()`、解释器与 JIT buffer、JIT C 回调均已完成；P1-5 已有可运行 echo 最小闭环，下一步补多客户端并发。
+4. 动态 FFI、`mono_ms()`、解释器与 JIT buffer、JIT C 回调均已完成；P1-5 的 echo 已支持多客户端并发，下一步进入 rawptr / HashMap。
 5. 全 workspace Clippy 单独清理，别和 FFI / Immix 的功能验收混在一起。
 
 ---
@@ -112,15 +113,17 @@
 - [ ] 类型 `HashMap<K, V>` 在 typecheck 中保留 K/V；键相等复用现有 `values_equal` / `is`。
 - **验收**：10 万条插入 / 查找；删除后 GC 不悬挂；进程内字符串键哈希稳定。
 
-### P1-5 Socket（最小闭环已完成，并发待做）
+### P1-5 Socket（最小闭环 + 多客户端并发已完成）
 
 - [x] 主路径走动态 FFI：`examples/server_echo/src/net.c` 封装 `listen` / `accept` / `recv` / `send` / `close` / `last_error`，fd 与长度统一 `i64`；`manifest.toml` 用 `[ffi.extern]` 绑定，解释器通过 libffi 动态分派。
 - [x] `sockaddr_in` 不进入 JIT；Lume 侧用 `ffi_buffer` 提供接收内存，`mono_ms()` 判定空闲超时并关闭监听 fd。
 - [x] `test_echo.sh` + `test_echo.c` 回环验证 `hello lume`，CI 示例矩阵已接入。
-- [ ] 非阻塞 + `poll` fd 集合，做单线程多客户端并发事件循环；当前每次只服务一个客户端。
+- [x] `poll` fd 集合：C 垫片维护平台相关 `pollfd` 数组，Lume 侧用 `ffi_buffer` 保存 fd 槽位；`lume_net_pollset_clear` / `set` / `lume_net_poll` / `pollset_ready` 全部通过动态 FFI 绑定。
+- [x] 单线程多客户端事件循环：槽位 `0` 为监听 fd，`1..63` 为客户端；就绪后非阻塞 `recv`/`send`，断开时回写 `-1` 并让 C 侧忽略该槽位。
+- [x] `test_echo_multi.c`：两个客户端同时打开，第二个客户端在第一个仍存活时必须得到回显；顺序 accept/echo 循环无法通过该用例。
 - [ ] AOT/JIT 静态 extern 路径仍保留后续阶段；当前只维护一套动态 FFI 分派语义。
 - [ ] 备选：`core_socket_*` Rust builtin 暂不实现，避免维护两套语义。
-- **当前验收**：`examples/server_echo` 可启动并回显；单客户端 accept / recv / send / close 无 fd 泄漏；多客户端并发仍待补。
+- **当前验收**：`bash examples/server_echo/test_echo.sh` 输出 `ECHO_OK hello lume` 与 `ECHO_MULTI_OK`；单/多客户端均通过，关闭时槽位复位，无 fd 泄漏。
 
 ### P1-6 锁与超时
 
@@ -162,23 +165,29 @@
 ## 横切工作
 
 - [x] 文档：`docs/ffi.md` 已补动态 FFI、manifest 静态/AOT、头文件生成与 `#[ffi_export]`；`docs/lume_spec.md` 已同步 FFI、时间、定宽构造、GC buffer 与 JIT 限制；`docs/immix-gc.md` 与 `README.md` 已更新。
-- [x] 文档：`docs/server.md` 已记录 socket 最小闭环、C ABI、超时语义与当前范围；`docs/gpu.md` 仍待做。
+- [x] 文档：`docs/server.md` 已记录 socket 最小闭环、C ABI、多客户端事件循环与当前范围；`docs/testing.md` 汇总全部测试项、命令与 CI 入口；`docs/gpu.md` 仍待做。
 - [ ] 文档：`docs/gpu.md`；`docs/lume_spec.md` 继续补 unsafe / ptr / HashMap 语法。Wiki 同步 CI 会自动把 `docs/` 推送到 GitHub Wiki。
 - [x] 工具链：VS Code 语法、补全、主题、图标与网页编辑器已可用；REPL 无需改；补了 `now_ms` / `mono_ms` / `buf_*` / `memcpy` / `memmove` / `ffi_struct*` 与 `#[ffi_export]` / `ffi_export_ptr` 补全。
 - [x] 工具链：实现 `lume-bootstrap --lsp` stdio 服务，提供关键字/类型/内置函数/函数/局部变量补全、hover 与 parser/type checker 实时诊断；VS Code 扩展连接语言服务。
 - [x] 工具链：完善 TextMate 高亮的 FFI / buffer / math 内置函数和 `#[ffi_export]` 属性；manifest `docs` 子命令生成模块与外部签名 Markdown；`scripts/test-examples.sh` 统一执行示例检查、输出断言和文档生成验证。
 - [ ] 工具链：VS Code 补全跟上 `ptr_*`、HashMap、GPU 等新关键字。
 - [x] CI：三平台构建 / Release / Pages / Wiki 同步；LLVM 23 安装脚本已修（Linux Polly、Windows 流式下载 + 7z + 缓存、macOS runner）；`examples/demo_buffer.lume`（解释器）、`examples/demo_buffer_jit.lume`（run/jit）、`examples/demo_c_interop/manifest.toml` 的 check/header/run/jit/llvm-ir、以及 `examples/server_echo/test_echo.sh` 回环测试已加入示例矩阵；stage1 `bootstrap` / `bootstrap-ir examples/demo_llvm_jit.lume` 已加入 `scripts/test-examples.sh`，随 CI 示例矩阵执行；Clippy 门禁恢复严格模式；stable/nightly rustfmt 差异已按 CI 的 stable rustfmt 对齐。
-- [ ] CI：后续阶段继续把新示例加入 `ci.yml`。
+- [x] CI：新增 `.github/workflows/test.yml` 专门测试工作流（Rust 单测、Clippy、示例矩阵、socket 回环、VS Code 编译、LLVM 多语言）；`ci.yml` 继续负责三平台构建门禁、Release、Pages 与 Wiki。
+- [x] 测试：新增 `scripts/test-llvm-languages.sh` + `tests/llvm-languages/{add.c,add.rs,add.f90}`；C/Rust/Fortran 统一 LLVM bitcode，做符号校验、`llvm-link` 与 `lli` 执行；Fortran 编译器缺失时按约定跳过。
+- [ ] CI：后续阶段继续把新示例加入 `ci.yml` / `test.yml`。
 - [x] 验证（本轮）：`cargo test --workspace` 78 项 core 测试 + 9 项 Immix 测试通过；stable rustfmt / strict Clippy / `git diff --check` 全绿；示例矩阵 `ffi_strlen`、`demo_buffer`、`demo_buffer_jit`（run/jit 同为 `50727435`）、`demo_c_interop`（run/jit 同为 `8256`）与 `server_echo` 回显测试全部通过。
 - [x] 验证（辅助工具）：`cargo test --workspace` 85 项 core 测试 + 9 项 Immix 测试通过；严格 Clippy、格式检查和 VS Code 扩展编译通过；示例自动测试脚本及独立 LSP stdio 握手/诊断/补全/hover 测试通过。
 - [x] 验证（stage1 自举）：5 项 `bootstrap::tests` 覆盖单函数 lowering/JIT、嵌套 `while`、`if`/`else`、自举入口与多函数 IR 解析；CLI `bootstrap examples/demo_llvm_jit.lume` 输出 `55`，`bootstrap-ir` 生成预期 LLVM IR。
-- [ ] 验证（剩余）：GPU / socket 等后续阶段示例尚未加入。
+- [x] 验证（socket 并发）：`test_echo.sh` 同时覆盖单客户端与多客户端用例；多客户端用例在旧的顺序循环下会超时失败，因此能真实区分并发能力。
+- [x] 验证（LLVM 多语言）：C/Rust bitcode 符号校验、`llvm-link` 合并与 `lli` 执行均通过（`LLVM_LANG_OK`）；Fortran 本机无 flang 自动跳过，CI 会先尝试安装 `flang-23`。
+- [ ] 验证（剩余）：GPU / 多语言项目端到端等后续阶段示例尚未加入。
 
 ---
 
-## 现在就做的三步
+## 现在就做的三步（已完成）
 
-1. **你**：决定何时提交当前工作区（P0 静态/AOT FFI、Clippy、P1 时间 + buffer、地基补完、Immix、socket 最小 echo、文档与示例）。
-2. **建议下一步**：把 P1-5 的顺序 accept 循环升级为 `poll` fd 集合，支持多客户端并发；随后再进 rawptr / HashMap。
-3. **顺序红线**：socket 当前只维护动态 FFI 一套语义；锁超时仍等锁原语；rawptr 不要绕过 buffer 生命周期；按值聚合在 JIT 外部 ABI 中仍不承载，socket 的 `sockaddr_in` 先用 `ffi_buffer` / `u32()` 拼装。
+1. [x] **你**：已提交 stage1 自举主改动（`8ddeb5f bootstrap stage 1 complete`）。注意工作区仍留有本轮 CI 修复（`project.rs`、`setup-llvm-windows.ps1`）与 `lib/syntax/lower.lume` 的尾换行改动，尚未提交。
+2. [x] **下一步**：P1-5 的顺序 accept 循环已升级为 `poll` fd 集合，支持单线程多客户端并发；`test_echo_multi.c` 验证第二个客户端在第一个仍打开时也能被服务。
+3. [x] **顺序红线**：本轮没有引入 rawptr / unsafe、没有依赖锁原语；socket 仍只走动态 FFI 一套语义；`pollfd` 与 `sockaddr_in` 都没有按值穿过 C ABI——`pollfd` 留在 C 垫片内部，Lume 侧只传 `i64` 索引与 fd，fd 列表放在 `ffi_buffer`。
+
+> 下一步按排序原则进入 **P1-3 rawptr / ptr<T> + unsafe 块**，之后是 P1-4 HashMap；socket 的锁超时仍等 P1-6 锁原语。

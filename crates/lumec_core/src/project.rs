@@ -305,10 +305,7 @@ fn validate_exported_symbols(bitcode: &Path, exports: &[String]) -> Result<(), S
         String::from_utf8_lossy(&output.stderr).to_string()
     };
     for symbol in exports {
-        if !listing
-            .lines()
-            .any(|line| line.split_whitespace().any(|field| field == symbol))
-        {
+        if !listing_declares_symbol(&listing, symbol) {
             return Err(format!(
                 "{}: C module does not export `{symbol}`",
                 bitcode.display()
@@ -316,6 +313,16 @@ fn validate_exported_symbols(bitcode: &Path, exports: &[String]) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// Darwin bitcode mangled from C prefixes global symbols with `_`. Accept
+/// either spelling so the same manifest works on Linux, macOS and Windows.
+fn listing_declares_symbol(listing: &str, symbol: &str) -> bool {
+    let underscored = format!("_{symbol}");
+    listing.lines().any(|line| {
+        line.split_whitespace()
+            .any(|field| field == symbol || field == underscored)
+    })
 }
 
 fn find_llvm_tool(name: &str) -> Option<PathBuf> {
@@ -363,6 +370,22 @@ fn _source_is_newer(source: &Path, output: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exported_symbol_lookup_accepts_darwin_underscore() {
+        assert!(listing_declares_symbol(
+            "0000000000000000 T c_matmul\n",
+            "c_matmul"
+        ));
+        assert!(listing_declares_symbol(
+            "0000000000000000 T _c_matmul\n",
+            "c_matmul"
+        ));
+        assert!(!listing_declares_symbol(
+            "0000000000000000 T other\n",
+            "c_matmul"
+        ));
+    }
 
     #[test]
     fn generates_docs_from_manifest_without_building_modules() {

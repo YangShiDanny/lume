@@ -9,7 +9,9 @@
 #      （或 LLVM_BASE_URL / LLVM_DOWNLOAD_URL 指定的镜像）下载官方 clang+llvm win64 MSVC 包；
 #      已解压过则直接复用；
 #   2. 优先用 7z 解压（比 bsdtar 快很多），没有 7z 时回退到 tar；
-#   3. 写一个 llvm-config-23.bat 垫片，重写 --system-libs 输出；
+#   3. 写一个 llvm-config-231.bat 垫片，重写 --system-libs 输出；
+#      名字必须匹配 llvm-sys 231 的查找顺序，否则它会直接用真实 llvm-config.exe，
+#      把构建机绝对路径（S:/...）当库名传给 rustc，触发 "renaming of the library S"。
 #   4. 设置 LLVM_SYS_231_PREFIX / PATH 供后续 cargo build 使用。
 #
 # 不修改仓库源码；只在 CI 环境运行。Windows runner 不预装 LLVM 23，全靠本脚本准备。
@@ -81,7 +83,7 @@ if (Test-Path $RealConfig) {
 
 # llvm-config 垫片：把 --system-libs 中带绝对路径的 *.lib 改写为纯文件名，
 # 并把已知缺失的 zstd/zlib/xml2 库名映射到官方包里的名字。
-$Shim = Join-Path $Prefix 'bin\llvm-config-23.bat'
+$Shim = Join-Path $Prefix 'bin\llvm-config-231.bat'
 $ShimContent = @'
 @echo off
 setlocal enabledelayedexpansion
@@ -134,6 +136,8 @@ if "%ARGS%"==" --system-libs" (
 )
 '@
 Set-Content -Path $Shim -Value $ShimContent -Encoding Ascii
+# llvm-sys 也会尝试 llvm-config231（无连字符），补一个别名确保垫片一定被选中。
+Copy-Item -Path $Shim -Destination (Join-Path $Prefix 'bin\llvm-config231.bat') -Force
 
 # 官方包可能缺少这些别名库，复制一份满足链接器。
 $LibDir = Join-Path $Prefix 'lib'

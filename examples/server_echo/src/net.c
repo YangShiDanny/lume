@@ -33,6 +33,7 @@ static int lume_net_error_code(void) { return errno; }
 
 #define LUME_NET_ERROR (-1)
 #define LUME_NET_TIMEOUT (-2)
+#define LUME_NET_MAX_FDS 64
 
 static char lume_last_error[256] = "ok";
 
@@ -62,6 +63,63 @@ static int lume_wait_readable(int64_t fd, int64_t timeout_ms) {
     }
 #endif
     return 1;
+}
+
+static lume_pollfd lume_poll_entries[LUME_NET_MAX_FDS];
+
+static void lume_pollset_reset(int index) {
+#ifdef _WIN32
+    lume_poll_entries[index].fd = INVALID_SOCKET;
+#else
+    lume_poll_entries[index].fd = -1;
+#endif
+    lume_poll_entries[index].events = LUME_NET_POLL_IN;
+    lume_poll_entries[index].revents = 0;
+}
+
+int64_t lume_net_pollset_clear(void) {
+    for (int index = 0; index < LUME_NET_MAX_FDS; ++index) {
+        lume_pollset_reset(index);
+    }
+    return 0;
+}
+
+int64_t lume_net_pollset_set(int64_t index, int64_t fd) {
+    if (index < 0 || index >= LUME_NET_MAX_FDS) {
+        lume_set_error("pollset index", 10004);
+        return LUME_NET_ERROR;
+    }
+    lume_poll_entries[index].fd = (lume_socket)fd;
+    lume_poll_entries[index].events = LUME_NET_POLL_IN;
+    lume_poll_entries[index].revents = 0;
+    return 0;
+}
+
+int64_t lume_net_poll(int64_t timeout_ms) {
+    int ready = lume_poll(lume_poll_entries, LUME_NET_MAX_FDS, (int)timeout_ms);
+    if (ready == 0) {
+        return 0;
+    }
+    if (ready < 0) {
+        lume_set_error("poll", lume_net_error_code());
+        return LUME_NET_ERROR;
+    }
+    return (int64_t)ready;
+}
+
+int64_t lume_net_pollset_ready(int64_t index) {
+    if (index < 0 || index >= LUME_NET_MAX_FDS) {
+        lume_set_error("pollset index", 10004);
+        return LUME_NET_ERROR;
+    }
+    short revents = lume_poll_entries[index].revents;
+    if (revents == 0) {
+        return 0;
+    }
+    if (revents & LUME_NET_POLL_IN) {
+        return 1;
+    }
+    return LUME_NET_ERROR;
 }
 
 int64_t lume_net_listen(int64_t port) {

@@ -14,15 +14,18 @@ target/debug/lume-bootstrap run examples/server_echo/manifest.toml
 bash examples/server_echo/test_echo.sh
 ```
 
-服务默认监听 `0.0.0.0:18080`。`test_echo.sh` 会启动服务、用 C 客户端发送
-`hello lume`、校验回显，然后等待服务在空闲超时后退出。
+服务默认监听 `0.0.0.0:18080`。`test_echo.sh` 会启动服务，先跑单客户端
+`hello lume` 回环，再跑多客户端并发用例（两个连接同时打开，验证第二个客户端
+能在第一个仍存活时被服务），最后等待服务在空闲超时后退出。
 
 ## 文件
 
 * `examples/server_echo/src/net.c`：跨平台 C ABI 垫片。
 * `examples/server_echo/src/main.lume`：Lume echo server 与客户端处理。
 * `examples/server_echo/manifest.toml`：C 模块、extern 签名与导出符号。
-* `examples/server_echo/test_echo.c`、`test_echo.sh`：自动化回环验证。
+* `examples/server_echo/test_echo.c`：单客户端回环验证。
+* `examples/server_echo/test_echo_multi.c`：多客户端并发回环验证。
+* `examples/server_echo/test_echo.sh`：编译并运行上述两个客户端。
 
 ## C ABI
 
@@ -36,31 +39,52 @@ bash examples/server_echo/test_echo.sh
 | `lume_net_send` | `i64(i64, pointer, i64)` | 尽量发送完整字节数 |
 | `lume_net_close` | `void(i64)` | 关闭 fd |
 | `lume_net_last_error` | `void(pointer, i64)` | 把最近错误写入调用方提供的缓冲区 |
+| `lume_net_pollset_clear` | `i64()` | 清空 poll 集合，把所有槽位设为无效 |
+| `lume_net_pollset_set` | `i64(i64, i64)` | 把 fd 写入指定槽位（`0` 保留给监听 fd） |
+| `lume_net_poll` | `i64(i64)` | 等待集合就绪，返回就绪数、`0` 超时、`-1` 错误 |
+| `lume_net_pollset_ready` | `i64(i64)` | 查询槽位状态：`1` 可读、`0` 无事件、`-1` 错误/挂断 |
 
 `pointer` 参数用 `ffi_buffer(size, alignment)` 提供本机内存。C 侧只在使用期间
 持有该指针，不保留到调用返回之后。
 
-## 空闲超时
+## 多客户端事件循环
 
-`main()` 用 `mono_ms()` 设置单调时钟 deadline：
+`main()` 用 `mono_ms()` 设置单调时钟空闲窗口，并把监听 fd 放在 poll 集合槽位
+`0`、客户端放在 `1..63`。Lume 侧用一个 `ffi_buffer(512, 8)` 保存每个槽位对应的
+fd；C 侧只维护平台相关的 `pollfd` 数组，不把 `pollfd` 作为按值聚合穿过 ABI：
 
 ```lume
-deadline:int = mono_ms() + 5000
-while mono_ms() < deadline
-    client:any = lume_net_accept(server, 500)
-    if client >= 0
-        echo_client(client)
-        lume_net_close(client)
-        deadline := mono_ms() + 5000
+idle_start:int = mono_ms()
+while mono_ms() - idle_start < 10000
+    ready:any = lume_net_poll(500)
+    if ready > 0
+        idle_start := mono_ms()
+        i:int = 0
+        while i < 64
+            state:any = lume_net_pollset_ready(i)
+            if state > 0
+                if i is 0
+                    accept_pending(server, slots)
+                else
+                    fd:any = ffi_buffer_read(slots, i * 8, "i64")
+                    if fd >= 0
+                        echo_ready_client(fd, i, slots, buffer)
+                    end
+                end
+            end
+            i := i + 1
+        end
     end
 end
 ```
 
-`accept` / `recv` 的超时返回 `-2`，不会让 Lume 报错；真正错误才返回 `-1` 并写
-`lume_net_last_error`。每个连接处理完都会关闭，服务端在最后关闭监听 fd。
+`poll` 超时返回 `0`；`accept` / `recv` 在就绪后以 `timeout_ms = 0` 调用，不会阻塞。
+连接关闭或出错时，Lume 把槽位 fd 写回 `-1` 并调用 `lume_net_pollset_set(i, -1)`，
+C 侧把该槽位设为平台无效 fd，后续 `poll` 自动忽略。
 
 ## 当前范围
 
-* 已支持：IPv4、单线程 accept/echo 循环、按连接边界检查的 `ffi_buffer`、单调时钟空闲超时、跨平台 C 垫片。
-* 尚未支持：同时服务多个客户端、TLS、IPv6、可配置端口/地址、非阻塞 poll fd 集合。
+* 已支持：IPv4、单线程 `poll` 多客户端并发、按连接边界检查的 `ffi_buffer`、单调时钟空闲超时、跨平台 C 垫片。
+* 尚未支持：TLS、IPv6、可配置端口/地址、写半关闭时的背压处理。
 * JIT/AOT 阶段仍可切换到静态 extern；当前先保持一套动态 FFI 分派语义。
+* 红线保持：`pollfd` / `sockaddr_in` 不穿透按值聚合 ABI；未引入 rawptr / unsafe，也未依赖锁原语。

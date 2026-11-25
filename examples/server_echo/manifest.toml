@@ -5,13 +5,13 @@ version = "0.1.0"
 [[module]]
 path = "src/main.lume"
 lang = "lume"
-export = ["echo_client", "main"]
+export = ["main"]
 
 [[module]]
 path = "src/net.c"
 lang = "c"
 cflags = ["-O1"]
-export = ["lume_net_listen", "lume_net_accept", "lume_net_recv", "lume_net_send", "lume_net_close", "lume_net_last_error"]
+export = ["lume_net_listen", "lume_net_accept", "lume_net_recv", "lume_net_send", "lume_net_close", "lume_net_last_error", "lume_net_pollset_clear", "lume_net_pollset_set", "lume_net_poll", "lume_net_pollset_ready"]
 
 [ffi.extern]
 lume_net_listen = { signature = "i64(i64)" }
@@ -20,3 +20,7 @@ lume_net_recv = { signature = "i64(i64, pointer, i64, i64)" }
 lume_net_send = { signature = "i64(i64, pointer, i64)" }
 lume_net_close = { signature = "void(i64)" }
 lume_net_last_error = { signature = "void(pointer, i64)" }
+lume_net_pollset_clear = { signature = "i64()" }
+lume_net_pollset_set = { signature = "i64(i64, i64)" }
+lume_net_poll = { signature = "i64(i64)" }
+lume_net_pollset_ready = { signature = "i64(i64)" }

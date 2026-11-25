@@ -13,13 +13,17 @@ fi
 
 WORK=$(mktemp -d)
 CLIENT="$WORK/test_echo"
+MULTI_CLIENT="$WORK/test_echo_multi"
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*)
     CLIENT="$WORK/test_echo.exe"
+    MULTI_CLIENT="$WORK/test_echo_multi.exe"
     "$CC" "$ROOT/examples/server_echo/test_echo.c" -o "$CLIENT" -lws2_32
+    "$CC" "$ROOT/examples/server_echo/test_echo_multi.c" -o "$MULTI_CLIENT" -lws2_32
     ;;
   *)
     "$CC" "$ROOT/examples/server_echo/test_echo.c" -o "$CLIENT"
+    "$CC" "$ROOT/examples/server_echo/test_echo_multi.c" -o "$MULTI_CLIENT"
     ;;
 esac
 
@@ -37,4 +41,5 @@ cleanup() {
 trap cleanup EXIT
 
 "$CLIENT" "$PORT"
+"$MULTI_CLIENT" "$PORT"
 wait "$server_pid"

@@ -4,25 +4,57 @@ fn print_last_error() -> int
     print(ffi_buffer_read_cstr(message, 0, 256))
 ret 0
 
-fn echo_client(client:int) -> int
-    buffer:any = ffi_buffer(1024, 1)
-    while true
-        received:any = lume_net_recv(client, buffer, 1024, 1000)
-        if received == 0
-            ret 0
+fn reset_slot(slots:any, index:int) -> int
+    ffi_buffer_write(slots, index * 8, "i64", -1)
+    lume_net_pollset_set(index, -1)
+ret 0
+
+fn accept_pending(server:any, slots:any) -> int
+    client:any = lume_net_accept(server, 0)
+    if client < 0
+        ret 0
+    end
+    slot:int = 1
+    placed:int = 0
+    while slot < 64
+        if placed is 0
+            occupied:any = ffi_buffer_read(slots, slot * 8, "i64")
+            if occupied < 0
+                ffi_buffer_write(slots, slot * 8, "i64", client)
+                lume_net_pollset_set(slot, client)
+                placed := 1
+            end
         end
-        if received < 0
-            print("recv failed")
-            print_last_error()
-            ret -1
-        end
-        message:any = ffi_buffer_read_cstr(buffer, 0, received + 1)
-        sent:int = lume_net_send(client, message, received)
-        if sent != received
-            print("send failed")
-            print_last_error()
-            ret -1
-        end
+        slot := slot + 1
+    end
+    if placed is 0
+        print("too many clients")
+        lume_net_close(client)
+    end
+ret placed
+
+fn echo_ready_client(fd:any, index:int, slots:any, buffer:any) -> int
+    received:any = lume_net_recv(fd, buffer, 1024, 0)
+    if received == 0
+        reset_slot(slots, index)
+        lume_net_close(fd)
+        ret 0
+    end
+    if received < 0
+        print("recv failed")
+        print_last_error()
+        reset_slot(slots, index)
+        lume_net_close(fd)
+        ret -1
+    end
+    message:any = ffi_buffer_read_cstr(buffer, 0, received + 1)
+    sent:any = lume_net_send(fd, message, received)
+    if sent != received
+        print("send failed")
+        print_last_error()
+        reset_slot(slots, index)
+        lume_net_close(fd)
+        ret -1
     end
 ret 0
 
@@ -34,13 +66,43 @@ fn main() -> int
         ret -1
     end
 
-    deadline:int = mono_ms() + 5000
-    while mono_ms() < deadline
-        client:any = lume_net_accept(server, 500)
-        if client >= 0
-            echo_client(client)
-            lume_net_close(client)
-            deadline := mono_ms() + 5000
+    slots:any = ffi_buffer(512, 8)
+    buffer:any = ffi_buffer(1024, 1)
+    lume_net_pollset_clear()
+
+    index:int = 0
+    while index < 64
+        ffi_buffer_write(slots, index * 8, "i64", -1)
+        index := index + 1
+    end
+    lume_net_pollset_set(0, server)
+
+    idle_start:int = mono_ms()
+    while mono_ms() - idle_start < 10000
+        ready:any = lume_net_poll(500)
+        if ready < 0
+            print("poll failed")
+            print_last_error()
+            lume_net_close(server)
+            ret -1
+        end
+        if ready > 0
+            idle_start := mono_ms()
+            i:int = 0
+            while i < 64
+                state:any = lume_net_pollset_ready(i)
+                if state > 0
+                    if i is 0
+                        accept_pending(server, slots)
+                    else
+                        fd:any = ffi_buffer_read(slots, i * 8, "i64")
+                        if fd >= 0
+                            echo_ready_client(fd, i, slots, buffer)
+                        end
+                    end
+                end
+                i := i + 1
+            end
         end
     end
     lume_net_close(server)

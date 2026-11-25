@@ -1,0 +1,88 @@
+name: Tests
+
+# 专门的测试工作流：单元测试、示例矩阵、socket 回环、stage1 自举、
+# VS Code 扩展编译，以及 C/Rust/Fortran 统一 LLVM 后端测试。
+# ci.yml 继续负责三平台构建门禁、Release、Pages 与 Wiki 同步。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-suite:
+    name: 全量测试 (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editor/vscode‑lume/package-lock.json
+
+      - name: 安装 LLVM 23
+        shell: bash
+        run: bash .github/scripts/setup-llvm-linux.sh
+
+      - name: 检查格式与工作区差异
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          git diff --check
+
+      - name: Rust 单元测试
+        shell: bash
+        run: cargo test --workspace --features libffi/system
+
+      - name: 严格 Clippy
+        shell: bash
+        run: cargo clippy --workspace --all-targets --features libffi/system -- -D warnings
+
+      - name: 构建并运行 Lume 示例矩阵
+        shell: bash
+        run: |
+          cargo build -p lumec_core --features libffi/system --release --quiet
+          BIN="target/release/lume-bootstrap"
+          bash scripts/test-examples.sh "$BIN"
+          LUME_BIN="$BIN" bash examples/server_echo/test_echo.sh
+
+      - name: 编译 VS Code 扩展
+        working-directory: editor/vscode‑lume
+        run: |
+          npm ci
+          npm run compile
+
+  llvm-languages:
+    name: LLVM 后端多语言 (C/Rust/Fortran)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装 LLVM 23
+        shell: bash
+        run: bash .github/scripts/setup-llvm-linux.sh
+
+      - name: 尝试安装 flang (Fortran LLVM 前端)
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flang-23 || echo "flang-23 不可用，Fortran 用例将按约定跳过"
+
+      - name: 运行统一 LLVM 后端测试
+        shell: bash
+        run: bash scripts/test-llvm-languages.sh
